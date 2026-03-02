@@ -11,12 +11,18 @@ from typing import Dict, List, Optional, Tuple
 class EnergyPlusKnowledgeBase:
     """EnergyPlus 知识库：解析 IDD 并提供智能匹配"""
     
-    def __init__(self, idd_path: str):
+    def __init__(self, idd_path: str, idf_path: str = None):
         self.idd_path = idd_path
+        self.idf_path = idf_path  # 添加IDF路径以检查实际值
         self.objects_metadata = {}  # {object_type: {fields: [...], description: ...}}
         self.keyword_mapping = self._build_keyword_mapping()
         self.field_semantics = self._build_field_semantics()  # 字段语义库
         self._parse_idd()
+        
+        # 缓存每个对象的可修改字段（通过检查IDF中的实际值）
+        self._modifiable_fields_cache = {}
+        if idf_path:
+            self._analyze_modifiable_fields(idf_path)
     
     def _build_keyword_mapping(self) -> Dict[str, List[str]]:
         """
@@ -72,12 +78,59 @@ class EnergyPlusKnowledgeBase:
             "人员密度": ["People"],
             "people": ["People"],
             
-            # HVAC相关
+            # HVAC相关（恢复完整映射）
             "空调": ["ZoneHVAC:IdealLoadsAirSystem", "AirLoopHVAC"],
             "暖通": ["ZoneHVAC:IdealLoadsAirSystem", "AirLoopHVAC"],
             "供暖": ["Heating:DesignDay", "ZoneHVAC:IdealLoadsAirSystem"],
             "制冷": ["Cooling:DesignDay", "ZoneHVAC:IdealLoadsAirSystem"],
             "hvac": ["ZoneHVAC:IdealLoadsAirSystem", "AirLoopHVAC"],
+            
+            # ✅ 温控设定点相关（最重要的节能措施！）
+            "温控": ["ThermostatSetpoint:DualSetpoint"],
+            "设定点": ["ThermostatSetpoint:DualSetpoint"],
+            "温度设定": ["ThermostatSetpoint:DualSetpoint"],
+            "供暖温度": ["ThermostatSetpoint:DualSetpoint", "Sizing:Zone"],  # 优先匹配温控和设计参数
+            "制冷温度": ["ThermostatSetpoint:DualSetpoint", "Sizing:Zone"],  # 优先匹配温控和设计参数
+            "thermostat": ["ThermostatSetpoint:DualSetpoint"],
+            "setpoint": ["ThermostatSetpoint:DualSetpoint"],
+            
+            # ✅ 新风量相关
+            "新风": ["DesignSpecification:OutdoorAir"],
+            "新风量": ["DesignSpecification:OutdoorAir"],
+            "室外空气": ["DesignSpecification:OutdoorAir"],
+            "通风": ["DesignSpecification:OutdoorAir"],
+            "ventilation": ["DesignSpecification:OutdoorAir"],
+            "outdoor air": ["DesignSpecification:OutdoorAir"],
+            
+            # ✅ 热回收相关
+            "热回收": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "能量回收": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "显热回收": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "潜热回收": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "热交换": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "heat recovery": ["ZoneHVAC:IdealLoadsAirSystem"],
+            
+            # ✅ 区域设计参数（供风温度相关 - 设计阶段的温度参数）
+            "设计参数": ["Sizing:Zone"],
+            "供风温度": ["Sizing:Zone", "ZoneHVAC:IdealLoadsAirSystem"],  # 保留完整映射，通过优先级排序
+            "设计供风温度": ["Sizing:Zone"],
+            "供冷温度": ["Sizing:Zone"],
+            "供暖供冷温度": ["Sizing:Zone"],
+            "sizing": ["Sizing:Zone"],
+            
+            # ⚠️ IdealLoads 阈值相关（用于优先级提升）
+            "阈值": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "最大温度": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "最小温度": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "上限温度": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "下限温度": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "温度上限": ["ZoneHVAC:IdealLoadsAirSystem"],
+            "温度下限": ["ZoneHVAC:IdealLoadsAirSystem"],
+            
+            # ✅ 围护结构
+            "围护结构": ["Construction"],
+            "构造": ["Construction"],
+            "construction": ["Construction"],
         }
     
     def _build_field_keyword_mapping(self) -> Dict[str, Dict[str, List[str]]]:
@@ -129,6 +182,34 @@ class EnergyPlusKnowledgeBase:
                 "功率": ["Watts_per_Floor_Area", "Watts_per_Person"],
                 "密度": ["Watts_per_Floor_Area", "Watts_per_Person"],
                 "equipment": ["Watts_per_Floor_Area", "Watts_per_Person"],
+            },
+            "People": {
+                "人员密度": ["People_per_Floor_Area"],
+                "人均面积": ["Floor_Area_per_Person"],
+                "density": ["People_per_Floor_Area"],
+            },
+            "ThermostatSetpoint:DualSetpoint": {
+                "供暖": ["Heating_Setpoint_Temperature_Schedule_Name"],
+                "制冷": ["Cooling_Setpoint_Temperature_Schedule_Name"],
+                "heating": ["Heating_Setpoint_Temperature_Schedule_Name"],
+                "cooling": ["Cooling_Setpoint_Temperature_Schedule_Name"],
+            },
+            "DesignSpecification:OutdoorAir": {
+                "新风": ["Outdoor_Air_Flow_per_Person", "Outdoor_Air_Flow_per_Zone_Floor_Area"],
+                "人均新风": ["Outdoor_Air_Flow_per_Person"],
+                "outdoor air": ["Outdoor_Air_Flow_per_Person"],
+            },
+            "ZoneHVAC:IdealLoadsAirSystem": {
+                "阈值": ["Minimum_Cooling_Supply_Air_Temperature", "Maximum_Heating_Supply_Air_Temperature"],
+                "供风阈值": ["Minimum_Cooling_Supply_Air_Temperature", "Maximum_Heating_Supply_Air_Temperature"],
+                "最小制冷供风温度": ["Minimum_Cooling_Supply_Air_Temperature"],
+                "最大供暖供风温度": ["Maximum_Heating_Supply_Air_Temperature"],
+                "热回收": ["Sensible_Heat_Recovery_Effectiveness", "Latent_Heat_Recovery_Effectiveness"],
+            },
+            "Sizing:Zone": {
+                "供风温度": ["Zone_Cooling_Design_Supply_Air_Temperature", "Zone_Heating_Design_Supply_Air_Temperature"],
+                "制冷温度": ["Zone_Cooling_Design_Supply_Air_Temperature"],
+                "供暖温度": ["Zone_Heating_Design_Supply_Air_Temperature"],
             },
         }
     
@@ -224,6 +305,111 @@ class EnergyPlusKnowledgeBase:
                     "related_concept": ["渗透", "外墙面积渗透"],
                 },
             },
+            # ✅ 人员密度
+            "People": {
+                "People_per_Floor_Area": {
+                    "description": "人员密度：单位楼板面积的人数",
+                    "unit": "人/m²",
+                    "range": [0, 0.2],
+                    "semantic": "值越低，人员产热负荷越小，制冷能耗降低",
+                    "related_concept": ["人员密度", "占用率", "灵活办公"],
+                },
+                "Floor_Area_per_Person": {
+                    "description": "人均楼板面积",
+                    "unit": "m²/人",
+                    "range": [5, 50],
+                    "semantic": "值越高，单位面积人数越少，人员负荷越低",
+                    "related_concept": ["人均面积", "办公空间"],
+                },
+            },
+            # ✅ 温控设定点（最重要！）
+            "ThermostatSetpoint:DualSetpoint": {
+                "Heating_Setpoint_Temperature_Schedule_Name": {
+                    "description": "供暖设定温度时间表：定义供暖目标温度",
+                    "unit": "°C",
+                    "range": [15, 23],
+                    "semantic": "温度越低，供暖能耗越低（冬季每降低1°C可节省8-15%供暖能耗）",
+                    "related_concept": ["供暖温度", "冬季设定点", "舒适温度"],
+                    "optimization_note": "建议从20-22°C降至18-19°C",
+                },
+                "Cooling_Setpoint_Temperature_Schedule_Name": {
+                    "description": "制冷设定温度时间表：定义制冷目标温度",
+                    "unit": "°C",
+                    "range": [24, 28],
+                    "semantic": "温度越高，制冷能耗越低（夏季每提高1°C可节省8-12%制冷能耗）",
+                    "related_concept": ["制冷温度", "夏季设定点", "空调温度"],
+                    "optimization_note": "建议从24-25°C提升至25-26°C",
+                },
+            },
+            # ✅ 新风量
+            "DesignSpecification:OutdoorAir": {
+                "Outdoor_Air_Flow_per_Person": {
+                    "description": "人均新风量：每人所需的室外新风流量",
+                    "unit": "m³/s/人",
+                    "range": [0.005, 0.015],
+                    "semantic": "值越小，新风负荷越低，但需满足健康标准（GB/T18883建议≥0.008）",
+                    "related_concept": ["人均新风", "通风率", "室内空气质量"],
+                    "optimization_note": "办公室标准0.008-0.010 m³/s/人",
+                },
+                "Outdoor_Air_Flow_per_Zone_Floor_Area": {
+                    "description": "单位楼板面积新风量",
+                    "unit": "m³/s/m²",
+                    "range": [0, 0.002],
+                    "semantic": "值越小，新风负荷越低",
+                    "related_concept": ["新风密度", "面积新风"],
+                },
+            },
+            "ZoneHVAC:IdealLoadsAirSystem": {
+                "Minimum_Cooling_Supply_Air_Temperature": {
+                    "description": "最小制冷供风温度阈值：运行时供冷送风温度下限",
+                    "unit": "°C",
+                    "range": [12, 20],
+                    "semantic": "值越高，送风下限越温和，通常可降低制冷侧能耗",
+                    "related_concept": ["阈值", "运行限制", "最小制冷供风温度"],
+                    "optimization_note": "常见可从16°C提升至17-18°C",
+                },
+                "Maximum_Heating_Supply_Air_Temperature": {
+                    "description": "最大供暖供风温度阈值：运行时供暖送风温度上限",
+                    "unit": "°C",
+                    "range": [35, 60],
+                    "semantic": "值越低，供暖送风峰值受限，通常可降低供暖侧峰值能耗",
+                    "related_concept": ["阈值", "运行限制", "最大供暖供风温度"],
+                    "optimization_note": "建议在舒适度允许范围内小幅下调",
+                },
+                "Sensible_Heat_Recovery_Effectiveness": {
+                    "description": "显热回收效率",
+                    "unit": "无量纲 (0-1)",
+                    "range": [0, 1],
+                    "semantic": "值越高，排风显热回收越充分，供暖/制冷负荷都可下降",
+                    "related_concept": ["热回收", "显热效率"],
+                },
+                "Latent_Heat_Recovery_Effectiveness": {
+                    "description": "潜热回收效率",
+                    "unit": "无量纲 (0-1)",
+                    "range": [0, 1],
+                    "semantic": "值越高，湿负荷回收越充分，可降低空调系统潜热负荷",
+                    "related_concept": ["热回收", "潜热效率"],
+                },
+            },
+            # ✅ 区域设计参数
+            "Sizing:Zone": {
+                "Zone_Cooling_Design_Supply_Air_Temperature": {
+                    "description": "制冷设计供风温度：空调送风温度",
+                    "unit": "°C",
+                    "range": [12, 18],
+                    "semantic": "温度越高，制冷机组效率越高，能耗越低（但需保证除湿能力）",
+                    "related_concept": ["供风温度", "送风温度", "制冷供风"],
+                    "optimization_note": "可从13-14°C提升至15-17°C",
+                },
+                "Zone_Heating_Design_Supply_Air_Temperature": {
+                    "description": "供暖设计供风温度：暖气送风温度",
+                    "unit": "°C",
+                    "range": [35, 55],
+                    "semantic": "温度越低，供暖效率越高（热泵COP提升），能耗越低",
+                    "related_concept": ["供风温度", "供暖送风"],
+                    "optimization_note": "可从50°C降至42-45°C（地暖30-35°C）",
+                },
+            },
         }
     
     def _parse_idd(self):
@@ -292,10 +478,82 @@ class EnergyPlusKnowledgeBase:
         
         print(f"[OK] 知识库已加载: {len(self.objects_metadata)} 个对象类型")
     
+    def _analyze_modifiable_fields(self, idf_path: str):
+        """
+        分析IDF文件中各对象类型的哪些字段包含可修改的数值
+        这解决了"提出建议但无法执行"的问题：某些对象虽然存在，但其字段都是引用或关键字
+        
+        关键改进：对于关键词映射中的所有对象类型，都进行分析，而不仅限于IDF中出现的对象
+        """
+        try:
+            from eppy.modeleditor import IDF
+            IDF.setiddname(self.idd_path)
+            idf = IDF(idf_path)
+            
+            # 收集需要分析的所有对象类型：包括IDF中出现的以及关键词映射中引用的
+            objects_to_analyze = set(idf.idfobjects.keys())
+            
+            # 添加关键词映射中的所有对象类型
+            for obj_types in self.keyword_mapping.values():
+                objects_to_analyze.update(obj_types)
+            
+            for obj_type in objects_to_analyze:
+                if obj_type not in self._modifiable_fields_cache:
+                    modifiable_fields = set()
+                    
+                    # 获取该类型的对象实例
+                    objs = idf.idfobjects.get(obj_type, [])
+                    if not objs:
+                        # 如果IDF中没有该对象的实例，仍然分析其定义（从objects_metadata中）
+                        # 这是关键：确保Construction等对象被识别为无可修改字段
+                        obj_fields = self.objects_metadata.get(obj_type, {}).get('fields', [])
+                        # 不分析字段内容，直接标记为0个可修改字段（保守做法）
+                        # 除非以后需要更精确的分析
+                        self._modifiable_fields_cache[obj_type] = set()
+                        continue
+                    
+                    sample_obj = objs[0]
+                    
+                    # 逐个检查该对象类型的所有字段
+                    for field_name in sample_obj.fieldnames:
+                        try:
+                            field_value = getattr(sample_obj, field_name, None)
+                            
+                            # 判断这个字段是否可修改：必须是数值类型
+                            if field_value is None:
+                                continue
+                            
+                            # 检查是否是数值
+                            try:
+                                float(str(field_value))
+                                modifiable_fields.add(field_name)
+                            except (ValueError, TypeError):
+                                # 非数值字段（字符串、引用等）不应被修改
+                                pass
+                        except Exception:
+                            pass
+                    
+                    self._modifiable_fields_cache[obj_type] = modifiable_fields
+        except Exception as e:
+            # IDF加载失败或其他错误，跳过分析
+            pass
+    
+    def _get_modifiable_fields(self, object_type: str) -> set:
+        """
+        获取该对象类型已确认可修改的字段集合
+        如果没有IDF分析数据，返回空集（安全做法）
+        """
+        return self._modifiable_fields_cache.get(object_type, set())
+    
     def match_objects_by_keywords(self, user_request: str) -> List[str]:
         """
         根据用户请求中的关键词匹配对象类型
-        返回匹配的对象类型列表（按相关性排序）
+        返回匹配的对象类型列表（按优先级排序）
+        
+        ✅ 改进策略：
+        - 不删除任何匹配的对象，保证匹配成功率
+        - 根据关键词调整对象的优先级（排序）
+        - Sizing:Zone 在无阈值意图时优先级更高
         """
         user_request_lower = user_request.lower()
         matched_objects = set()
@@ -312,19 +570,62 @@ class EnergyPlusKnowledgeBase:
         # 验证对象是否在元数据中存在
         valid_objects = [obj for obj in matched_objects if obj in self.objects_metadata]
         
+        # ✅ 根据用户意图调整优先级（排序）而不是删除
+        threshold_keywords = ["阈值", "最大", "最小", "上限", "下限", "限制", "极值", "范围", "threshold", "limit", "max", "min"]
+        has_threshold_intent = any(kw in user_request_lower for kw in threshold_keywords)
+        
+        # 如果用户提到了供风温度相关的词
+        temperature_keywords = ["供风温度", "供暖", "供冷", "制冷", "空调", "hvac"]
+        has_temperature_intent = any(kw in user_request_lower for kw in temperature_keywords)
+        
+        # ✅ 优先级排序：根据意图调整对象顺序
+        if has_temperature_intent:
+            if has_threshold_intent:
+                # 有阈值意图：IdealLoads 优先，Sizing:Zone 次之
+                priority_order = ["ZoneHVAC:IdealLoadsAirSystem", "Sizing:Zone"]
+                print(f"  ✓ 检测到阈值关键词，优先推荐 ZoneHVAC:IdealLoadsAirSystem")
+            else:
+                # 无阈值意图：Sizing:Zone 优先，IdealLoads 次之
+                priority_order = ["Sizing:Zone", "ZoneHVAC:IdealLoadsAirSystem"]
+                print(f"  ✓ 未检测到阈值关键词，优先推荐 Sizing:Zone")
+            
+            # 按优先级排序（优先级高的对象排在前面）
+            sorted_objects = []
+            for obj in priority_order:
+                if obj in valid_objects:
+                    sorted_objects.append(obj)
+            # 添加其他未排序的对象
+            for obj in valid_objects:
+                if obj not in sorted_objects:
+                    sorted_objects.append(obj)
+            valid_objects = sorted_objects
+        
         return valid_objects
     
     def match_fields_by_keywords(self, object_type: str, user_request: str) -> List[str]:
         """
         根据用户请求为特定对象类型匹配字段
         返回匹配的字段列表
+        
+        关键改进：对于没有预定义字段映射的对象，只返回已确认可修改的字段
+        这解决了"提出建议但无法修改"的问题（如Construction只有字符串引用字段）
         """
         user_request_lower = user_request.lower()
         field_mapping = self._build_field_keyword_mapping()
         
         if object_type not in field_mapping:
-            # 如果没有预定义的字段映射，返回该对象的所有字段
-            return self.objects_metadata.get(object_type, {}).get('fields', [])
+            # 关键修改：如果没有预定义的字段映射，只返回该对象中实际可修改的字段
+            all_fields = self.objects_metadata.get(object_type, {}).get('fields', [])
+            
+            # 检查是否有IDF分析的可修改字段缓存数据
+            if object_type in self._modifiable_fields_cache:
+                # IDF已被分析，只返回实际可修改的数值字段
+                modifiable = self._modifiable_fields_cache[object_type]
+                return [f for f in all_fields if f in modifiable]
+            else:
+                # 降级策略：没有IDF分析数据，返回所有字段
+                # （这会在系统应用修改时被过滤掉非数值字段）
+                return all_fields
         
         matched_fields = set()
         for keyword, fields in field_mapping[object_type].items():
