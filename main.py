@@ -1,3 +1,7 @@
+﻿"""
+EnergyPlus 5-轮迭代优化闭环系统
+完整实现：模拟→提取→LLM优化→修改→循环
+"""
 import json
 import os
 import re
@@ -5,82 +9,123 @@ import sqlite3
 import subprocess
 import logging
 import sys
+import shutil
 from datetime import datetime
 from pathlib import Path
 from eppy.modeleditor import IDF
 from openai import OpenAI
 from knowledge_base import EnergyPlusKnowledgeBase
 
-class EnergyPlusOptimizationIterator:
-    """
-    EnergyPlus 参数优化迭代系统
-    包含5次迭代的自动化优化流程
-    """
+
+class EnergyPlusOptimizer:
+    """EnergyPlus 5轮迭代自动优化系统"""
+    
     def __init__(self, idf_path, idd_path, api_key_path, epw_path="weather.epw", log_dir="optimization_logs"):
         self.idf_path = idf_path
         self.idd_path = idd_path
         self.epw_path = epw_path
         self.log_dir = log_dir
+        self.optimization_dir = "optimization_results"
         
         # 创建日志目录
         os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(self.optimization_dir, exist_ok=True)
         
-        # 初始化日志系统
+        # 初始化日志
         self.logger = self._setup_logging()
         
-        # 验证文件存在
-        if not os.path.exists(idf_path): 
-            self.logger.error(f"IDF file not found: {idf_path}")
-            raise FileNotFoundError(f"IDF file not found: {idf_path}")
-        if not os.path.exists(idd_path): 
-            self.logger.error(f"IDD file not found: {idd_path}")
-            raise FileNotFoundError(f"IDD file not found: {idd_path}")
-        if not os.path.exists(epw_path):
-            self.logger.error(f"EPW file not found: {epw_path}")
-            raise FileNotFoundError(f"EPW file not found: {epw_path}")
+        self.logger.info("="*80)
+        self.logger.info("EnergyPlus 5轮迭代优化系统启动")
+        self.logger.info("="*80)
         
-        # 设置 IDD 并加载 IDF
+        # 验证文件
+        if not os.path.exists(idf_path): 
+            self.logger.error(f"IDF文件不存在: {idf_path}")
+            raise FileNotFoundError(f"IDF not found: {idf_path}")
+        if not os.path.exists(idd_path): 
+            self.logger.error(f"IDD文件不存在: {idd_path}")
+            raise FileNotFoundError(f"IDD not found: {idd_path}")
+        if not os.path.exists(epw_path):
+            self.logger.error(f"EPW文件不存在: {epw_path}")
+            raise FileNotFoundError(f"EPW not found: {epw_path}")
+        
+        # 加载IDF
         try:
             IDF.setiddname(idd_path)
             self.base_idf = IDF(idf_path)
-            self.logger.info(f"✓ IDF文件加载成功: {idf_path}")
+            self.logger.info(f"✓ IDF文件加载成功")
         except Exception as e:
-            self.logger.error(f"加载 IDF/IDD 失败: {e}")
+            self.logger.error(f"加载IDF失败: {e}")
             raise
-
-        # 初始化知识库
+        
+        # 初始化知识库（传入idf_path以分析实际可修改字段）
         try:
-            self.knowledge_base = EnergyPlusKnowledgeBase(idd_path)
+            self.knowledge_base = EnergyPlusKnowledgeBase(idd_path, idf_path)
             self.logger.info("✓ 知识库加载成功")
         except Exception as e:
-            self.logger.warning(f"知识库加载失败: {e}，将使用传统模式")
+            self.logger.warning(f"知识库加载失败: {e}")
             self.knowledge_base = None
-
-        # 加载 API Key
+        
+        # 初始化OpenAI客户端
         try:
             with open(api_key_path, 'r') as f:
                 api_key = f.read().strip()
             self.client = OpenAI(api_key=api_key)
-            self.logger.info("✓ OpenAI API客户端初始化成功")
+            self.logger.info("✓ OpenAI客户端初始化成功")
         except Exception as e:
-            self.logger.error(f"加载 API Key 失败: {e}")
+            self.logger.error(f"初始化OpenAI失败: {e}")
             self.client = None
-
-        # 定位 EnergyPlus
+        
+        # 定位EnergyPlus
         self.eplus_exe = self._locate_energyplus()
         if not self.eplus_exe:
-            self.logger.error("未找到 EnergyPlus 安装")
-            raise RuntimeError("EnergyPlus installation not found")
+            self.logger.error("未找到EnergyPlus安装")
+            raise RuntimeError("EnergyPlus not found")
         
-        # 追踪最优值
+        # 初始化追踪数据
         self.best_metrics = None
-        self.iteration_history = []  # 保存所有迭代的数据
+        self.best_iteration = 0
+        self.iteration_history = []
+        self.current_idf_path = idf_path  # 当前工作IDF
+        
+        # Token使用追踪
+        self.total_tokens_used = 0
+        self.llm_calls_count = 0
+        
+        # 当前优化建议文本（用于关键词检查）
+        self.current_user_request = ""
+        self.current_plan_context = ""
+        
+        # 字段修改频率统计（格式：{"OBJECT_TYPE.Field_Name": count}）
+        # 用于追踪各字段的使用频率，避免过度集中修改少数字段
+        self.field_modification_history = {}
+        
+        # 字段修改的关键词限制规则（配置化，非硬编码）
+        # 格式：{"对象类型": {"字段名": ["必需关键词1", "必需关键词2"]}}
+        # 只有当建议文本中包含至少一个必需关键词时，才允许修改该字段
+        self.field_keyword_rules = {
+            "ZONEHVAC:IDEALLOADSAIRSYSTEM": {
+                # 阈值字段需要出现阈值/上下限/限制等语义即可修改
+                "MINIMUM_COOLING_SUPPLY_AIR_TEMPERATURE": ["阈值", "上下限", "上限", "下限", "最大", "最小", "限制", "limit", "threshold"],
+                "MAXIMUM_HEATING_SUPPLY_AIR_TEMPERATURE": ["阈值", "上下限", "上限", "下限", "最大", "最小", "限制", "limit", "threshold"],
+                # 热回收效率无需关键词限制，可自由修改
+            },
+            "SIZING:ZONE": {
+                # 设计温度参数：出现供风/送风/设计温度语义即可修改
+                "ZONE_COOLING_DESIGN_SUPPLY_AIR_TEMPERATURE": ["供冷", "制冷", "供风温度", "送风温度", "设计供风温度", "设计温度", "供暖供冷温度"],
+                "ZONE_HEATING_DESIGN_SUPPLY_AIR_TEMPERATURE": ["供暖", "制热", "供风温度", "送风温度", "设计供风温度", "设计温度", "供暖供冷温度"],
+            }
+        }
     
     def _setup_logging(self):
         """初始化日志系统"""
-        log_file = os.path.join(self.log_dir, f"optimization_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        log_file = os.path.join(
+            self.log_dir, 
+            f"optimization_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
         
         logger = logging.getLogger(__name__)
+        logger.handlers = []  # 清除之前的处理器
         logger.setLevel(logging.DEBUG)
         
         # 文件处理器
@@ -105,7 +150,7 @@ class EnergyPlusOptimizationIterator:
         return logger
     
     def _locate_energyplus(self):
-        """定位EnergyPlus安装位置"""
+        """定位EnergyPlus安装"""
         common_paths = [
             r"C:\EnergyPlusV24-2-0",
             r"C:\EnergyPlusV24-1-0",
@@ -118,113 +163,64 @@ class EnergyPlusOptimizationIterator:
         for path in common_paths:
             exe_path = os.path.join(path, "energyplus.exe")
             if os.path.exists(exe_path):
-                self.logger.info(f"✓ 找到 EnergyPlus: {path}")
+                self.logger.info(f"✓ 找到EnergyPlus: {path}")
                 return exe_path
         
         return None
     
-    def run_energyplus_simulation(self, idf_path, output_dir, run_name):
-        """运行EnergyPlus模拟，返回输出目录"""
-        self.logger.info(f"【EnergyPlus模拟】开始运行模拟: {run_name}")
+    def run_simulation(self, idf_path, iteration_name):
+        """运行EnergyPlus模拟"""
+        self.logger.info(f"\n【模拟】{iteration_name}")
+        self.logger.info("-" * 80)
         
         try:
-            # 创建输出目录
-            run_dir = os.path.join(output_dir, run_name)
+            run_dir = os.path.join(self.optimization_dir, iteration_name)
             os.makedirs(run_dir, exist_ok=True)
             
-            # 复制IDF文件到运行目录
+            # 复制IDF到运行目录
             idf_name = os.path.splitext(os.path.basename(idf_path))[0]
-            run_idf = os.path.join(run_dir, f"{idf_name}.idf")
-            with open(idf_path, 'r', encoding='utf-8') as src:
-                with open(run_idf, 'w', encoding='utf-8') as dst:
-                    dst.write(src.read())
+            sim_idf = os.path.join(run_dir, f"{idf_name}.idf")
+            shutil.copy(idf_path, sim_idf)
             
             # 运行EnergyPlus
             cmd = [
                 self.eplus_exe,
                 "-w", self.epw_path,
                 "-d", run_dir,
-                "-r",  # 生成SQL结果
-                run_idf
+                "-r",
+                sim_idf
             ]
             
-            self.logger.info(f"执行命令: {' '.join(cmd)}")
+            self.logger.info(f"执行EnergyPlus: {iteration_name}")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             
             if result.returncode == 0:
-                self.logger.info(f"✓ 模拟成功: {run_name}")
-                self.logger.info(f"输出目录: {run_dir}")
+                self.logger.info(f"✓ 模拟完成: {iteration_name}")
                 return run_dir
             else:
-                self.logger.error(f"✗ 模拟失败: {run_name}")
-                self.logger.error(f"错误信息: {result.stderr}")
-                
-                # 尝试读取错误文件
-                err_file = os.path.join(run_dir, "eplusout.err")
-                if os.path.exists(err_file):
-                    with open(err_file, 'r', encoding='latin-1') as f:
-                        err_content = f.read()
-                        self.logger.error(f"EnergyPlus 错误:\n{err_content}")
-                
+                self.logger.error(f"✗ 模拟失败: {iteration_name}")
+                self.logger.error(f"返回码: {result.returncode}")
+                if result.stderr:
+                    self.logger.error(f"错误: {result.stderr[:500]}")
                 return None
-                
+        
         except subprocess.TimeoutExpired:
-            self.logger.error(f"✗ 模拟超时: {run_name}")
+            self.logger.error(f"✗ 模拟超时: {iteration_name}")
             return None
         except Exception as e:
-            self.logger.error(f"✗ 模拟异常: {run_name} - {e}")
+            self.logger.error(f"✗ 模拟异常: {str(e)}")
             return None
     
-    def extract_energy_metrics(self, sim_output_dir):
-        """从SQLite数据库提取能耗数据"""
+    def extract_metrics(self, sim_dir):
+        """从SQLite数据库提取能耗指标"""
         try:
-            # 查找SQL数据库文件
-            sql_file = os.path.join(sim_output_dir, "eplusout.sql")
-            
+            sql_file = os.path.join(sim_dir, "eplusout.sql")
             if not os.path.exists(sql_file):
                 self.logger.error(f"SQL文件不存在: {sql_file}")
                 return None
             
-            # 连接数据库并查询
             conn = sqlite3.connect(sql_file)
             cursor = conn.cursor()
-            
-            metrics = {}
-            
-            # 查询1: 总建筑能耗 (kWh)
-            try:
-                cursor.execute(
-                    "SELECT Value FROM TablesData WHERE ReportVariableData_TableName='Site Outdoor Air Drybulb Temperature' LIMIT 1"
-                )
-                # 实际应该查询能耗相关字段，这里用示例
-                # 正确的查询应该是针对能耗变量的
-                pass
-            except:
-                pass
-            
-            # 使用eppy读取结果文件替代SQL查询
-            result_file = os.path.join(sim_output_dir, "eplusout.eio")
-            energy_kwh = self._parse_eio_file(result_file)
-            
-            conn.close()
-            
-            if energy_kwh:
-                self.logger.info(f"✓ 提取能耗数据成功")
-                return energy_kwh
-            else:
-                self.logger.warning(f"⚠ 无法提取能耗数据")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"✗ 提取能耗数据异常: {e}")
-            return None
-    
-    def _parse_eio_file(self, eio_file):
-        """从EIO文件解析能耗数据"""
-        try:
-            if not os.path.exists(eio_file):
-                self.logger.warning(f"EIO文件不存在: {eio_file}")
-                return None
             
             metrics = {
                 'total_site_energy_kwh': 0,
@@ -233,208 +229,292 @@ class EnergyPlusOptimizationIterator:
                 'total_heating_kwh': 0
             }
             
-            with open(eio_file, 'r', encoding='latin-1') as f:
-                for line in f:
-                    line = line.strip()
+            try:
+                # 从TabularData表中查询能耗数据（单位：GJ）
+                # 数据结构：Total End Uses行包含所有能源类型的汇总
+                # 包括：Electricity, Natural Gas, Coal, District Cooling/Heating等
+                # 过滤条件：
+                # - 不包含"Source"前缀（因为Source是换算后的，会重复计算）
+                # - 不包含"Water"（这是用水量，不是能耗）
+                
+                # 1. 查询总建筑能耗 - Total End Uses行的所有非Source、非Water能源求和
+                cursor.execute("""
+                    SELECT COALESCE(SUM(CAST(t.Value AS FLOAT)), 0) as TotalEnergy
+                    FROM TabularData t 
+                    JOIN Strings sr ON t.RowNameIndex = sr.StringIndex 
+                    JOIN Strings sc ON t.ColumnNameIndex = sc.StringIndex 
+                    JOIN Strings su ON t.UnitsIndex = su.StringIndex 
+                    WHERE sr.Value = 'Total End Uses'
+                    AND su.Value = 'GJ'
+                    AND sc.Value NOT LIKE 'Source%'
+                    AND sc.Value != 'Water'
+                """)
+                
+                total_result = cursor.fetchone()
+                if total_result:
+                    total_gj = float(total_result[0])
+                    metrics['total_site_energy_kwh'] = round(total_gj * 277.778, 2)
+                    self.logger.debug(f"总建筑能耗: {total_gj} GJ = {metrics['total_site_energy_kwh']} kWh")
+                
+                # 2. 查询冷却能耗 - Cooling行的所有非Source、非Water能源求和
+                cursor.execute("""
+                    SELECT COALESCE(SUM(CAST(t.Value AS FLOAT)), 0) as CoolingEnergy
+                    FROM TabularData t 
+                    JOIN Strings sr ON t.RowNameIndex = sr.StringIndex 
+                    JOIN Strings sc ON t.ColumnNameIndex = sc.StringIndex 
+                    JOIN Strings su ON t.UnitsIndex = su.StringIndex 
+                    WHERE sr.Value = 'Cooling'
+                    AND su.Value = 'GJ'
+                    AND sc.Value NOT LIKE 'Source%'
+                    AND sc.Value != 'Water'
+                """)
+                
+                cooling_result = cursor.fetchone()
+                if cooling_result:
+                    cooling_gj = float(cooling_result[0])
+                    metrics['total_cooling_kwh'] = round(cooling_gj * 277.778, 2)
+                    self.logger.debug(f"冷却能耗: {cooling_gj} GJ = {metrics['total_cooling_kwh']} kWh")
+                
+                # 3. 查询供暖能耗 - Heating行的所有非Source、非Water能源求和
+                cursor.execute("""
+                    SELECT COALESCE(SUM(CAST(t.Value AS FLOAT)), 0) as HeatingEnergy
+                    FROM TabularData t 
+                    JOIN Strings sr ON t.RowNameIndex = sr.StringIndex 
+                    JOIN Strings sc ON t.ColumnNameIndex = sc.StringIndex 
+                    JOIN Strings su ON t.UnitsIndex = su.StringIndex 
+                    WHERE sr.Value = 'Heating'
+                    AND su.Value = 'GJ'
+                    AND sc.Value NOT LIKE 'Source%'
+                    AND sc.Value != 'Water'
+                """)
+                
+                heating_result = cursor.fetchone()
+                if heating_result:
+                    heating_gj = float(heating_result[0])
+                    metrics['total_heating_kwh'] = round(heating_gj * 277.778, 2)
+                    self.logger.debug(f"供暖能耗: {heating_gj} GJ = {metrics['total_heating_kwh']} kWh")
+                
+                # 4. 查询能耗强度 (MJ/m²) 并转换为 kWh/m²
+                cursor.execute("""
+                    SELECT t.Value 
+                    FROM TabularData t 
+                    JOIN Strings sr ON t.RowNameIndex = sr.StringIndex 
+                    JOIN Strings su ON t.UnitsIndex = su.StringIndex 
+                    WHERE sr.Value = 'Total Site Energy'
+                    AND su.Value = 'MJ/m2'
+                """)
+                
+                eui_result = cursor.fetchone()
+                if eui_result:
+                    try:
+                        eui_mj_m2 = float(eui_result[0])
+                        metrics['eui_kwh_per_m2'] = round(eui_mj_m2 / 3.6, 2)
+                        self.logger.debug(f"能耗强度: {eui_mj_m2} MJ/m² = {metrics['eui_kwh_per_m2']} kWh/m²")
+                    except Exception as e:
+                        self.logger.warning(f"无法从SQL查询能耗强度: {e}")
+                
+                conn.close()
+                
+                # 验证数据完整性
+                if metrics['total_site_energy_kwh'] > 0:
+                    self.logger.info(f"✓ 从SQL数据库成功提取能耗数据")
+                    self.logger.info(f"  总建筑能耗: {metrics['total_site_energy_kwh']} kWh")
+                    self.logger.info(f"  能耗强度: {metrics['eui_kwh_per_m2']} kWh/m²")
+                    self.logger.info(f"  冷却能耗: {metrics['total_cooling_kwh']} kWh")
+                    self.logger.info(f"  供暖能耗: {metrics['total_heating_kwh']} kWh")
+                    return metrics
+                else:
+                    self.logger.warning(f"⚠ 无法从SQL数据库提取能耗数据")
+                    return None
                     
-                    # 解析关键行
-                    if 'Total Site Energy' in line:
-                        try:
-                            parts = line.split(',')
-                            if len(parts) >= 2:
-                                val = float(parts[1].strip())
-                                metrics['total_site_energy_kwh'] = val / 1000.0 if val > 10000 else val
-                        except:
-                            pass
-                    
-                    elif 'Energy per Total Building Area' in line:
-                        try:
-                            parts = line.split(',')
-                            if len(parts) >= 2:
-                                val = float(parts[1].strip())
-                                metrics['eui_kwh_per_m2'] = val
-                        except:
-                            pass
-                    
-                    elif 'Total Cooling' in line and 'Energy' in line:
-                        try:
-                            parts = line.split(',')
-                            if len(parts) >= 2:
-                                val = float(parts[1].strip())
-                                metrics['total_cooling_kwh'] = val / 1000.0 if val > 10000 else val
-                        except:
-                            pass
-                    
-                    elif 'Total Heating' in line and 'Energy' in line:
-                        try:
-                            parts = line.split(',')
-                            if len(parts) >= 2:
-                                val = float(parts[1].strip())
-                                metrics['total_heating_kwh'] = val / 1000.0 if val > 10000 else val
-                        except:
-                            pass
-            
-            return metrics if any(metrics.values()) else None
-            
+            except Exception as e:
+                self.logger.error(f"✗ SQL查询异常: {e}")
+                conn.close()
+                return None
+        
         except Exception as e:
-            self.logger.error(f"✗ 解析EIO文件异常: {e}")
+            self.logger.error(f"✗ 提取数据异常: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             return None
-
-    def get_idf_object_summary(self):
-        """
-        提取仅包含对象类型、数量和示例名称的概览，用于第一阶段对象选择，减少 token。
-        """
-        summary = {}
-        for obj_type in self.base_idf.idfobjects:
-            objs = self.base_idf.idfobjects[obj_type]
-            if len(objs) > 0:
-                summary[obj_type] = {
-                    "count": len(objs),
-                    "example_names": [getattr(o, 'Name', 'N/A') for o in objs[:3]]
-                }
-        return summary
-
-
-    def generate_object_plan(self, user_request):
-        """
-        第一阶段：仅基于对象概览（不含字段列表）生成候选对象类型，降低 token。
-        返回 JSON：{clarification_needed, question, options:[{object_type}], modifications:[]}
-        """
+    
+    def generate_optimization_suggestions(self, metrics, iteration):
+        """基于能耗数据调用LLM获取优化建议"""
+        self.logger.info(f"\n【LLM优化分析】第{iteration}轮")
+        self.logger.info("-" * 80)
+        
         if not self.client:
-            print("API Client 未初始化，无法调用 LLM。")
+            self.logger.error("OpenAI客户端未初始化")
             return None
-
-        object_summary = self.get_idf_object_summary()
-        # 调试输出：第一阶段喂给 LLM 的对象类型列表
+        
+        user_request = self._build_optimization_request(metrics, iteration)
+        # 保存当前建议文本，用于后续关键词检查
+        self.current_user_request = user_request
+        
         try:
-            obj_list = sorted(object_summary.keys())
-            print("\n[DEBUG] 第一阶段对象类型列表（传递给 LLM）:")
-            print(", ".join(obj_list))
-        except Exception:
-            pass
-        system_prompt = """
-你是 EnergyPlus 对象选择助手。只输出严格 JSON，不要解释。
-
-【目标】仅根据对象类型列表（含数量与示例名称），为用户需求挑选可能相关的 object_type 候选项。
-【约束】不输出字段信息；若不唯一，设置 clarification_needed=true 并给出多个 object_type 选项。
-
-输出格式：
-{
-  "clarification_needed": true,
-  "question": "请选择最相关的对象类型",
-  "options": [ {"object_type": "Lights"}, {"object_type": "ElectricEquipment"} ],
-  "modifications": []
-}
-"""
-        user_prompt = f"""
-用户需求（REQUESTS）: "{user_request}"
-
-对象概览（仅对象类型、数量、示例名称）：
-{json.dumps(object_summary, indent=2, ensure_ascii=False)}
-
-请返回候选对象类型列表，尽量覆盖所有可能性。
-"""
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_format={"type": "json_object"}
-            )
-            plan = json.loads(response.choices[0].message.content)
-            # 打印 token 使用统计
-            usage = response.usage
-            print(f"[Token] 第一阶段（对象选择）: prompt={usage.prompt_tokens}, completion={usage.completion_tokens}, total={usage.total_tokens}")
-            return plan
+            IDF.setiddname(self.idd_path)
+            self.base_idf = IDF(self.current_idf_path)
         except Exception as e:
-            print(f"LLM 调用失败: {e}")
+            self.logger.error(f"加载当前IDF失败: {e}")
             return None
 
-    def generate_field_plan(self, user_request, object_type):
-        """
-        第二阶段：仅针对用户选择的 object_type，提供该对象的字段列表给 LLM，让其给出候选字段或直接修改方案。
-        返回 JSON：当有多个字段时设置 clarification_needed=true 并在 options 中给出 fields。
-        """
-        if not self.client:
-            print("API Client 未初始化，无法调用 LLM。")
+        plan = self.generate_plan_with_knowledge_base(user_request)
+        if not plan:
+            self.logger.error("LLM未返回有效修改方案")
             return None
-
-        # 获取该对象的字段列表
-        if object_type not in self.base_idf.idfobjects or len(self.base_idf.idfobjects[object_type]) == 0:
-            print(f"对象类型 '{object_type}' 不存在或没有实例。")
+        
+        if plan.get('reasoning'):
+            self.logger.info(f"\n【LLM推理过程】\n{plan['reasoning']}")
+        if plan.get('confidence'):
+            self.logger.info(f"[置信度] {plan['confidence']}")
+        
+        # 如果LLM无法找到与5个建议相关的修改方案，返回None以使用默认方案
+        if plan.get('clarification_needed') or not plan.get('modifications'):
+            self.logger.warning(f"LLM无法推荐有效修改方案，将使用默认优化策略")
             return None
-        fields = self.base_idf.idfobjects[object_type][0].fieldnames
+        
+        return plan
+    
+    def apply_optimization(self, plan, iteration):
+        """根据LLM计划修改IDF（保持与 main.py 一致的过滤与修改逻辑）"""
+        if not plan or 'modifications' not in plan:
+            self.logger.warning("无有效的修改计划")
+            return None
+        
+        self.logger.info(f"\n【应用优化】第{iteration}轮优化修改")
+        self.logger.info("-" * 80)
 
-        system_prompt = """
-你是 EnergyPlus 字段选择助手。只输出严格 JSON，不要解释。
-
-【目标】基于给定的对象类型与其字段列表，挑选满足用户需求的字段集合。
-【约束】字段来自提供的列表；若不唯一，设置 clarification_needed=true 并在 options 中列出多个字段。
-
-输出示例：
-{
-  "clarification_needed": true,
-  "question": "该对象有多个相关字段，请选择需要修改的字段",
-  "options": [{"object_type": "Lights", "fields": ["Watts_per_Floor_Area", "Watts_per_Person"]}],
-  "modifications": []
-}
-"""
-        user_prompt = f"""
-用户需求（REQUESTS）: "{user_request}"
-对象类型：{object_type}
-字段列表（仅该对象）：{json.dumps(fields, ensure_ascii=False)}
-请返回候选字段（或直接给出 modifications）。
-"""
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_format={"type": "json_object"}
-            )
-            plan = json.loads(response.choices[0].message.content)
-            # 打印 token 使用统计
-            usage = response.usage
-            print(f"[Token] 第二阶段（字段选择，对象={object_type}）: prompt={usage.prompt_tokens}, completion={usage.completion_tokens}, total={usage.total_tokens}")
-            return plan
+            IDF.setiddname(self.idd_path)
+            self.base_idf = IDF(self.current_idf_path)
         except Exception as e:
-            print(f"LLM 调用失败: {e}")
+            self.logger.error(f"加载当前IDF失败: {e}")
             return None
+
+        # 关键词过滤上下文：同时包含用户请求与LLM建议内容
+        self.current_plan_context = self._build_plan_context_text(plan)
+        
+        coefficient = 0.85
+        
+        refined_plan = {
+            "clarification_needed": False,
+            "question": None,
+            "options": [],
+            "modifications": []
+        }
+        
+        for mod in plan.get("modifications", []):
+            obj_type = mod.get("object_type", "")
+            fields = mod.get("fields", {})
+            refined_fields = {}
+            
+            # 对每个字段进行关键词检查和应用系数
+            for field_name, expr in fields.items():
+                # 检查该字段是否允许修改（基于关键词限制）
+                if not self._check_modification_allowed(obj_type, field_name):
+                    self.logger.info(
+                        f"  【关键词过滤】跳过 {obj_type}.{field_name} - "
+                        f"建议文本未包含必需关键词，不允许修改此字段"
+                    )
+                    continue  # 跳过这个字段，不将其添加到refined_fields
+                
+                # 应用系数到表达式
+                refined_fields[field_name] = self._apply_coefficient_to_expr(expr, coefficient)
+            
+            # 只有当该对象还有待修改的字段时，才添加到refined_plan
+            if refined_fields:
+                refined_plan["modifications"].append({
+                    "object_type": mod.get("object_type"),
+                    "name_filter": mod.get("name_filter"),
+                    "apply_to_all": mod.get("apply_to_all", True),
+                    "fields": refined_fields
+                })
+            else:
+                # 所有字段都被过滤掉了，记录警告
+                self.logger.info(
+                    f"  【关键词过滤】对象类型 {obj_type} 的所有字段因关键词限制被过滤，不会进行任何修改"
+                )
+        
+        output_idf = os.path.join(self.optimization_dir, f"iteration_{iteration}_optimized.idf")
+        self._execute_modifications(refined_plan, output_idf, self.current_idf_path)
+        
+        if os.path.exists(output_idf):
+            self.logger.info(f"✓ 优化修改完成: {output_idf}")
+            self.current_idf_path = output_idf
+            return output_idf
+        
+        self.logger.warning("⚠ 优化修改未生成输出文件")
+        return None
+
+    def _build_optimization_request(self, metrics, iteration):
+        """构造用于知识库检索与LLM推理的需求描述"""
+        if iteration == 1:
+            status_note = "初始基准模拟"
+        else:
+            status_note = f"第{iteration}轮迭代优化"
+        
+        # 构建优化请求，描述当前状态和目标
+        request = (
+            f"{status_note}。当前能耗指标：\n"
+            f"- 总建筑能耗 {metrics['total_site_energy_kwh']} kWh\n"
+            f"- 能耗强度 {metrics['eui_kwh_per_m2']} kWh/m²\n"
+            f"- 冷却能耗 {metrics['total_cooling_kwh']} kWh\n"
+            f"- 供暖能耗 {metrics['total_heating_kwh']} kWh\n"
+            f"\n【核心优化目标】必须同时降低总能耗、供暖能耗、制冷能耗三者，不允许其中任何一项上升。"
+        )
+
+        # 反馈上一轮效果，避免重复沿错误方向调整
+        if len(self.iteration_history) >= 2:
+            prev_metrics = self.iteration_history[-2]['metrics']
+            delta_total = metrics['total_site_energy_kwh'] - prev_metrics['total_site_energy_kwh']
+            delta_cooling = metrics['total_cooling_kwh'] - prev_metrics['total_cooling_kwh']
+            delta_heating = metrics['total_heating_kwh'] - prev_metrics['total_heating_kwh']
+
+            request += (
+                f"\n【上一轮效果反馈】\n"
+                f"  总能耗变化: {delta_total:+.2f} kWh\n"
+                f"  制冷能耗变化: {delta_cooling:+.2f} kWh\n"
+                f"  供暖能耗变化: {delta_heating:+.2f} kWh"
+            )
+
+            # 详细分析每一项的变化
+            problems = []
+            if delta_total > 0:
+                problems.append("总能耗上升")
+            if delta_cooling > 0:
+                problems.append("制冷能耗上升")
+            if delta_heating > 0:
+                problems.append("供暖能耗上升")
+            
+            if problems:
+                request += (
+                    f"\n⚠️ 上一轮存在问题：{', '.join(problems)}。\n"
+                    f"本轮必须针对性修正：\n"
+                )
+                if delta_cooling > 0:
+                    request += f"  - 制冷能耗上升了{delta_cooling:.2f} kWh，需要调整制冷相关参数（如提高制冷供风温度、增加窗户反射率、降低内部热源等）\n"
+                if delta_heating > 0:
+                    request += f"  - 供暖能耗上升了{delta_heating:.2f} kWh，需要调整供暖相关参数（如降低供暖供风温度、增加围护结构保温、减少渗透等）\n"
+                request += f"  - 避免重复上一轮的修改方向，应反向调整或采用更小步长。"
+            else:
+                request += "\n✓ 上一轮三项指标均下降，本轮继续沿此方向优化，但注意保持平衡。"
+        
+        request += f"\n请根据物理原理，推荐可执行的IDF参数修改方案（允许某些字段增大、另一些字段减小）。"
+        
+        return request
 
     def generate_plan_with_knowledge_base(self, user_request):
-        """
-        【新方法】使用知识库增强检索，直接生成修改方案，减少交互
-        利用知识库预先匹配对象和字段，只将相关的候选项传递给 LLM，
-        让 LLM 能够一次性准确识别并生成完整的修改方案。
-        """
-        if not self.client:
-            print("API Client 未初始化，无法调用 LLM。")
+        """使用知识库生成修改计划（与 main.py 逻辑保持一致）"""
+        if not self.knowledge_base:
+            self.logger.error("知识库未加载，无法生成计划")
             return None
         
-        if not self.knowledge_base:
-            print("知识库未加载，退回传统模式。")
-            return self.generate_object_plan(user_request)
-        
-        # 使用知识库获取增强的上下文
         enhanced_context = self.knowledge_base.get_enhanced_context(user_request)
         
         if not enhanced_context['matched_objects']:
-            print("⚠ 知识库未找到匹配对象，退回传统模式。")
-            return self.generate_object_plan(user_request)
+            self.logger.warning("知识库未找到匹配对象")
+            return None
         
-        # 打印知识库匹配结果
-        print("\n【知识库匹配结果】")
-        for obj in enhanced_context['matched_objects']:
-            candidate_count = len(obj['candidate_fields'])
-            print(f"  ✓ {obj['object_type']}: {candidate_count} 个候选字段及其语义信息")
-        
-        # 构建详细的字段语义信息供 LLM 参考
         kb_context = {
             'user_intent': enhanced_context['user_intent_analysis'],
             'candidates': []
@@ -444,7 +524,6 @@ class EnergyPlusOptimizationIterator:
             obj_type = obj['object_type']
             candidate_fields = obj['candidate_fields']
 
-            # 按对象的 Calculation Method 过滤字段，避免选错计算方式
             if obj_type in self.base_idf.idfobjects and len(self.base_idf.idfobjects[obj_type]) > 0:
                 sample_obj = self.base_idf.idfobjects[obj_type][0]
                 candidate_field_names = [f['field_name'] for f in candidate_fields]
@@ -452,7 +531,6 @@ class EnergyPlusOptimizationIterator:
                 if filtered_names:
                     candidate_fields = [f for f in candidate_fields if f['field_name'] in filtered_names]
 
-            # 构建字段语义信息
             field_semantics_list = []
             for field_info in candidate_fields:
                 field_semantics_list.append({
@@ -464,7 +542,6 @@ class EnergyPlusOptimizationIterator:
                     'related_concepts': field_info.get('related_concepts', [])
                 })
             
-            # 获取对象实例的当前值
             current_values = {}
             if obj_type in self.base_idf.idfobjects and len(self.base_idf.idfobjects[obj_type]) > 0:
                 sample_obj = self.base_idf.idfobjects[obj_type][0]
@@ -482,40 +559,202 @@ class EnergyPlusOptimizationIterator:
             })
         
         system_prompt = """
-你是 EnergyPlus 专家。你的任务不是简单查表，而是理解用户需求的物理含义，并基于字段的物理性质进行推理。
+你是 EnergyPlus 专家。你的任务是理解用户的能耗优化目标，并基于字段的物理含义进行推理，推荐合适的IDF参数修改方案。
 
-【重要概念】
-某些用户提到的参数（如"遮阳系数"）在 IDF 中可能没有直接对应字段。你需要根据物理原理推断：
-- 用户说什么目标？（物理意义）
-- 使用哪个字段最合适？（根据字段语义）
-- 应该增加还是减少该字段的值？（根据字段的物理含义）
+【🎯 核心优化目标】
+经过多轮迭代优化，最终要实现：
+- 总建筑能耗降低 ≥30%
+- 供暖能耗降低 ≥30%  
+- 制冷能耗降低 ≥30%
+- 所有参数修改必须符合实际工程应用，不得超出合理范围
 
-例如：
-- 用户说"降低遮阳系数"实际上想降低太阳热进入
-- 在 IDF 中，这对应两个方向：
-  a) 增加 Front_Side_Solar_Reflectance_at_Normal_Incidence（反射率越高，越多光被反射出去）
-  b) 减少 Solar_Transmittance_at_Normal_Incidence（透射率越低，越少光透进来）
-- 你需要选择最合理的字段和修改方向
+【� 重要：使用自然语言，避免 IDF 技术术语】
+- **reasoning 中使用通俗易懂的物理描述**，而不是 IDF 对象名称
+  - ✅ 推荐："提高制冷系统设计供风温度可以改善冷机运行效率"
+  - ❌ 避免："修改 Sizing:Zone 的 Zone_Cooling_Design_Supply_Air_Temperature"
+- **不要在 reasoning 中提及 IDF 对象类型名**（如 ZoneHVAC:IdealLoadsAirSystem、Sizing:Zone 等）
+- **用物理现象和节能原理描述优化逻辑**
+- 只在 modifications 数组的 object_type 字段中使用准确的 IDF 对象名
 
-【输入信息】
-1. 用户需求及其隐含的物理意图
-2. 候选对象的所有字段及其物理含义（已按 Calculation Method 过滤）
-3. 每个字段的当前值
+【🔥 优先推荐：供风温度优化（高效节能措施）】
+**供风温度优化是最有效的 HVAC 节能措施之一**，应该优先考虑：
+- 提高制冷设计供风温度（14°C→15-17°C）：冷机COP提升5-15%
+- 降低供暖设计供风温度（50°C→42-45°C）：热泵COP提升10-20%
+- 每调整1°C可影响HVAC能耗5-10%
 
-【任务】
-1. 分析用户的真实物理目标
-2. 理解每个候选字段的物理含义
-3. 推理应该修改哪些字段，以及增加还是减少
-4. 生成修改方案
+当用户提到"供暖供冷温度优化"、"供风温度"、"空调温度优化"等需求时：
+✅ **优先推荐修改 Sizing:Zone 的设计供风温度**（用自然语言描述为"调整系统设计温度参数"）
+✅ **在 reasoning 中强调"调整系统设计温度参数"的节能效果**
+⚠️ **只有当用户明确提到"阈值"、"上下限"、"最大最小"时，才考虑运行阈值修改**
 
-【输出格式】严格 JSON：
+【�🚨 关键警告：特殊关键字不可修改】
+EnergyPlus字段中的特殊关键字代表系统内部的自动计算或特定行为，绝对不能被修改成0或其他数值，否则会导致模拟崩溃。
+常见的特殊关键字包括：
+- autosize / AutoSize：自动计算大小（绝对不能改）
+- autocalculate / AutoCalculate：自动计算（绝对不能改）  
+- LimitFlowRateAndCapacity：限制流量和容量（绝对不能改）
+- LimitCapacity、LimitFlowRate、NoControl、Default、Yes、No 等
+
+对你的建议：
+- 浏览current_sample_values时，如果字段值包含上述关键字，说明该字段无法修改
+- 只建议修改那些current_sample_values为普通数字的字段
+- 如果某个对象的所有候选字段都是特殊关键字，千万不要尝试修改，应该跳过它
+- 只有在所有候选对象都没有可修改数字字段时，才设置 clarification_needed=true
+
+【参考优化建议及参数范围】
+当前阶段我们重点参考以下优化方向，**请采用激进但合理的参数调整**：
+
+1. **提高照明效率，降低照明功率密度**
+   - 照明功率密度（W/m²）：可降低30-50%
+   - 现代LED照明：办公室5-8 W/m²，走廊3-5 W/m²
+   - 旧建筑典型值：10-15 W/m²
+
+2. **提高墙体保温性能，降低材料导热系数**
+   - 保温材料导热系数：可降低30-60%（如0.04→0.02 W/m·K）
+   - 增加保温层厚度或使用更好的保温材料
+   - 外墙、屋顶、地面分别优化
+
+3. **降低夏季太阳辐射得热**
+   - 窗户太阳热得系数(SHGC)：可降低30-50%
+   - 窗户可见光透射率：适度降低20-40%
+   - 外遮阳系数：可降低40-60%
+
+4. **减少空气渗透热损失**
+   - 渗透率：可降低40-70%（改善气密性）
+   - 典型值：良好气密性 0.0001 m³/s·m²，普通0.0003 m³/s·m²
+
+5. **优化室内设备热负荷**
+   - 设备功率密度：可降低20-40%
+   - 通过设备更新、使用调度优化
+
+6. **提高HVAC系统热回收效率**
+   - 热回收效率：可从0提升至0.65-0.80（显热和潜热）
+   - COP/EER：提高冷热源效率20-40%
+
+7. **🔥 优化HVAC供风温度设计参数（系统设计阶段）**
+   - 制冷设计供风温度：可从13-14°C提升至15-17°C（提高制冷机组效率）
+   - 供暖设计供风温度：可从50°C降至42-45°C（提高热泵COP）
+   - 物理含义：系统初始设计的供风温度，影响空调设备选型和能力
+   - 优点：改变系统设计参数，整体优化能耗
+   - 影响：会改变系统的底层工作点
+
+8. **⚡ 优化HVAC供风温度运行阈值（系统运行阶段）**
+   - 最小制冷供风温度：可从16°C提升至17-18°C
+   - 最大供暖供风温度：可适度调整
+   - 物理含义：系统运行时的供风温度限制/阈值，约束实际供风不能低于/高于这个值
+   - 优点：直接改变运行时的控制策略，使供风更温和
+   - 影响：减少供风温度的过度设定，使系统运行更高效
+
+9. **🔥 优化温控设定点（用户舒适度目标）**
+   - 冬季供暖设定温度：可降低1-2°C（20-22°C→18-19°C）
+   - 夏季制冷设定温度：可提高1-2°C（24-25°C→25-26°C）
+   - 影响：供暖能耗降低8-15%/°C，制冷能耗降低8-12%/°C
+   - 注意：修改的是用户期望的目标温度，由空调系统追踪
+
+【三种温度参数的区别（务必理解）】
+```
+┌─────────────────┬──────────────────────────┬─────────────┬────────────────┐
+│    参数类型     │         定义             │   修改方式  │    作用机制    │
+├─────────────────┼──────────────────────────┼─────────────┼────────────────┤
+│ 设计供风温度    │ 空调系统初始设计参数     │ Sizing:Zone │ 影响系统设计  │
+│ (Sizing:Zone)   │ 例：14°C制冷，50°C供暖  │ (设计参数)  │ 和设备选型    │
+├─────────────────┼──────────────────────────┼─────────────┼────────────────┤
+│ 运行供风阈值    │ 系统运行时的上下限制    │ IdealLoads  │ 约束实际供风  │
+│ (IdealLoads)    │ 例：最小16°C最大55°C    │ (阈值)      │ 直接控制流量  │
+├─────────────────┼──────────────────────────┼─────────────┼────────────────┤
+│ 温控设定点      │ 用户期望的舒适温度      │ Schedule    │ 空调追踪目标  │
+│ (Schedule)      │ 例：冬季22°C夏季24°C    │ (设定值)    │ 主要影响负荷  │
+└─────────────────┴──────────────────────────┴─────────────┴────────────────┘
+```
+
+**优化原理**：
+- ✅ **提高制冷设计温度**（14→16°C）：制冷机组运行工况更好→COP提升→能耗降低
+- ✅ **降低供暖设计温度**（50→45°C）：热泵运行工况更好→COP提升→能耗降低
+- ✅ **提高制冷阈值**（16→17°C）：供冷时的下限更高→供风更温和→舒适度OK但能耗低
+- ✅ **降低温控设定点**（22→20°C）：空调需要维持的目标温度更低→负荷减少→能耗降低
+
+10. **优化新风量**
+   - 人均新风量：在满足健康标准前提下可适度优化10-20%
+   - 办公室标准≥0.008 m³/s/人（GB/T18883），典型值0.008-0.010
+   - 过高的新风量会显著增加供暖/制冷负荷
+
+11. **优化人员密度**
+   - 人员密度：可降低20-40%（灵活办公、共享工位）
+   - 典型值：办公室0.05-0.08 人/m²，共享工位0.03-0.05 人/m²
+   - 影响：人员产热负荷降低，夏季制冷能耗减少
+
+12. **优化围护结构组合**
+    - 在Material基础上，可整体优化Construction层级
+    - 调整各层厚度、顺序、材料组合
+
+【关键理解】
+这些方向是你优化推荐的首选范围。对于知识库返回的每个候选对象，你需要评估：
+- 它与上述方向中的哪一个相关？
+- 当前值距离高性能建筑标准还有多大差距？
+- 可以采用多大幅度的改进（在合理范围内尽可能激进）
+- 如果候选对象与所有方向都无关，则设置 clarification_needed=true
+
+【任务流程】
+1. 分析用户需求涉及的物理过程（例如"遮阳系数"→太阳热增益）
+2. 确定它最接近的优化方向
+3. 从知识库候选对象中找出符合这个方向的对象
+4. **查看current_sample_values，只选择值为数字且不是特殊关键字的字段**
+5. 推理具体修改哪个字段（从列出的可修改字段中选择）
+6. 决定增加还是减少字段值
+7. 同时检查对“总能耗、供暖、制冷”的综合影响，避免只盯单一指标
+
+【字段名硬约束（必须遵守）】
+- 你只能使用 `field_semantics` 与 `current_sample_values` 里出现的字段名，禁止发明新字段名。
+- 对 Lights / ElectricEquipment / ZoneInfiltration:DesignFlowRate：
+    必须根据该对象的 Calculation Method 只选择当前生效字段（如 Watts/Area -> Watts_per_Floor_Area）。
+- 若你不能确定当前生效字段，必须设置 clarification_needed=true，绝不能猜测字段名。
+
+【关键约束：供暖与制冷必须同时优化】
+- **核心要求**：修改方案必须能够同时降低供暖能耗和制冷能耗，不允许只优化其中一个。
+- **供暖能耗降低策略**：
+  * 大幅增加围护结构保温性能（材料导热系数降低30-60%）
+  * 显著减少空气渗透（渗透率降低40-70%）
+  * 大幅提高热回收效率（0→0.65-0.80）
+  * 适当降低供暖供风温度（50→42-45°C）
+  * 降低内部热源损失
+- **制冷能耗降低策略**：
+  * 大幅减少太阳辐射得热（SHGC降低30-50%）
+  * 显著降低内部热源（照明功率密度降低30-50%，设备功率密度降低20-40%）
+  * 适度提高制冷供风温度（13→15-17°C）
+  * 大幅提高热回收效率（0→0.65-0.80）
+  * 改善窗户性能（U值降低、遮阳优化）
+- **平衡原则**：
+  * 优先采用对供暖和制冷都有利的措施（保温、渗透、热回收、内热源）
+  * 某些措施可能对供暖和制冷有相反影响（如窗户性能），需要综合评估
+  * 若上一轮供暖能耗上升，本轮必须包含至少3项供暖降低措施
+  * 若上一轮制冷能耗上升，本轮必须包含至少3项制冷降低措施
+  * **每轮优化应同时涉及多个类别的措施**（如同时优化围护结构+HVAC+内热源）
+- **严格禁止**：不允许为了降低制冷而牺牲供暖，也不允许为了降低供暖而牺牲制冷。
+
+【输出格式】严格 JSON，必须包含以下内容：
+⚠️ **CRITICAL：modifications 数组必须覆盖至少5个不同优化方面（对象类别）**
+⚠️ **建议给出5-8个修改项，且每个方面至少1条有效字段修改**
 {
   "clarification_needed": false,
-  "reasoning": "你的推理过程（为什么选择这些字段，为什么增加或减少）",
+  "reasoning": "清晰描述推理链：用户需求 → 物理目标 → 多个优化方向 → 多对象类别选择 → 具体修改方案",
   "confidence": "high/medium/low",
   "modifications": [
     {
-      "object_type": "对象类型",
+      "object_type": "对象类型1（如Lights、ElectricEquipment、Material等）",
+      "name_filter": null,
+      "fields": {
+        "字段名": "修改表达式"
+      }
+    },
+    {
+      "object_type": "对象类型2（不同于类型1）",
+      "name_filter": null,
+      "fields": {
+        "字段名": "修改表达式"
+      }
+    },
+    {
+      "object_type": "对象类型3（可选，增加覆盖范围）",
       "name_filter": null,
       "fields": {
         "字段名": "修改表达式"
@@ -523,15 +762,35 @@ class EnergyPlusOptimizationIterator:
     }
   ]
 }
+✅ 示例：modifications 中可包含 [Lights, ElectricEquipment, Material, ZoneInfiltration, ZoneHVAC:IdealLoadsAirSystem] 中的多个
+
+【供风温度字段的严格映射（必须遵守）】
+- 当建议是“设计供风温度（设计值）”时：只能改 `Sizing:Zone` 的
+    `Zone_Cooling_Design_Supply_Air_Temperature` / `Zone_Heating_Design_Supply_Air_Temperature`。
+- 当建议是“运行阈值（最小/最大供风温度）”时：只能改 `ZoneHVAC:IdealLoadsAirSystem` 的
+    `Minimum_Cooling_Supply_Air_Temperature` / `Maximum_Heating_Supply_Air_Temperature`。
+- 严禁混淆：
+    * 不要把“设计值”建议写成阈值字段
+    * 不要把“阈值”建议写成设计字段
+- 严禁修改 `Sizing:Zone` 中的 `...Input_Method`、`...Difference` 等语义不同字段。
 
 【修改表达式规则】
-- 使用 existing_value 代表原值，coefficient 代表系数
-- 示例：
-  * "existing_value * coefficient" （减少/增加原有值）
-  * "existing_value - coefficient" （各取所需）
-  * "coefficient" （设置为固定值）
-- 如果无法确定，设置 clarification_needed=true
-"""
+- 使用 existing_value 代表字段原值，coefficient 代表外部系数
+- 字段优化方向不能写死为“降低”，必须根据物理机理决定是增加还是减少
+- 可使用增加或减少两种表达：
+    * "existing_value * 1.1"（增加10%）
+    * "existing_value * 0.9"（减少10%）
+    * "existing_value + 1" 或 "existing_value - 1"
+    * "existing_value * coefficient"（仅当你确认需要统一系数缩放）
+
+【必须遵守】
+- 只使用知识库提供的候选对象和字段，不要凭空编造
+- **绝对不要推荐修改包含特殊关键字的字段**
+- 若存在至少1个“可修改=是”的字段，必须给出至少1条 modifications（clarification_needed=false）
+- 若存在多个“可修改=是”的相关字段，优先给出多字段组合方案（通常2~4个字段）
+- 只有在不存在任何可修改数字字段时，才允许 clarification_needed=true
+- 如果无法确定应该修改某个对象，宁可跳过它，不要勉强关联
+"""  
         
         user_prompt = f"""
 用户需求: "{user_request}"
@@ -549,8 +808,13 @@ class EnergyPlusOptimizationIterator:
             user_prompt += f"  该对象的字段及其物理含义:\n"
             
             for field in candidate['field_semantics']:
+                field_name = field['field_name']
+                current_value = candidate.get('current_sample_values', {}).get(field_name, "未设置")
+                modifiable = self._is_numeric_value(current_value) and (not self._is_special_value(current_value))
                 user_prompt += f"\n    • {field['field_name']}\n"
                 user_prompt += f"      物理含义: {field['description']}\n"
+                user_prompt += f"      当前值: {current_value}\n"
+                user_prompt += f"      可修改: {'是' if modifiable else '否'}\n"
                 if field['unit']:
                     user_prompt += f"      单位: {field['unit']}\n"
                 if field['range']:
@@ -559,43 +823,389 @@ class EnergyPlusOptimizationIterator:
                 if field['related_concepts']:
                     user_prompt += f"      用户可能称呼: {', '.join(field['related_concepts'])}\n"
         
+        # 添加字段使用频率摘要
+        field_usage_summary = self._get_field_usage_summary()
+        user_prompt += f"\n\n{field_usage_summary}\n"
+        
         user_prompt += f"""
 
-【请根据以上信息进行推理】
-1. 用户说的是什么物理目标？
-2. 哪些字段与这个目标最相关？
-3. 应该增加还是减少这些字段的值？
-4. 是否所有相关对象都应该修改？
+【强制多对象修改要求】
+**本轮优化必须涉及至少5个不同类别的对象修改。**修改方案应覆盖以下多个类别：
+- 照明  - 照明功率密度
+- 设备 - 设备功率密度  
+- 围护结构 - 导热系数
+- 窗户 - 太阳热得系数
+- 渗透 - 渗透率
+- HVAC - 供风温度、热回收效率
+- 人员 - 人员密度
+- 新风 - 新风量
 
-然后生成修改方案。
+modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象类别。
+
+在"current_sample_values"中显示的是该字段的当前值。需要你检查这些值：
+- 如果当前值是数字（如5.5、100、0.8），则该字段可以被修改
+- 如果当前值包含特殊关键字（autosize、AutoCalculate、LimitFlowRateAndCapacity等），绝对不能修改！
+- 如果当前值是"未设置"，说明该字段为空，不应该修改
+
+【推理步骤】
+1. **首先分析用户目标的物理过程和优化方向**
+   - 在12个优化方向中，哪些与用户需求最相关？
+
+2. **主动识别所有可能的优化方向（不要遗漏）**
+   - 如果知识库返回Lights → 考虑"照明功率密度优化"
+   - 如果知识库返回People → 考虑"人员密度优化"
+   - 如果知识库返回DesignSpecification:OutdoorAir → 考虑"新风量优化"
+   - 如果知识库返回Sizing:Zone → 考虑"供暖供冷温度优化"
+   - 如果知识库返回ZoneHVAC:IdealLoadsAirSystem → 考虑"热回收效率提升"
+   - 如果知识库返回Material → 考虑"保温性能改善"
+   - 如果知识库返回ZoneInfiltration → 考虑"减少空气渗透"
+   - **不要只依赖知识库返回的对象，要主动思考相关优化方向**
+
+3. **从至少5个不同类别中选择优化方向（强制要求）**
+   - 不允许只优化一个类别（如只改Sizing:Zone）
+   - 必须涉及多个维度（HVAC + 围护 + 内热源等）
+    - 温度相关场景默认优先考虑“设计供风温度”（Sizing:Zone）
+    - 只有当文本出现“阈值/上下限/限制/最大/最小”等语义时，才启用运行阈值字段（IdealLoads）
+
+4. **为每个优化方向确定具体修改字段**
+   - 参考"建议→字段修改的明确映射"部分
+   - 确保建议与modifications中的字段修改相对应
+
+5. **验证modifications数组的完整性**
+    - 至少5-8条修改记录
+    - 至少5个不同的对象类别
+   - 包含reasoning中提到的所有优化方向
+
+然后生成修改方案。如果至少有一个"可修改=是"的字段，必须输出可执行修改，不要设置clarification_needed=true。
+若上一轮总能耗变差，优先给出"反向或减小步长"的方案。
 """
         
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_format={"type": "json_object"}
-            )
-            plan = json.loads(response.choices[0].message.content)
+            plan = self._request_plan_from_llm(system_prompt, user_prompt)
+            if not plan:
+                return None
+
+            min_categories = 5
+            category_count = self._count_plan_categories(plan)
+            if category_count < min_categories:
+                self.logger.warning(
+                    f"LLM方案仅覆盖{category_count}个优化方面，低于要求的{min_categories}个，触发一次纠偏重生成"
+                )
+                repair_prompt = user_prompt + f"""
+
+【纠偏重生成（必须遵守）】
+你上一版仅覆盖{category_count}个优化方面，未达到要求。
+请重新生成JSON，并满足：
+1) modifications 至少覆盖5个不同对象类别（优化方面）
+2) 优先覆盖：HVAC设计温度、热回收、照明、设备、渗透、新风、人员、围护中的至少5类
+3) 若提到“阈值/上下限/限制/最大/最小”，可修改IdealLoads阈值字段；否则优先修改Sizing:Zone设计温度字段
+4) 不得修改特殊关键字字段（autosize/autocalculate等）
+"""
+                repaired_plan = self._request_plan_from_llm(system_prompt, repair_prompt)
+                if repaired_plan:
+                    repaired_count = self._count_plan_categories(repaired_plan)
+                    if repaired_count >= category_count:
+                        plan = repaired_plan
+                        category_count = repaired_count
+
+            if category_count < min_categories:
+                self.logger.warning(
+                    f"最终LLM方案覆盖{category_count}个优化方面，仍低于{min_categories}个；将继续执行当前最佳方案"
+                )
+
+            temp_issue = self._get_temperature_mapping_issue(plan, user_request)
+            if temp_issue:
+                self.logger.warning(f"温度字段映射检查未通过：{temp_issue}，触发一次纠偏重生成")
+                temp_repair_prompt = user_prompt + f"""
+
+【温度映射纠偏（必须遵守）】
+{temp_issue}
+
+规则：
+1) 如果文本没有“阈值/上下限/限制/最大/最小”等语义，禁止修改 IdealLoads 的
+   Minimum_Cooling_Supply_Air_Temperature / Maximum_Heating_Supply_Air_Temperature。
+2) 此时应优先修改 Sizing:Zone 的
+   Zone_Cooling_Design_Supply_Air_Temperature / Zone_Heating_Design_Supply_Air_Temperature。
+3) 如果文本出现阈值语义，允许修改 IdealLoads 阈值字段；并鼓励同时保留设计温度优化。
+请重新生成严格JSON。
+"""
+                temp_repaired_plan = self._request_plan_from_llm(system_prompt, temp_repair_prompt)
+                if temp_repaired_plan:
+                    repaired_issue = self._get_temperature_mapping_issue(temp_repaired_plan, user_request)
+                    if not repaired_issue:
+                        plan = temp_repaired_plan
+                    else:
+                        self.logger.warning(f"温度字段映射纠偏后仍未完全满足：{repaired_issue}，将继续执行当前最佳方案")
             
-            # 打印 token 使用统计
-            usage = response.usage
-            print(f"[Token] 知识库增强模式（含推理）: prompt={usage.prompt_tokens}, completion={usage.completion_tokens}, total={usage.total_tokens}")
-            
-            # 显示推理过程和置信度
-            if plan.get('reasoning'):
-                print(f"\n【LLM推理过程】\n{plan['reasoning']}\n")
-            if plan.get('confidence'):
-                print(f"[置信度] {plan['confidence']}")
-            
+            # ========== 字段多样性检查 ==========
+            is_diverse, diversity_issue = self._check_field_diversity(plan)
+            if not is_diverse and diversity_issue:
+                self.logger.warning(f"字段多样性检查未通过：{diversity_issue}，触发一次纠偏重生成")
+                diversity_repair_prompt = user_prompt + f"""
+
+【字段多样性纠偏（必须遵守）】
+{diversity_issue}
+
+要求：
+1) 避免过度集中于少数高频字段，应从多个类别中选择字段进行修改
+2) 优先选择低频字段，如：人员密度、新风量、遮阳系数、设备功率密度等
+3) 至少覆盖3个核心优化类别（人员、照明、设备、新风、遮阳、保温、渗透、HVAC等）
+4) 参考【历史字段修改频率统计】，优先使用低频字段，避免高频字段
+请重新生成包含更多样化字段的JSON方案。
+"""
+                diversity_repaired_plan = self._request_plan_from_llm(system_prompt, diversity_repair_prompt)
+                if diversity_repaired_plan:
+                    repaired_is_diverse, _ = self._check_field_diversity(diversity_repaired_plan)
+                    if repaired_is_diverse:
+                        plan = diversity_repaired_plan
+                        self.logger.info("✓ 多样性纠偏成功，已采用新方案")
+                    else:
+                        self.logger.warning(f"多样性纠偏后仍未完全满足，将继续执行当前最佳方案")
+
             return plan
         except Exception as e:
-            print(f"LLM 调用失败: {e}")
+            self.logger.error(f"LLM 调用失败: {e}")
             return None
+
+    def _request_plan_from_llm(self, system_prompt, user_prompt):
+        """统一的LLM请求入口，负责调用与token日志。"""
+        self.llm_calls_count += 1
+        self.logger.info(f"\n🤖 【调用LLM】第{self.llm_calls_count}次调用 - 模型: gpt-4o")
+
+        response = self.client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+        plan = json.loads(response.choices[0].message.content)
+        usage = response.usage
+
+        prompt_tokens = usage.prompt_tokens
+        completion_tokens = usage.completion_tokens
+        total_tokens = usage.total_tokens
+        self.total_tokens_used += total_tokens
+
+        self.logger.info("✓ LLM分析完成")
+        self.logger.info(f"  - Prompt Tokens: {prompt_tokens:,}")
+        self.logger.info(f"  - Completion Tokens: {completion_tokens:,}")
+        self.logger.info(f"  - 本次总计: {total_tokens:,} tokens")
+        self.logger.info(f"  - 累计使用: {self.total_tokens_used:,} tokens")
+        return plan
+
+    def _count_plan_categories(self, plan):
+        """统计计划中涉及的对象类别数量。"""
+        if not isinstance(plan, dict):
+            return 0
+
+        categories = set()
+        for mod in plan.get("modifications", []):
+            object_type = str(mod.get("object_type", "")).strip()
+            fields = mod.get("fields", {})
+            if not object_type or not isinstance(fields, dict) or not fields:
+                continue
+            categories.add(object_type.upper())
+
+        return len(categories)
+
+    def _contains_threshold_intent(self, text):
+        """判断文本是否包含阈值/上下限语义。"""
+        text_lower = str(text or "").lower()
+        threshold_keywords = [
+            "阈值", "上下限", "上限", "下限", "限制", "最大", "最小",
+            "threshold", "limit", "upper", "lower"
+        ]
+        return any(keyword in text_lower for keyword in threshold_keywords)
+    
+    def _print_modification_statistics(self, target_updates):
+        """打印本轮修改的统计信息：修改了多少个object，每个object修改了多少个field"""
+        if not target_updates:
+            self.logger.info("\n【本轮修改统计】无修改")
+            return
+        
+        # 按对象类型和名称分组
+        objects_modified = {}
+        for update in target_updates:
+            obj_key = f"{update['type']} ({update['name']})"
+            if obj_key not in objects_modified:
+                objects_modified[obj_key] = []
+            objects_modified[obj_key].append(update['field'])
+        
+        total_objects = len(objects_modified)
+        total_fields = len(target_updates)
+        
+        self.logger.info("\n" + "="*100)
+        self.logger.info("【本轮修改统计】")
+        self.logger.info("="*100)
+        self.logger.info(f"修改对象总数: {total_objects}")
+        self.logger.info(f"修改字段总数: {total_fields}")
+        self.logger.info("")
+        
+        for obj_key, fields in sorted(objects_modified.items()):
+            self.logger.info(f"  ▶ {obj_key}: {len(fields)} 个字段")
+            for field in fields:
+                self.logger.info(f"      • {field}")
+        
+        self.logger.info("="*100 + "\n")
+    
+    def _update_field_modification_history(self, target_updates):
+        """更新字段修改频率历史记录"""
+        for update in target_updates:
+            field_key = f"{update['type']}.{update['field']}"
+            if field_key not in self.field_modification_history:
+                self.field_modification_history[field_key] = 0
+            self.field_modification_history[field_key] += 1
+    
+    def _get_field_usage_summary(self, max_high_freq=10, max_low_freq=10):
+        """生成字段使用频率摘要，用于LLM prompt"""
+        if not self.field_modification_history:
+            return "暂无历史修改记录，这是首轮优化。"
+        
+        # 按频率排序
+        sorted_fields = sorted(
+            self.field_modification_history.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        
+        high_freq_fields = sorted_fields[:max_high_freq]
+        low_freq_fields = sorted_fields[-max_low_freq:] if len(sorted_fields) > max_low_freq else []
+        
+        summary = "【历史字段修改频率统计】\n"
+        
+        if high_freq_fields:
+            summary += "⚠️ 高频修改字段（已被过度使用，本轮应避免或减少使用）：\n"
+            for field, count in high_freq_fields:
+                summary += f"  - {field}: 已使用 {count} 次\n"
+        
+        if low_freq_fields:
+            summary += "\n✅ 低频修改字段（推荐优先使用，增加优化多样性）：\n"
+            for field, count in low_freq_fields:
+                summary += f"  - {field}: 仅使用 {count} 次\n"
+        
+        # 统计覆盖的对象类型
+        object_types_count = {}
+        for field_key in self.field_modification_history.keys():
+            obj_type = field_key.split('.')[0]
+            object_types_count[obj_type] = object_types_count.get(obj_type, 0) + 1
+        
+        summary += f"\n已修改的对象类型数: {len(object_types_count)}\n"
+        summary += "对象类型覆盖情况：\n"
+        for obj_type, count in sorted(object_types_count.items(), key=lambda x: x[1], reverse=True):
+            summary += f"  - {obj_type}: {count} 个字段被修改过\n"
+        
+        return summary
+    
+    def _check_field_diversity(self, plan):
+        """检查优化方案的字段多样性
+        返回: (is_diverse, issue_description)
+        """
+        if not isinstance(plan, dict) or 'modifications' not in plan:
+            return True, None
+        
+        modifications = plan.get('modifications', [])
+        if not modifications:
+            return True, None
+        
+        # 提取本轮涉及的字段
+        current_fields = set()
+        object_types = set()
+        for mod in modifications:
+            obj_type = str(mod.get('object_type', '')).upper()
+            object_types.add(obj_type)
+            fields = mod.get('fields', {})
+            for field_name in fields.keys():
+                field_key = f"{obj_type}.{str(field_name).upper()}"
+                current_fields.add(field_key)
+        
+        # 检查1：是否过度集中在高频字段
+        if self.field_modification_history:
+            sorted_fields = sorted(
+                self.field_modification_history.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )
+            top_5_high_freq = {field.upper() for field, _ in sorted_fields[:5]}
+            
+            overlap_count = 0
+            for field in current_fields:
+                if field.upper() in top_5_high_freq:
+                    overlap_count += 1
+            
+            # 如果本轮80%以上的字段都是高频字段，认为多样性不足
+            if len(current_fields) > 0 and overlap_count / len(current_fields) >= 0.8:
+                return False, f"本轮方案过度集中在高频字段（{overlap_count}/{len(current_fields)}个字段为高频字段）"
+        
+        # 检查2：是否缺少核心优化类别
+        # 定义核心字段关键词（大类）
+        core_categories = {
+            "人员密度": ["PEOPLE", "PERSON", "DENSITY"],
+            "照明功率": ["LIGHTS", "LIGHTING", "POWER"],
+            "设备功率": ["ELECTRICEQUIPMENT", "EQUIPMENT"],
+            "新风量": ["OUTDOORAIR", "VENTILATION"],
+            "遮阳系数": ["SHGC", "SOLARHEATGAINCOEFFICIENT", "WINDOW"],
+            "保温性能": ["MATERIAL", "CONDUCTIVITY", "THERMAL"],
+            "渗透率": ["INFILTRATION", "AIRCHANGES"],
+            "HVAC效率": ["HEATRECOVERY", "EFFICIENCY", "COP"],
+        }
+        
+        # 统计已覆盖的核心类别
+        covered_categories = set()
+        for field in current_fields:
+            field_upper = field.upper()
+            for category, keywords in core_categories.items():
+                if any(keyword in field_upper for keyword in keywords):
+                    covered_categories.add(category)
+                    break
+        
+        # 如果少于3个核心类别，提示多样性不足
+        if len(covered_categories) < 3:
+            missing_categories = set(core_categories.keys()) - covered_categories
+            return False, f"本轮方案仅覆盖 {len(covered_categories)} 个核心优化类别（建议至少3个）。缺失类别：{', '.join(list(missing_categories)[:5])}"
+        
+        return True, None
+
+    def _get_temperature_mapping_issue(self, plan, user_request):
+        """校验温度建议是否符合“设计温度优先、阈值按语义启用”的规则。"""
+        if not isinstance(plan, dict):
+            return "计划格式无效"
+
+        reasoning = str(plan.get("reasoning", ""))
+        text_for_intent = f"{user_request}\n{reasoning}"
+        has_threshold_intent = self._contains_threshold_intent(text_for_intent)
+
+        has_ideal_threshold_fields = False
+        has_sizing_design_fields = False
+
+        for mod in plan.get("modifications", []):
+            object_type = str(mod.get("object_type", "")).upper()
+            fields = mod.get("fields", {})
+            if not isinstance(fields, dict):
+                continue
+
+            field_names_upper = {str(field).upper() for field in fields.keys()}
+
+            if object_type == "ZONEHVAC:IDEALLOADSAIRSYSTEM":
+                if (
+                    "MINIMUM_COOLING_SUPPLY_AIR_TEMPERATURE" in field_names_upper
+                    or "MAXIMUM_HEATING_SUPPLY_AIR_TEMPERATURE" in field_names_upper
+                ):
+                    has_ideal_threshold_fields = True
+
+            if object_type == "SIZING:ZONE":
+                if (
+                    "ZONE_COOLING_DESIGN_SUPPLY_AIR_TEMPERATURE" in field_names_upper
+                    or "ZONE_HEATING_DESIGN_SUPPLY_AIR_TEMPERATURE" in field_names_upper
+                ):
+                    has_sizing_design_fields = True
+
+        if not has_threshold_intent and has_ideal_threshold_fields and not has_sizing_design_fields:
+            return "未检测到阈值语义，但方案使用了IdealLoads阈值字段且缺少Sizing:Zone设计温度字段"
+
+        return None
 
     def _filter_fields_by_method(self, object_type, sample_obj, candidate_fields):
         """
@@ -605,7 +1215,17 @@ class EnergyPlusOptimizationIterator:
         if not candidate_fields:
             return candidate_fields
 
-        method_field_map = {
+        target_field = self._get_method_target_field(object_type, sample_obj)
+        if not target_field:
+            return candidate_fields
+
+        if target_field in candidate_fields:
+            return [target_field]
+        return candidate_fields
+
+    def _get_method_field_map(self):
+        """返回按对象类型定义的 Calculation Method → 有效字段映射。"""
+        return {
             "Lights": ("Design_Level_Calculation_Method", {
                 "WATTS/AREA": "Watts_per_Floor_Area",
                 "WATTS/PERSON": "Watts_per_Person",
@@ -625,171 +1245,277 @@ class EnergyPlusOptimizationIterator:
             }),
         }
 
+    def _has_method_mapping(self, object_type):
+        return object_type in self._get_method_field_map()
+
+    def _get_method_field_name(self, object_type):
+        method_map = self._get_method_field_map()
+        if object_type not in method_map:
+            return None
+        return method_map[object_type][0]
+
+    def _get_method_target_field(self, object_type, sample_obj):
+        """根据对象的 Calculation Method 解析当前生效字段名，无法解析时返回 None。"""
+        method_field_map = self._get_method_field_map()
+
         if object_type not in method_field_map:
-            return candidate_fields
+            return None
 
         method_field, value_map = method_field_map[object_type]
         method_val = getattr(sample_obj, method_field, None)
         if not method_val:
-            return candidate_fields
+            return None
 
         key = str(method_val).upper().replace(" ", "")
-        target_field = value_map.get(key)
-        if not target_field:
-            return candidate_fields
+        return value_map.get(key)
 
-        if target_field in candidate_fields:
-            return [target_field]
-        return candidate_fields
+    def _get_valid_fields_for_method(self, object_type, sample_obj):
+        """获取某个对象当前Calculation Method对应的所有有效字段集合。"""
+        method_field_map = self._get_method_field_map()
 
+        if object_type not in method_field_map:
+            return set()
+
+        method_field, value_map = method_field_map[object_type]
+        return set(value_map.values())
+
+    def _is_field_for_method(self, object_type, sample_obj, target_field):
+        """检查target_field是否与该对象的当前Calculation Method相匹配。"""
+        valid_fields = self._get_valid_fields_for_method(object_type, sample_obj)
+        if not valid_fields:
+            # 没有method定义则无法验证，返回True（允许修改）
+            return True
+        return target_field in valid_fields
+
+    def _is_special_value(self, value):
+        """
+        检测字段值是否为EnergyPlus特殊关键字（不应修改）。
+        这些关键字代表内部自动计算或特定行为，不能改成0
+        """
+        if not isinstance(value, str):
+            return False
+        
+        value_lower = value.lower().strip()
+        
+        # 空值视为未设置
+        if value_lower == '':
+            return True
+        
+        # EnergyPlus特殊关键字列表（精确匹配或前缀匹配）
+        # 使用元组 (keyword, match_type) 其中 match_type 为 'exact' 或 'contains'
+        special_keywords = [
+            ('autosize', 'exact'),
+            ('autocalculate', 'exact'),
+            ('limitflowrateandcapacity', 'exact'),
+            ('limitcapacity', 'exact'),
+            ('limitflowrate', 'exact'),
+            ('nocontrol', 'exact'),
+            ('on', 'exact'),
+            ('off', 'exact'),
+            ('default', 'exact'),
+            ('differencedays', 'exact'),
+            ('differencescheduled', 'exact'),
+            ('yes', 'exact'),
+            ('no', 'exact'),
+        ]
+        
+        # 精确匹配：值必须完全等于关键字
+        for keyword, match_type in special_keywords:
+            if match_type == 'exact' and value_lower == keyword:
+                return True
+            elif match_type == 'contains' and keyword in value_lower:
+                return True
+        
+        return False
+
+    def _is_numeric_value(self, value):
+        """判断字段值是否为可计算的数值"""
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return True
+        if isinstance(value, str):
+            text = value.strip()
+            if text == "":
+                return False
+            try:
+                float(text)
+                return True
+            except (ValueError, TypeError):
+                return False
+        return False
+
+    def _normalize_field_label(self, text):
+        """标准化字段名/注释名，用于精确匹配（避免子串误匹配）。"""
+        if text is None:
+            return ""
+        cleaned = str(text).upper()
+        cleaned = re.sub(r"\{[^}]*\}", "", cleaned)
+        cleaned = re.sub(r"[^A-Z0-9]", "", cleaned)
+        return cleaned
+
+    def _get_object_identifier(self, obj):
+        """获取对象实例标识，优先 Name，不存在时回退到常见主键字段。"""
+        candidate_attrs = [
+            "Name",
+            "Zone_or_ZoneList_Name",
+            "Zone_Name",
+            "Space_Name",
+            "AirLoop_Name",
+            "Availability_Schedule_Name",
+        ]
+
+        for attr in candidate_attrs:
+            try:
+                val = getattr(obj, attr)
+                if val is not None and str(val).strip() != "":
+                    return str(val)
+            except Exception:
+                pass
+
+        return ""
+    
+    def _check_modification_allowed(self, object_type, field_name):
+        """
+        检查是否允许修改指定字段（基于关键词规则）。
+        
+        对于某些字段，需要建议文本中包含特定关键词才能修改。
+        例如：ZoneHVAC:IdealLoadsAirSystem的最大/最小供风温度阈值，
+        只有建议中明确提到"阈值"时才能修改。
+        
+        Args:
+            object_type: 对象类型（如"ZoneHVAC:IdealLoadsAirSystem"）
+            field_name: 字段名（如"Minimum_Cooling_Supply_Air_Temperature"）
+        
+        Returns:
+            bool: True表示允许修改，False表示不允许
+        """
+        # 标准化对象类型和字段名（不区分大小写）
+        obj_type_upper = object_type.upper()
+        field_upper = field_name.upper()
+        
+        # 检查是否有针对此对象类型的规则
+        if obj_type_upper not in self.field_keyword_rules:
+            return True  # 没有规则限制，允许修改
+        
+        obj_rules = self.field_keyword_rules[obj_type_upper]
+        
+        # 检查是否有针对此字段的规则
+        matched_rule_keywords = None
+        for rule_field, keywords in obj_rules.items():
+            if rule_field.upper() == field_upper:
+                matched_rule_keywords = keywords
+                break
+        
+        # 没有针对此字段的规则，允许修改
+        if matched_rule_keywords is None:
+            return True
+        
+        # 有规则，检查上下文文本中是否包含至少一个必需关键词
+        # 优先使用包含LLM建议内容的上下文，避免“建议里有阈值但仍被过滤”
+        context_text = self.current_plan_context if self.current_plan_context else self.current_user_request
+        context_text_lower = str(context_text).lower()
+        for keyword in matched_rule_keywords:
+            if str(keyword).lower() in context_text_lower:
+                return True  # 找到关键词，允许修改
+        
+        # 没有找到任何必需关键词，不允许修改
+        return False
+
+    def _build_plan_context_text(self, plan):
+        """构建字段关键词过滤所需的上下文文本。"""
+        parts = [self.current_user_request or ""]
+        if isinstance(plan, dict):
+            reasoning = plan.get("reasoning", "")
+            if reasoning:
+                parts.append(str(reasoning))
+            modifications = plan.get("modifications", [])
+            if modifications:
+                parts.append(json.dumps(modifications, ensure_ascii=False))
+        return "\n".join([p for p in parts if p])
+    
     def _apply_coefficient_to_expr(self, expr, coef):
-        """
-        将外部系数应用到表达式，避免重复乘导致系数被平方。
-        """
+        """将外部系数应用到表达式"""
         if not isinstance(expr, str):
             return expr
 
         expr_stripped = expr.strip()
 
-        # 显式占位符优先
         if re.search(r"\bcoefficient\b", expr_stripped, flags=re.IGNORECASE):
             return re.sub(r"\bcoefficient\b", str(coef), expr_stripped, flags=re.IGNORECASE)
 
-        # 仅在表达式是单纯 existing_value 时应用系数
         if re.fullmatch(r"\{?existing_value\}?", expr_stripped, flags=re.IGNORECASE):
             return f"existing_value * {coef}"
 
-        # 如果已有 existing_value * 数值，则替换数值为系数
-        m = re.search(r"existing_value\s*\*\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)", expr_stripped, flags=re.IGNORECASE)
-        if m:
-            return re.sub(r"existing_value\s*\*\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)",
-                          f"existing_value * {coef}",
-                          expr_stripped,
-                          flags=re.IGNORECASE)
-
-        # 其他复杂表达式不强行改写
         return expr_stripped
 
-    def interactive_select_object_and_fields(self, user_request):
-        """
-        两阶段交互：先对象选择（支持多选），再为每个对象进行字段选择。
-        返回列表：[{object_type, fields, name_filter}, ...]
-        """
-        # 阶段1：对象选择（支持多选）
-        obj_plan = self.generate_object_plan(user_request)
-        if not obj_plan:
-            return None
-        options = obj_plan.get("options", [])
-        if not options:
-            print("✗ LLM 未提供对象候选。")
-            return None
-        print("\n对象候选（支持多选）：")
-        for idx, opt in enumerate(options, 1):
-            print(f"  {idx}. {opt.get('object_type', '?')}")
-        
-        # 获取用户选择的对象（支持多选，逗号分隔）
-        chosen_objs = []
-        while True:
+    def _evaluate_expression(self, value, old_value):
+        """计算单个表达式"""
+        if not isinstance(value, str):
             try:
-                choice_str = input(f"请选择对象 (1-{len(options)}，可用逗号分隔多选): ").strip()
-                indices = [int(x.strip())-1 for x in choice_str.split(',') if x.strip()]
-                chosen_objs = [options[i] for i in indices if 0 <= i < len(options)]
-                if not chosen_objs:
-                    print("✗ 请至少选择一个对象")
-                    continue
-                break
-            except ValueError:
-                print("✗ 请输入有效数字")
+                num = float(value)
+                if abs(num - round(num)) < 1e-6:
+                    return float(round(num))
+                return round(num, 6)
+            except (ValueError, TypeError):
+                return value
         
-        print(f"✓ 已选择对象: {', '.join([opt.get('object_type', '?') for opt in chosen_objs])}")
-
-        # 阶段2：为每个选中的对象进行字段选择
-        selected_options = []
-        for obj_opt in chosen_objs:
-            selected_obj_type = obj_opt.get("object_type")
-            print(f"\n━━━ 处理对象: {selected_obj_type} ━━━")
-            
-            # 获取该对象的候选字段
-            field_plan = self.generate_field_plan(user_request, selected_obj_type)
-            if not field_plan:
-                print(f"⚠ 跳过 {selected_obj_type}：字段选择失败")
-                continue
-            
-            candidate_fields = []
-            if field_plan.get("clarification_needed"):
-                # 从 options 中拿字段列表
-                for opt in field_plan.get("options", []):
-                    if opt.get("object_type") == selected_obj_type:
-                        candidate_fields = opt.get("fields", [])
-                        break
+        value_lower = value.lower()
+        has_expr = any(var in value_lower for var in ['old_value', 'original_value', 'existing_value', 'current_value'])
+        
+        if not has_expr:
+            try:
+                num = float(value)
+                if abs(num - round(num)) < 1e-6:
+                    return float(round(num))
+                return round(num, 6)
+            except (ValueError, TypeError):
+                return value
+        
+        try:
+            if old_value is None or old_value == '' or (isinstance(old_value, str) and old_value.strip() == ''):
+                old_val_num = 0.0
             else:
-                mods = field_plan.get("modifications", [])
-                if mods:
-                    fields_obj = mods[0].get("fields", {})
-                    # 处理 fields 既可能是字典也可能是列表的情况
-                    if isinstance(fields_obj, dict):
-                        candidate_fields = list(fields_obj.keys())
-                    elif isinstance(fields_obj, list):
-                        candidate_fields = fields_obj
-                    else:
-                        candidate_fields = []
-            
-            if not candidate_fields:
-                # 如果 LLM 没给出，退回到全部字段
-                candidate_fields = self.base_idf.idfobjects[selected_obj_type][0].fieldnames
-
-            print(f"该对象有 {len(candidate_fields)} 个候选字段：")
-            sample_obj = self.base_idf.idfobjects[selected_obj_type][0]
-            for i, fld in enumerate(candidate_fields, 1):
-                val = getattr(sample_obj, fld, None)
-                if val is None or (isinstance(val, str) and val.strip() == ''):
-                    val_str = "None"
-                else:
-                    val_str = str(val)
-                print(f"  {i}. {fld} = {val_str}")
-            
-            field_input = input(f"请为 [{selected_obj_type}] 输入要修改的字段编号(可逗号多选，留空表示全选): ").strip()
-            if field_input:
                 try:
-                    indices = [int(x.strip())-1 for x in field_input.split(',') if x.strip()]
-                    chosen_fields = [candidate_fields[i] for i in indices if 0 <= i < len(candidate_fields)]
-                    if not chosen_fields:
-                        print("⚠ 无效输入，使用全部字段")
-                        chosen_fields = candidate_fields
-                except Exception:
-                    print("⚠ 输入错误，使用全部字段")
-                    chosen_fields = candidate_fields
-            else:
-                chosen_fields = candidate_fields
-                print(f"✓ 使用全部字段")
+                    old_val_num = float(old_value)
+                except (ValueError, TypeError):
+                    self.logger.warning(f"无法将原值 '{old_value}' 转换为数值，使用 0")
+                    old_val_num = 0.0
             
-            selected_options.append({
-                "object_type": selected_obj_type,
-                "fields": chosen_fields,
-                "name_filter": None
-            })
-        
-        return selected_options if selected_options else None
-    
-    def _do_modification_work(self, plan, output_idf_path):
+            expr = value
+            expr = re.sub(r'\{?old_value\}?', str(old_val_num), expr, flags=re.IGNORECASE)
+            expr = re.sub(r'\{?original_value\}?', str(old_val_num), expr, flags=re.IGNORECASE)
+            expr = re.sub(r'\{?existing_value\}?', str(old_val_num), expr, flags=re.IGNORECASE)
+            expr = re.sub(r'\{?current_value\}?', str(old_val_num), expr, flags=re.IGNORECASE)
+            
+            if any(dangerous in expr.lower() for dangerous in ['import', 'exec', 'eval', '__', 'open', 'os.']):
+                self.logger.error(f"表达式包含不安全操作: {expr}")
+                return value
+            
+            result = eval(expr, {"__builtins__": {}}, {})
+            try:
+                num = float(result)
+            except (ValueError, TypeError):
+                return result
+            if abs(num - round(num)) < 1e-6:
+                return float(round(num))
+            return round(num, 6)
+        except Exception as e:
+            self.logger.error(f"计算表达式 '{value}' 失败: {e}")
+            return value
+
+    def _do_modification_work(self, plan, output_idf_path, source_idf_path):
+        """执行修改并保存，保留原始IDF格式。
+        默认策略：同一对象类型下的同字段修改，应用到全部实例，避免漏改。
         """
-        【修改版】执行修改并保存。
-        为了完全保留原始 IDF 的结构、缩进和注释，
-        本方法采用"Eppy计算逻辑 + 纯文本替换"的混合模式。
-        1. 使用 eppy 找到目标对象和原值，计算出新值。
-        2. 读取原始 IDF 文本，定位特定行进行字符串替换。
-        """
-        # 1. 预计算所有需要修改的目标值
-        # 结构: target_updates = [ {type, name, field, value}, ... ]
         target_updates = []
         
-        # 使用 base_idf 查找对象并计算新值（但不修改 base_idf）
         for mod in plan["modifications"]:
             obj_type_input = mod.get("object_type")
             name_filter = mod.get("name_filter")
+            apply_to_all = mod.get("apply_to_all", True)
             fields_to_mod = mod.get("fields", {})
             
-            # 查找匹配的对象类型
             target_obj_type = None
             if obj_type_input in self.base_idf.idfobjects:
                 target_obj_type = obj_type_input
@@ -802,55 +1528,166 @@ class EnergyPlusOptimizationIterator:
                         break
             
             if not target_obj_type:
-                print(f"✗ 跳过: 找不到对象类型 '{obj_type_input}'")
+                self.logger.warning(f"跳过: 找不到对象类型 '{obj_type_input}'")
                 continue
 
+            if name_filter and apply_to_all:
+                self.logger.info(
+                    f"  [批量应用] {target_obj_type} 提供了 name_filter='{name_filter}'，"
+                    f"但当前策略为同字段批量修改，将应用到该对象类型全部实例。"
+                )
+
             for obj in self.base_idf.idfobjects[target_obj_type]:
-                obj_name = getattr(obj, 'Name', '')
-                if name_filter and obj_name != name_filter:
+                obj_name = self._get_object_identifier(obj)
+                if (not apply_to_all) and name_filter and obj_name != name_filter:
                     continue
                 
-                # 处理每个字段
                 for field_input, value_expr in fields_to_mod.items():
-                    # 字段匹配逻辑
                     clean_field = field_input.split('{')[0].strip()
                     valid_attrs = obj.fieldnames
                     target_attr = None
-                    
-                    # 1. 精确
-                    if hasattr(obj, clean_field.replace(" ", "_")):
-                        target_attr = clean_field.replace(" ", "_")
+                    method_target = self._get_method_target_field(target_obj_type, obj)
+
+                    # 对有 Method 约束的对象，强制只改当前 Method 对应字段，避免 LLM 误改
+                    if self._has_method_mapping(target_obj_type):
+                        method_field_name = self._get_method_field_name(target_obj_type)
+                        method_value = getattr(obj, method_field_name, None)
+                        if not method_target or method_target not in valid_attrs:
+                            self.logger.warning(
+                                f"  [跳过修改] {target_obj_type} ({obj_name}): "
+                                f"Method字段 '{method_field_name}' 当前值 '{method_value}' 无法解析为可修改字段，"
+                                f"跳过 LLM 建议字段 '{clean_field}'"
+                            )
+                            continue
+
+                        target_attr = method_target
+                        norm_llm_field = clean_field.lower().replace("_", "").replace(" ", "")
+                        norm_target_attr = target_attr.lower().replace("_", "").replace(" ", "")
+                        if norm_llm_field != norm_target_attr:
+                            self.logger.info(
+                                f"  [Method强制字段] {target_obj_type} ({obj_name}): "
+                                f"LLM建议字段 '{clean_field}' 已忽略，按 Method 使用 '{target_attr}'"
+                            )
                     else:
-                        # 2. 模糊匹配
-                        norm_field = clean_field.lower().replace("_", "").replace(" ", "")
-                        for attr in valid_attrs:
-                            if attr.lower().replace("_", "").replace(" ", "") == norm_field:
-                                target_attr = attr
-                                break
+                        if hasattr(obj, clean_field.replace(" ", "_")):
+                            target_attr = clean_field.replace(" ", "_")
+                        else:
+                            norm_field = clean_field.lower().replace("_", "").replace(" ", "")
+                            for attr in valid_attrs:
+                                if attr.lower().replace("_", "").replace(" ", "") == norm_field:
+                                    target_attr = attr
+                                    break
+
+                    if not target_attr:
+                        self.logger.warning(
+                            f"  [跳过修改] {target_obj_type} ({obj_name}): "
+                            f"无法匹配字段 '{clean_field}'，可用字段数={len(valid_attrs)}"
+                        )
+                        continue
                     
-                    if target_attr:
-                        # 获取原值并计算
-                        old_value = getattr(obj, target_attr, 0)
-                        final_value = self._evaluate_expression(value_expr, old_value)
-                        
-                        target_updates.append({
-                            "type": target_obj_type,
-                            "name": obj_name,
-                            "field": target_attr,
-                            "value": final_value
-                        })
-                        print(f"  [计划修改] {target_obj_type} ({obj_name}): {target_attr} -> {final_value}(原值: {old_value})")
+                    old_value = getattr(obj, target_attr, 0)
+                    
+                    # 检查是否为EnergyPlus特殊关键字，如果是则跳过修改
+                    # 这些关键字代表自动计算、特定行为等，不能被改成0或其他数值
+                    if self._is_special_value(old_value):
+                        self.logger.info(f"  [跳过修改] {target_obj_type} ({obj_name}): {target_attr} 原值为 '{old_value}'（特殊关键字），跳过")
+                        continue
+
+                    # 非数值字符串（如 None、DifferentialDryBulb 等枚举）不进行数值修改
+                    if isinstance(old_value, str) and not self._is_numeric_value(old_value):
+                        self.logger.info(f"  [跳过修改] {target_obj_type} ({obj_name}): {target_attr} 原值为 '{old_value}'（非数值字符串），跳过")
+                        continue
+                    
+                    final_value = self._evaluate_expression(value_expr, old_value)
+                    
+                    # 计算修改系数
+                    try:
+                        old_num = float(old_value) if old_value else 0.0
+                        new_num = float(final_value) if final_value else 0.0
+                        if old_num != 0:
+                            coefficient = new_num / old_num
+                        else:
+                            coefficient = None
+                    except (ValueError, TypeError):
+                        coefficient = None
+                    
+                    target_updates.append({
+                        "type": target_obj_type,
+                        "name": obj_name,
+                        "field": target_attr,
+                        "old_value": old_value,
+                        "value": final_value,
+                        "coefficient": coefficient,
+                        "expression": value_expr
+                    })
 
         if not target_updates:
-            print("没有产生有效的修改计划，跳过保存。")
+            self.logger.warning("没有产生有效的修改计划，跳过保存")
             return
 
-        # 2. 读取原始文本进行"外科手术式"替换
+        # ========== 【修改摘要】先于【计划修改】输出 ==========
+        self.logger.info("\n" + "="*100)
+        self.logger.info("【修改摘要】汇总 - 快速查看修改概览")
+        self.logger.info("="*100)
+        
+        # 按对象型号和名称分组统计
+        updates_by_obj = {}
+        for update in target_updates:
+            key = f"{update['type']} ({update['name']})"
+            if key not in updates_by_obj:
+                updates_by_obj[key] = []
+            updates_by_obj[key].append(update)
+        
+        total_modifications = len(target_updates)
+        self.logger.info(f"总修改数: {total_modifications}")
+        self.logger.info("")
+        
+        for obj_key, updates_list in sorted(updates_by_obj.items()):
+            self.logger.info(f"▶ {obj_key}")
+            for update in updates_list:
+                old_val = update.get('old_value', '?')
+                new_val = update['value']
+                expression = update.get('expression', '')
+                coef = update.get('coefficient')
+                field = update['field']
+                
+                # 格式化修改系数信息
+                if coef is not None:
+                    if coef >= 1.0:
+                        coef_str = f"增加 {coef:.2%}" if coef > 1 else "不变"
+                    else:
+                        coef_str = f"降低 {(1-coef):.2%}"
+                    coef_info = f" [{coef_str}]"
+                else:
+                    coef_info = " [计算系数失败]"
+                
+                self.logger.info(f"  • 字段: {field}")
+                self.logger.info(f"    原值: {old_val} → 新值: {new_val}{coef_info}")
+                if expression:
+                    self.logger.info(f"    表达式: {expression}")
+            self.logger.info("")
+        
+        self.logger.info("="*100)
+        self.logger.info("【计划修改】详情 - 逐一修改具体信息")
+        self.logger.info("="*100)
+        for update in target_updates:
+            obj_type = update['type']
+            obj_name = update['name']
+            field = update['field']
+            old_value = update['old_value']
+            new_value = update['value']
+            self.logger.info(f"  [计划修改] {obj_type} ({obj_name}): {field}")
+            self.logger.info(f"    原值: {old_value} → 新值: {new_value}")
+        self.logger.info("="*100)
+        self.logger.info("开始执行IDF文本替换...")
+        self.logger.info("="*100 + "\n")
+        # ========== END 修改摘要和计划修改输出 ==========
+
         try:
-            with open(self.idf_path, 'r', encoding='utf-8') as f:
+            with open(source_idf_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
         except UnicodeDecodeError:
-            with open(self.idf_path, 'r', encoding='latin-1') as f:
+            with open(source_idf_path, 'r', encoding='latin-1') as f:
                 lines = f.readlines()
 
         new_lines = []
@@ -858,20 +1695,25 @@ class EnergyPlusOptimizationIterator:
         current_obj_name = None
         in_object = False
         
-        # 为了处理不区分大小写的匹配
-        updates_map = {} # type -> { name -> { field -> value } }
+        updates_map = {}
         for item in target_updates:
             t = item['type'].upper()
             n = item['name'].upper()
             f = item['field'].upper()
-            if t not in updates_map: updates_map[t] = {}
-            if n not in updates_map[t]: updates_map[t][n] = {}
+            if t not in updates_map:
+                updates_map[t] = {}
+            if n not in updates_map[t]:
+                updates_map[t][n] = {}
             updates_map[t][n][f] = item['value']
+
+        # 记录都有哪些计划修改
+        planned_modifications_count = sum(len(v) for u in updates_map.values() for v in u.values())
+        self.logger.info(f"\n计划修改总数: {planned_modifications_count}")
+        executed_modifications = set()
 
         for line in lines:
             stripped = line.strip()
             
-            # 检测对象开始
             if not in_object and stripped and not stripped.startswith('!'):
                 parts = stripped.split('!')[0].strip().split(',')
                 possible_type = parts[0].strip().replace(';', '')
@@ -886,19 +1728,21 @@ class EnergyPlusOptimizationIterator:
                         current_obj_type = "UNKNOWN"
                         current_obj_name = "N/A"
 
-            # 如果在对象内，尝试匹配字段
             if in_object:
-                # 检查是否结束
                 if ';' in line.split('!')[0]:
                     in_object = False
                 
-                # 1. 尝试识别 Name 字段以锁定对象名
+                # 对象名识别：不同对象类型有不同的Name字段
                 if "!- Name" in line:
                     val_part = line.split('!')[0].strip()
                     val_part = val_part.replace(',', '').replace(';', '').strip()
                     current_obj_name = val_part.upper()
+                elif "!- Zone or ZoneList Name" in line and current_obj_type == "SIZING:ZONE":
+                    # Sizing:Zone特殊处理：第一个字段就是Zone or ZoneList Name
+                    val_part = line.split('!')[0].strip()
+                    val_part = val_part.replace(',', '').replace(';', '').strip()
+                    current_obj_name = val_part.upper()
                 
-                # 2. 检查是否是我们需要修改的字段
                 if current_obj_type in updates_map:
                     if '!' in line:
                         comment_part = line.split('!')[1].strip()
@@ -909,392 +1753,479 @@ class EnergyPlusOptimizationIterator:
                         
                         target_fields = updates_map[current_obj_type].get(current_obj_name, {})
                         
-                        # 核心替换逻辑：匹配字段名
                         matched_val = None
+                        matched_field_key = None
+                        norm_comment = self._normalize_field_label(field_comment)
                         for target_field_key, target_val in target_fields.items():
-                            # 归一化比较
-                            f1 = target_field_key.replace(" ", "").replace("_", "")
-                            f2 = field_comment.replace(" ", "").replace("_", "")
-                            
-                            if f1 in f2: # 包含匹配
+                            norm_target = self._normalize_field_label(target_field_key)
+                            if norm_target == norm_comment:
                                 matched_val = target_val
+                                matched_field_key = target_field_key
                                 break
                         
                         if matched_val is not None:
-                            # 执行替换（严格保留原始空格、分隔符、注释与换行）
+                            # 关键词限制检查：某些字段需要建议中包含特定关键词才能修改
+                            if not self._check_modification_allowed(current_obj_type, matched_field_key):
+                                self.logger.info(
+                                    f"  [跳过修改] {current_obj_type} ({current_obj_name}): {matched_field_key} "
+                                    f"- 建议中未包含必需的关键词，不允许修改此字段"
+                                )
+                                new_lines.append(line)
+                                continue
+                            
                             idx_bang = line.find('!')
                             if idx_bang == -1:
-                                # 没有注释，保守处理：仅替换数值，尽量不改变其他字符
                                 original_content = line
                                 comment_full = ''
                             else:
                                 original_content = line[:idx_bang]
                                 comment_full = line[idx_bang:]
 
-                            # 使用正则定位数值并替换，保留前后空格和分隔符
-                            import re
                             m = re.match(r"^(\s*)([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)(\s*)([,;].*)$", original_content.rstrip('\r\n'))
                             if m:
                                 leading = m.group(1)
-                                # old_val = m.group(2)  # 原值，不使用，只用于定位
                                 spaces_after = m.group(3)
                                 rest = m.group(4)
                                 new_original_content = f"{leading}{matched_val}{spaces_after}{rest}"
                             else:
-                                # 兜底：如果无法精准匹配，尝试替换第一个逗号/分号之前的非空内容为新值
-                                # 仍然保留原有前导空格与分隔符及其后续内容
                                 parts = original_content.rstrip('\r\n').split(',', 1)
                                 sep = ','
                                 if len(parts) == 1:
                                     parts = original_content.rstrip('\r\n').split(';', 1)
                                     sep = ';'
                                 if len(parts) == 2:
-                                    # 保留前导空格
                                     leading = parts[0][:len(parts[0]) - len(parts[0].lstrip())]
                                     tail = parts[1]
                                     new_original_content = f"{leading}{matched_val}{sep}{tail}"
                                 else:
-                                    # 无法判断结构，直接用原行（不做替换以避免破坏格式）
                                     new_original_content = original_content.rstrip('\r\n')
 
-                            # 重新拼接完整行，严格保留原有注释与换行
                             new_line = new_original_content + comment_full
                             line = new_line
-                            print(f"✓ [文本替换] {current_obj_type}: {field_comment} -> {matched_val}")
+                            exec_key = f"{current_obj_type}_{current_obj_name}_{matched_field_key}"
+                            executed_modifications.add(exec_key)
+                            self.logger.info(f"  [文本替换成功] {current_obj_type} ({current_obj_name}): {matched_field_key} -> {matched_val}")
 
             new_lines.append(line)
 
-        # 3. 保存
+        # 检查是否有计划修改没有被执行
+        self.logger.info(f"\n已执行修改数: {len(executed_modifications)}")
+        if len(executed_modifications) < planned_modifications_count:
+            unexecuted_count = planned_modifications_count - len(executed_modifications)
+            self.logger.warning(f"⚠️ 警告：{unexecuted_count}个计划修改未在IDF中找到对应字段！")
+            self.logger.warning("可能原因：")
+            self.logger.warning("  1. LLM建议修改的字段在IDF中不存在")
+            self.logger.warning("  2. 优化建议中提出的对象不符合当前支持的对象类型")
+            self.logger.warning("  3. 字段名大小写或格式不匹配")
+
         with open(output_idf_path, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
-        print(f"算例已保存至: {output_idf_path}")
+        self.logger.info(f"算例已保存至: {output_idf_path}")
+        
+        # ========== 本轮修改统计 ==========
+        self._print_modification_statistics(target_updates)
+        
+        # ========== 更新字段修改频率统计 ==========
+        self._update_field_modification_history(target_updates)
 
-    def _evaluate_expression(self, value, old_value):
-        """
-        计算单个表达式。输入原值，返回计算结果。
-        处理空值、None、字符串等各种情况。
-        """
-        if not isinstance(value, str):
-            # 非字符串，尝试数值格式化
-            try:
-                num = float(value)
-                # 近似整数处理
-                if abs(num - round(num)) < 1e-6:
-                    return float(round(num))
-                return round(num, 6)
-            except (ValueError, TypeError):
-                return value
+    def _execute_modifications(self, plan, output_idf_path, source_idf_path):
+        """执行实际的 IDF 修改"""
+        return self._do_modification_work(plan, output_idf_path, source_idf_path)
+    
+    def update_best_metrics(self, metrics, iteration):
+        """更新最优指标"""
+        if self.best_metrics is None:
+            self.best_metrics = metrics
+            self.best_iteration = iteration
+            self.logger.info(f"\n【最优值】第{iteration}轮为新的最优方案")
+        else:
+            if metrics['total_site_energy_kwh'] < self.best_metrics['total_site_energy_kwh']:
+                energy_saved = self.best_metrics['total_site_energy_kwh'] - metrics['total_site_energy_kwh']
+                save_pct = (energy_saved / self.best_metrics['total_site_energy_kwh'] * 100)
+                
+                self.best_metrics = metrics
+                self.best_iteration = iteration
+                
+                self.logger.info(f"\n【最优值更新】第{iteration}轮为新的最优方案！")
+                self.logger.info(f"节能 {energy_saved:.2f} kWh ({save_pct:.1f}%)")
+            else:
+                energy_diff = metrics['total_site_energy_kwh'] - self.best_metrics['total_site_energy_kwh']
+                self.logger.info(f"\n【对比最优值】本轮能耗增加 {energy_diff:.2f} kWh，未超过最优值")
+
+    def _print_iteration_savings(self, metrics, iteration):
+        """打印每轮节能明细（终端+日志）"""
+        if not self.iteration_history:
+            return
+
+        baseline_metrics = self.iteration_history[0]['metrics']
+
+        def _safe_pct(saved_value, base_value):
+            if base_value == 0:
+                return 0.0
+            return saved_value / base_value * 100
+
+        total_saved_vs_baseline = baseline_metrics['total_site_energy_kwh'] - metrics['total_site_energy_kwh']
+        eui_saved_vs_baseline = baseline_metrics['eui_kwh_per_m2'] - metrics['eui_kwh_per_m2']
+        cooling_saved_vs_baseline = baseline_metrics['total_cooling_kwh'] - metrics['total_cooling_kwh']
+        heating_saved_vs_baseline = baseline_metrics['total_heating_kwh'] - metrics['total_heating_kwh']
+
+        self.logger.info("\n【本轮节能明细（相对初始基准）】")
+        self.logger.info(
+            f"- 总建筑能耗: {total_saved_vs_baseline:+.2f} kWh "
+            f"({_safe_pct(total_saved_vs_baseline, baseline_metrics['total_site_energy_kwh']):+.2f}%)"
+        )
+        self.logger.info(
+            f"- 能耗强度(EUI): {eui_saved_vs_baseline:+.2f} kWh/m² "
+            f"({_safe_pct(eui_saved_vs_baseline, baseline_metrics['eui_kwh_per_m2']):+.2f}%)"
+        )
+        self.logger.info(
+            f"- 制冷能耗: {cooling_saved_vs_baseline:+.2f} kWh "
+            f"({_safe_pct(cooling_saved_vs_baseline, baseline_metrics['total_cooling_kwh']):+.2f}%)"
+        )
+        self.logger.info(
+            f"- 供暖能耗: {heating_saved_vs_baseline:+.2f} kWh "
+            f"({_safe_pct(heating_saved_vs_baseline, baseline_metrics['total_heating_kwh']):+.2f}%)"
+        )
+
+        if iteration > 1 and len(self.iteration_history) >= 2:
+            prev_metrics = self.iteration_history[-2]['metrics']
+
+            total_saved_vs_prev = prev_metrics['total_site_energy_kwh'] - metrics['total_site_energy_kwh']
+            eui_saved_vs_prev = prev_metrics['eui_kwh_per_m2'] - metrics['eui_kwh_per_m2']
+            cooling_saved_vs_prev = prev_metrics['total_cooling_kwh'] - metrics['total_cooling_kwh']
+            heating_saved_vs_prev = prev_metrics['total_heating_kwh'] - metrics['total_heating_kwh']
+
+            self.logger.info("【本轮节能明细（相对上一轮）】")
+            self.logger.info(
+                f"- 总建筑能耗: {total_saved_vs_prev:+.2f} kWh "
+                f"({_safe_pct(total_saved_vs_prev, prev_metrics['total_site_energy_kwh']):+.2f}%)"
+            )
+            self.logger.info(
+                f"- 能耗强度(EUI): {eui_saved_vs_prev:+.2f} kWh/m² "
+                f"({_safe_pct(eui_saved_vs_prev, prev_metrics['eui_kwh_per_m2']):+.2f}%)"
+            )
+            self.logger.info(
+                f"- 制冷能耗: {cooling_saved_vs_prev:+.2f} kWh "
+                f"({_safe_pct(cooling_saved_vs_prev, prev_metrics['total_cooling_kwh']):+.2f}%)"
+            )
+            self.logger.info(
+                f"- 供暖能耗: {heating_saved_vs_prev:+.2f} kWh "
+                f"({_safe_pct(heating_saved_vs_prev, prev_metrics['total_heating_kwh']):+.2f}%)"
+            )
+    
+    def run_optimization_loop(self, max_iterations=5):
+        """运行5次迭代优化循环"""
+        self.logger.info(f"\n\n{'█'*80}")
+        self.logger.info(f"启动{max_iterations}轮迭代优化")
+        self.logger.info(f"{'█'*80}\n")
         
-        # 检测是否为表达式
-        value_lower = value.lower()
-        has_expr = any(var in value_lower for var in ['old_value', 'original_value', 'existing_value', 'current_value'])
+        for iteration in range(1, max_iterations + 1):
+            self.logger.info(f"\n\n{'═'*80}")
+            self.logger.info(f"【第{iteration}轮/{max_iterations}】")
+            self.logger.info(f"{'═'*80}\n")
+            
+            # 第一轮使用原始IDF，后续使用优化后的IDF
+            if iteration == 1:
+                sim_idf = self.idf_path
+                iter_name = "initial_baseline"
+            else:
+                sim_idf = self.current_idf_path
+                iter_name = f"iteration_{iteration}"
+            
+            # 1. 运行模拟
+            sim_dir = self.run_simulation(sim_idf, iter_name)
+            if not sim_dir:
+                self.logger.error(f"第{iteration}轮模拟失败，中断优化")
+                break
+            
+            # 2. 提取能耗指标
+            metrics = self.extract_metrics(sim_dir)
+            if not metrics:
+                self.logger.error(f"第{iteration}轮无法提取能耗数据，中断优化")
+                break
+            
+            # 保存到历史
+            self.iteration_history.append({
+                'iteration': iteration,
+                'metrics': metrics,
+                'idf_path': sim_idf
+            })
+
+            # 3.5 打印每轮节能明细
+            self._print_iteration_savings(metrics, iteration)
+            
+            # 3. 更新最优值
+            self.update_best_metrics(metrics, iteration)
+            
+            # 4. 最后一轮不需要优化
+            if iteration == max_iterations:
+                self.logger.info(f"\n✓ 优化循环完成！")
+                break
+            
+            # 5. LLM分析建议
+            plan = self.generate_optimization_suggestions(metrics, iteration)
+            if not plan:
+                self.logger.warning(f"第{iteration}轮无法获得优化建议，使用默认优化")
+                plan = self._get_default_suggestions(iteration)
+            
+            # 6. 应用优化
+            new_idf = self.apply_optimization(plan, iteration)
+            if not new_idf:
+                self.logger.warning(f"第{iteration}轮优化应用失败，继续下一轮")
+                # 继续使用当前IDF
         
-        if not has_expr:
-            # 直接尝试转换为数值
-            try:
-                num = float(value)
-                if abs(num - round(num)) < 1e-6:
-                    return float(round(num))
-                return round(num, 6)
-            except (ValueError, TypeError):
-                return value
+        # 优化循环结束
+        self._print_final_report()
+    
+    def _get_default_suggestions(self, iteration):
+        """无法获得LLM建议时的默认优化方案"""
+        defaults = {
+            "clarification_needed": False,
+            "reasoning": f"第{iteration}轮使用默认优化方案",
+            "confidence": "low",
+            "modifications": [
+                {
+                    "object_type": "Lights",
+                    "name_filter": None,
+                    "fields": {
+                        "Watts_per_Floor_Area": "existing_value * coefficient"
+                    }
+                }
+            ]
+        }
+        return defaults
+    
+    def _extract_and_print_optimal_parameters(self):
+        """提取和打印最优方案中的所有参数修改"""
+        if self.best_iteration == 0 or not self.iteration_history:
+            return
+        
+        self.logger.info(f"\n\n{'═'*80}")
+        self.logger.info(f"【最优优化方案 - 参数修改详情】")
+        self.logger.info(f"{'═'*80}\n")
+        
+        baseline_idf_path = self.idf_path
+        optimal_idf_path = self.iteration_history[self.best_iteration-1]['idf_path']
+        
+        if not os.path.exists(optimal_idf_path):
+            self.logger.warning(f"最优IDF文件不存在: {optimal_idf_path}")
+            return
         
         try:
-            # 获取原值的数值
-            # 处理 None、空字符串、空格等情况
-            if old_value is None or old_value == '' or (isinstance(old_value, str) and old_value.strip() == ''):
-                old_val_num = 0.0
-            else:
-                try:
-                    old_val_num = float(old_value)
-                except (ValueError, TypeError):
-                    # 如果无法转换，记录警告并使用 0
-                    print(f"警告: 无法将原值 '{old_value}' 转换为数值，使用 0")
-                    old_val_num = 0.0
+            # 加载基准和最优IDF进行比较
+            baseline_idf = IDF(baseline_idf_path)
+            optimal_idf = IDF(optimal_idf_path)
             
-            # 替换表达式中的各种变量名
-            expr = value
-            expr = re.sub(r'\{?old_value\}?', str(old_val_num), expr, flags=re.IGNORECASE)
-            expr = re.sub(r'\{?original_value\}?', str(old_val_num), expr, flags=re.IGNORECASE)
-            expr = re.sub(r'\{?existing_value\}?', str(old_val_num), expr, flags=re.IGNORECASE)
-            expr = re.sub(r'\{?current_value\}?', str(old_val_num), expr, flags=re.IGNORECASE)
+            # 收集所有修改
+            modifications = []
+            modified_objects = set()
             
-            # 安全检查
-            if any(dangerous in expr.lower() for dangerous in ['import', 'exec', 'eval', '__', 'open', 'os.']):
-                print(f"错误: 表达式包含不安全操作: {expr}")
-                return value
-            
-            # 计算
-            result = eval(expr, {"__builtins__": {}}, {})
-            try:
-                num = float(result)
-            except (ValueError, TypeError):
-                return result
-            # 近似整数处理 + 限定小数位，避免 20.9999999 这类误差
-            if abs(num - round(num)) < 1e-6:
-                return float(round(num))
-            return round(num, 6)
-        except Exception as e:
-            print(f"错误: 计算表达式 '{value}' 失败: {e}")
-            return value
-
-    def batch_run(self, requests, output_dir="output_cases"):
-        """
-        批量生成算例。支持多对象选择。
-        """
-        if not os.path.exists(output_dir): os.makedirs(output_dir)
-        
-        for i, req in enumerate(requests):
-            print(f"\n[算例 {i+1}] 处理需求: {req}")
-            # 新流程：两阶段交互以减少 token（支持多对象）
-            selected_options = self.interactive_select_object_and_fields(req)
-            if not selected_options:
-                continue
-            
-            # 第二步：询问修改系数（对所有选中的对象统一应用）
-            print(f"\n已选择 {len(selected_options)} 个对象：")
-            for opt in selected_options:
-                print(f"  • {opt.get('object_type')}: {', '.join(opt.get('fields', []))}")
-            
-            coefficient_str = input("\n请输入修改系数，支持以下格式:\n  单个：0.8\n  多个：0.3,0.5,0.8\n  范围：0.1-0.8(步长0.1)\n输入: ").strip()
-            coefficients = self._parse_coefficients(coefficient_str)
-            
-            if not coefficients:
-                coefficients = [0.8]  # 默认降低20%
-            
-            print(f"✓ 将生成 {len(coefficients)} 个案例，系数为: {coefficients}")
-            
-            # 第三步：对每个系数生成一个案例
-            for coef_idx, coefficient in enumerate(coefficients, 1):
-                # 生成输出文件名
-                if len(coefficients) == 1:
-                    output_file = os.path.join(output_dir, f"case_{i+1}.idf")
-                else:
-                    output_file = os.path.join(output_dir, f"case_{i+1}_coef_{coefficient:.2f}.idf")
-                
-                # 为所有选中的对象构建修改方案
-                modifications = []
-                for selected_option in selected_options:
-                    modifications.append({
-                        "object_type": selected_option.get("object_type"),
-                        "name_filter": selected_option.get("name_filter"),
-                        "fields": {field: f"existing_value * {coefficient}" for field in selected_option.get("fields", [])}
-                    })
-                
-                refined_plan = {
-                    "clarification_needed": False,
-                    "question": None,
-                    "options": [],
-                    "modifications": modifications
-                }
-                if len(coefficients) > 1:
-                    print(f"\n  生成 case_{i+1}_coef_{coefficient:.2f}.idf (修改系数: {coefficient})")
-                else:
-                    print(f"\n  生成 case_{i+1}.idf (修改系数: {coefficient})")
-                self._execute_modifications(refined_plan, output_file)
-    
-    def batch_run_with_kb(self, requests, output_dir="output_cases", auto_confirm=False):
-        """
-        【新方法】使用知识库增强的批量生成算例，减少交互
-        
-        参数:
-        - requests: 用户需求列表
-        - output_dir: 输出目录
-        - auto_confirm: 是否自动确认（True=完全自动，False=显示计划并要求确认）
-        """
-        if not os.path.exists(output_dir): 
-            os.makedirs(output_dir)
-        
-        if not self.knowledge_base:
-            print("⚠ 知识库未加载，退回传统模式")
-            return self.batch_run(requests, output_dir)
-        
-        for i, req in enumerate(requests, 1):
-            print("\n" + "=" * 60)
-            print(f"[算例 {i}] 处理需求: {req}")
-            print("=" * 60)
-            
-            # 使用知识库增强的方法生成计划
-            plan = self.generate_plan_with_knowledge_base(req)
-            
-            if not plan:
-                print("✗ 无法生成计划，跳过此需求")
-                continue
-            
-            # 检查是否需要人工澄清
-            if plan.get("clarification_needed"):
-                print(f"\n⚠ LLM 需要澄清: {plan.get('question', '未知问题')}")
-                # 这里可以添加交互逻辑，当前跳过
-                continue
-            
-            modifications = plan.get("modifications", [])
-            if not modifications:
-                print("✗ 计划中无有效修改项，跳过")
-                continue
-            
-            # 显示计划摘要
-            print("\n【生成的修改计划】")
-            for mod in modifications:
-                obj_type = mod.get("object_type", "?")
-                fields = mod.get("fields", {})
-                print(f"  • {obj_type}: {len(fields)} 个字段")
-                for field_name, expr in list(fields.items())[:3]:  # 只显示前3个
-                    print(f"    - {field_name}: {expr}")
-                if len(fields) > 3:
-                    print(f"    ... 还有 {len(fields) - 3} 个字段")
-            
-            # 确认或自动执行
-            if not auto_confirm:
-                confirm = input("\n是否执行此计划? (y/n，直接回车=是): ").strip().lower()
-                if confirm and confirm not in ['y', 'yes', '']:
-                    print("✗ 用户取消，跳过此需求")
+            # 遍历最优IDF中的所有对象类别
+            for obj_type in optimal_idf.idfobjects:
+                if obj_type not in baseline_idf.idfobjects:
                     continue
-            
-            # 询问修改系数
-            if auto_confirm:
-                coefficient_str = "0.8"  # 默认值
-                print(f"[自动模式] 使用默认系数: {coefficient_str}")
-            else:
-                coefficient_str = input("\n请输入修改系数 (单个/多个/范围，默认0.8): ").strip()
-                if not coefficient_str:
-                    coefficient_str = "0.8"
-            
-            coefficients = self._parse_coefficients(coefficient_str)
-            if not coefficients:
-                coefficients = [0.8]
-            
-            print(f"✓ 将生成 {len(coefficients)} 个案例，系数为: {coefficients}")
-            
-            # 为每个系数生成案例
-            for coef in coefficients:
-                # 生成输出文件名
-                if len(coefficients) == 1:
-                    output_file = os.path.join(output_dir, f"case_{i}.idf")
-                else:
-                    output_file = os.path.join(output_dir, f"case_{i}_coef_{coef:.2f}.idf")
                 
-                # 应用系数到计划
-                coef_plan = {
-                    "clarification_needed": False,
-                    "modifications": []
-                }
+                baseline_objs = {getattr(o, 'Name', str(i)): o for i, o in enumerate(baseline_idf.idfobjects[obj_type])}
+                optimal_objs = {getattr(o, 'Name', str(i)): o for i, o in enumerate(optimal_idf.idfobjects[obj_type])}
                 
-                for mod in modifications:
-                    modified_fields = {}
-                    for field_name, expr in mod.get("fields", {}).items():
-                        modified_expr = self._apply_coefficient_to_expr(expr, coef)
-                        modified_fields[field_name] = modified_expr
+                for obj_name in optimal_objs:
+                    if obj_name not in baseline_objs:
+                        continue
                     
-                    coef_plan["modifications"].append({
-                        "object_type": mod.get("object_type"),
-                        "name_filter": mod.get("name_filter"),
-                        "fields": modified_fields
-                    })
+                    baseline_obj = baseline_objs[obj_name]
+                    optimal_obj = optimal_objs[obj_name]
+                    
+                    # 比较每个字段
+                    for field in optimal_obj.fieldnames:
+                        try:
+                            baseline_val = getattr(baseline_obj, field, None)
+                            optimal_val = getattr(optimal_obj, field, None)
+                            
+                            # 字符串/数值比较
+                            if baseline_val != optimal_val:
+                                # 过滤掉非相关字段（如Name、Type等）
+                                if field.lower() not in ['name', 'type']:
+                                    try:
+                                        # 尝试转换为数值进行对比
+                                        baseline_num = float(baseline_val) if baseline_val else 0
+                                        optimal_num = float(optimal_val) if optimal_val else 0
+                                        
+                                        if baseline_num != optimal_num:
+                                            change_pct = ((optimal_num - baseline_num) / baseline_num * 100) if baseline_num != 0 else 0
+                                            modifications.append({
+                                                'object_type': obj_type,
+                                                'object_name': obj_name,
+                                                'field': field,
+                                                'baseline_value': baseline_num,
+                                                'optimal_value': optimal_num,
+                                                'change_pct': change_pct
+                                            })
+                                            modified_objects.add(obj_type)
+                                    except (ValueError, TypeError):
+                                        # 非数值字段，做字符串对比
+                                        if str(baseline_val) != str(optimal_val):
+                                            modifications.append({
+                                                'object_type': obj_type,
+                                                'object_name': obj_name,
+                                                'field': field,
+                                                'baseline_value': baseline_val,
+                                                'optimal_value': optimal_val,
+                                                'change_pct': 'N/A'
+                                            })
+                                            modified_objects.add(obj_type)
+                        except Exception as e:
+                            continue
+            
+            # 按对象类型分组打印
+            if modifications:
+                self.logger.info(f"【修改对象类型】({len(modified_objects)}种)")
+                self.logger.info(f"{', '.join(sorted(modified_objects))}\n")
                 
-                print(f"\n  生成 {os.path.basename(output_file)}")
-                self._execute_modifications(coef_plan, output_file)
-        
-        print("\n" + "=" * 60)
-        print("✓ 批量生成完成")
-        print("=" * 60)
-    
-    def _execute_modifications(self, plan, output_idf_path):
-        """
-        执行实际的 IDF 修改。
-        """
-        return self._do_modification_work(plan, output_idf_path)
-    
-    def _parse_coefficients(self, coefficient_str):
-        """
-        解析用户输入的系数字符串，支持多种格式：
-        - 单个：0.8
-        - 多个：0.3,0.5,0.8
-        - 范围：0.1-0.8(自动按0.1步长)、0.2-0.9/5(5个点)
-        返回排序后的系数列表。
-        """
-        coefficient_str = coefficient_str.strip()
-        if not coefficient_str:
-            return []
-        
-        coefficients = []
-        
-        # 检查是否包含范围表达式 (start-end 或 start-end/count)
-        if '-' in coefficient_str and ',' not in coefficient_str:
-            try:
-                if '/' in coefficient_str:
-                    range_part, count_str = coefficient_str.rsplit('/', 1)
-                    start, end = map(float, range_part.split('-'))
-                    count = int(count_str)
-                else:
-                    start, end = map(float, coefficient_str.split('-'))
-                    # 默认按 0.1 步长
-                    count = int((end - start) / 0.1) + 1
+                self.logger.info(f"【参数修改详情】(共{len(modifications)}项修改)\n")
                 
-                if start >= end:
-                    return []
-                
-                coefficients = [round(start + i * (end - start) / (count - 1), 2) for i in range(count)]
-            except Exception:
-                return []
-        else:
-            # 多个系数，用逗号分隔
-            try:
-                coefficients = [round(float(x.strip()), 2) for x in coefficient_str.split(',') if x.strip()]
-            except Exception:
-                return []
+                current_obj_type = None
+                for mod in sorted(modifications, key=lambda x: (x['object_type'], x['object_name'])):
+                    if mod['object_type'] != current_obj_type:
+                        current_obj_type = mod['object_type']
+                        self.logger.info(f"\n━━ {current_obj_type} ━━")
+                    
+                    obj_name = mod['object_name']
+                    field = mod['field']
+                    baseline = mod['baseline_value']
+                    optimal = mod['optimal_value']
+                    change_pct = mod['change_pct']
+                    
+                    if isinstance(change_pct, str):
+                        change_str = f"{baseline} → {optimal}"
+                        self.logger.info(f"  • {obj_name}")
+                        self.logger.info(f"    └─ {field}: {change_str}")
+                    else:
+                        change_str = f"{baseline:.4f} → {optimal:.4f}"
+                        pct_str = f"({change_pct:+.2f}%)" if change_pct != 0 else ""
+                        self.logger.info(f"  • {obj_name}")
+                        self.logger.info(f"    └─ {field}: {change_str} {pct_str}")
+            else:
+                self.logger.info("未检测到参数修改（可能原始文件和优化文件相同）")
+            
+            self.logger.info(f"\n{'═'*80}\n")
+            
+        except Exception as e:
+            self.logger.error(f"解析最优方案修改详情时出错: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+    def _print_final_report(self):
+        """打印最终优化报告"""
+        self.logger.info(f"\n\n{'█'*80}")
+        self.logger.info(f"优化完成总结报告")
+        self.logger.info(f"{'█'*80}\n")
         
-        # 去重并排序
-        coefficients = sorted(set(coefficients))
-        return coefficients
+        # 先打印最优参数修改细节
+        self._extract_and_print_optimal_parameters()
+        
+        if not self.iteration_history:
+            self.logger.info("无优化数据")
+            return
+        
+        initial_metrics = self.iteration_history[0]['metrics']
+        
+        self.logger.info("【各轮能耗对比】\n")
+        self.logger.info(f"{'轮次':<8} {'总建筑能耗':<15} {'EUI':<15} {'冷却能耗':<15} {'供暖能耗':<15} {'状态'}")
+        self.logger.info("-" * 85)
+        
+        for item in self.iteration_history:
+            iteration = item['iteration']
+            m = item['metrics']
+            
+            if iteration == 1:
+                status = "基准"
+            elif iteration == self.best_iteration:
+                status = "最优 ✓"
+            else:
+                status = ""
+            
+            self.logger.info(
+                f"{iteration:<8} {m['total_site_energy_kwh']:<15.2f} "
+                f"{m['eui_kwh_per_m2']:<15.2f} {m['total_cooling_kwh']:<15.2f} "
+                f"{m['total_heating_kwh']:<15.2f} {status}"
+            )
+        
+        # 计算最优值相比初始值的节能效果
+        if self.best_metrics:
+            total_savings = initial_metrics['total_site_energy_kwh'] - self.best_metrics['total_site_energy_kwh']
+            total_savings_pct = (total_savings / initial_metrics['total_site_energy_kwh'] * 100)
+            
+            eui_savings = initial_metrics['eui_kwh_per_m2'] - self.best_metrics['eui_kwh_per_m2']
+            eui_savings_pct = (eui_savings / initial_metrics['eui_kwh_per_m2'] * 100)
+            
+            cool_savings = initial_metrics['total_cooling_kwh'] - self.best_metrics['total_cooling_kwh']
+            cool_savings_pct = (cool_savings / initial_metrics['total_cooling_kwh'] * 100) if initial_metrics['total_cooling_kwh'] > 0 else 0
+            
+            heat_savings = initial_metrics['total_heating_kwh'] - self.best_metrics['total_heating_kwh']
+            heat_savings_pct = (heat_savings / initial_metrics['total_heating_kwh'] * 100) if initial_metrics['total_heating_kwh'] > 0 else 0
+            
+            self.logger.info(f"\n【优化效果】(第{self.best_iteration}轮最优)\n")
+            self.logger.info(f"总建筑能耗节能: {total_savings:.2f} kWh ({total_savings_pct:.1f}%)")
+            self.logger.info(f"能耗强度改善: {eui_savings:.2f} kWh/m² ({eui_savings_pct:.1f}%)")
+            self.logger.info(f"冷却能耗节能: {cool_savings:.2f} kWh ({cool_savings_pct:.1f}%)")
+            self.logger.info(f"供暖能耗节能: {heat_savings:.2f} kWh ({heat_savings_pct:.1f}%)")
+            
+            self.logger.info(f"\n【最优参数】\n")
+            self.logger.info(f"最优方案来自: 第{self.best_iteration}轮优化")
+            self.logger.info(f"对应IDF: {self.iteration_history[self.best_iteration-1]['idf_path']}")
+        
+        # Token使用统计
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info(f"【Token使用统计】")
+        self.logger.info(f"{'='*80}")
+        self.logger.info(f"LLM调用次数: {self.llm_calls_count}")
+        self.logger.info(f"总计消耗Token: {self.total_tokens_used:,}")
+        
+        # 计算API剩余tokens（假设API总配额，这里需要根据实际情况调整）
+        # GPT-4的常见配额范围，这里以一个示例值展示
+        # 注意：实际配额需要从API账户查询，这里仅作演示
+        try:
+            with open("api_key.txt", 'r') as f:
+                api_key = f.read().strip()
+            
+            # 这里使用一个假设的总配额值（用户需根据实际情况调整）
+            # 不同API key有不同的配额限制，可以从OpenAI dashboard查看
+            # 这里假设总配额为 10,000,000 tokens（仅为示例）
+            assumed_total_quota = 10_000_000
+            remaining_tokens = assumed_total_quota - self.total_tokens_used
+            
+            self.logger.info(f"估算剩余Token: {remaining_tokens:,} (基于假设总配额 {assumed_total_quota:,})")
+            self.logger.info(f"")
+            self.logger.info(f"⚠️  注意：剩余Token为估算值，实际配额请登录OpenAI账户查看")
+            self.logger.info(f"    不同API key配额不同，上述计算基于假设值 {assumed_total_quota:,} tokens")
+        except Exception as e:
+            self.logger.warning(f"无法读取API key文件: {e}")
+        
+        self.logger.info(f"{'='*80}\n")
+        
+        self.logger.info(f"\n{'█'*80}\n")
+
 
 if __name__ == "__main__":
-    # ========== 可运行示例 ==========
-    
-    # 1. 配置文件路径
+    # 配置文件路径
     IDF_PATH = "in.idf"
     IDD_PATH = "Energy+.idd"
     API_KEY_PATH = "api_key.txt"
-    OUTPUT_DIR = "generated_cases"
-    
-    # 2. 创建自动化实例
-    print("=" * 60)
-    print("EnergyPlus 自动化算例生成系统 (知识库增强版)")
-    print("=" * 60)
+    EPW_PATH = "weather.epw"
     
     try:
-        automation = EnergyPlusOptimizationIterator(IDF_PATH, IDD_PATH, API_KEY_PATH)
-        print("✓ 成功加载 IDF 和 IDD 文件")
+        # 创建优化器实例
+        optimizer = EnergyPlusOptimizer(
+            idf_path=IDF_PATH,
+            idd_path=IDD_PATH,
+            api_key_path=API_KEY_PATH,
+            epw_path=EPW_PATH
+        )
+        
+        # 运行5轮迭代优化
+        optimizer.run_optimization_loop(max_iterations=5)
+        
     except Exception as e:
-        print(f"✗ 初始化失败: {e}")
-        exit(1)
-    
-    # 3. 定义需求列表（可根据实际需求修改）
-    DESIGN_REQUESTS = [
-        "提高照明效率，降低照明功率密度",
-        "提高墙体保温性能，降低外墙材料的导热系数",
-        "降低夏季太阳辐射得热，减少窗户的遮阳系数",
-        "减少空气渗透热损失，降低渗透率",
-        "优化室内设备热负荷，降低设备功率密度"
-    ]
-    
-    print(f"\n共有 {len(DESIGN_REQUESTS)} 个设计需求待处理")
-    
-    # 4. 选择运行模式
-    print("\n请选择运行模式:")
-    print("  1. 知识库增强模式 (推荐) - 自动匹配对象和字段，减少交互")
-    print("  2. 传统交互模式 - 逐步选择对象和字段")
-    
-    mode = input("请输入模式编号 (1/2，默认1): ").strip()
-    
-    if mode == "2":
-        print("\n使用传统交互模式...")
-        automation.batch_run(DESIGN_REQUESTS, output_dir=OUTPUT_DIR)
-    else:
-        print("\n使用知识库增强模式...")
-        auto_mode = input("是否启用全自动模式? (y/n，默认n): ").strip().lower()
-        auto_confirm = (auto_mode in ['y', 'yes'])
-        automation.batch_run_with_kb(DESIGN_REQUESTS, output_dir=OUTPUT_DIR, auto_confirm=auto_confirm)
-    
-    print("\n" + "=" * 60)
-    print(f"✓ 所有算例已生成完成，保存在 {OUTPUT_DIR}/ 目录")
-    print("=" * 60)
+        print(f"✗ 优化过程异常: {e}")
+        import traceback
+        traceback.print_exc()
