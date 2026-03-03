@@ -100,6 +100,9 @@ class EnergyPlusOptimizer:
         # 用于追踪各字段的使用频率，避免过度集中修改少数字段
         self.field_modification_history = {}
         
+        # 上一轮修改的字段列表（用于检查轮次间的差异性）
+        self.last_round_fields = set()
+        
         # 字段修改的关键词限制规则（配置化，非硬编码）
         # 格式：{"对象类型": {"字段名": ["必需关键词1", "必需关键词2"]}}
         # 只有当建议文本中包含至少一个必需关键词时，才允许修改该字段
@@ -447,7 +450,11 @@ class EnergyPlusOptimizer:
         return None
 
     def _build_optimization_request(self, metrics, iteration):
-        """构造用于知识库检索与LLM推理的需求描述"""
+        """构造用于知识库检索与LLM推理的需求描述
+        
+        关键改进：基于历史修改频率，动态生成优化方向关键词，
+        确保知识库能匹配到多样化的对象（人员、遮阳、新风等）
+        """
         if iteration == 1:
             status_note = "初始基准模拟"
         else:
@@ -499,9 +506,123 @@ class EnergyPlusOptimizer:
             else:
                 request += "\n✓ 上一轮三项指标均下降，本轮继续沿此方向优化，但注意保持平衡。"
         
+        # ========== 关键改进：动态添加优化方向关键词 ==========
+        # 这确保知识库能匹配到多样化的对象类型
+        optimization_directions = self._get_dynamic_optimization_directions(iteration)
+        request += f"\n\n【建议优化方向】{optimization_directions}"
+        
         request += f"\n请根据物理原理，推荐可执行的IDF参数修改方案（允许某些字段增大、另一些字段减小）。"
         
         return request
+    
+    def _get_dynamic_optimization_directions(self, iteration):
+        """基于历史修改频率，动态生成优化方向关键词
+        
+        核心逻辑：
+        1. 统计各类别的修改频率
+        2. 识别低频类别（被忽视的优化机会）
+        3. 每轮侧重3-4个不同的低频类别
+        4. 在请求中明确提及关键词，确保知识库能匹配到相关对象
+        
+        这解决了"为什么总是修改相同字段"的根本问题
+        """
+        # 定义核心优化类别及其关键词（用于知识库匹配）
+        optimization_categories = {
+            "人员密度": {
+                "keywords": ["人员密度", "人员"],
+                "description": "降低人员密度可减少人体产热负荷，显著降低制冷能耗"
+            },
+            "照明功率": {
+                "keywords": ["照明功率密度", "照明"],
+                "description": "降低照明功率密度可减少照明发热，降低制冷能耗"
+            },
+            "设备功率": {
+                "keywords": ["设备功率密度", "设备"],
+                "description": "降低设备功率密度可减少设备发热，降低制冷能耗"
+            },
+            "新风量": {
+                "keywords": ["新风量", "新风", "室外空气"],
+                "description": "优化新风量可减少空调负荷，在满足健康标准前提下降低能耗"
+            },
+            "遮阳系数": {
+                "keywords": ["遮阳系数", "SHGC", "太阳热得系数", "窗"],
+                "description": "降低窗户遮阳系数(SHGC)可减少太阳辐射进入，显著降低制冷能耗"
+            },
+            "保温性能": {
+                "keywords": ["导热系数", "保温", "材料"],
+                "description": "降低材料导热系数可增强保温性能，降低供暖能耗"
+            },
+            "渗透率": {
+                "keywords": ["渗透率", "空气渗透"],
+                "description": "降低渗透率可减少冷热空气交换，显著降低供暖和制冷能耗"
+            },
+            "HVAC效率": {
+                "keywords": ["热回收效率", "供风温度", "HVAC"],
+                "description": "提高热回收效率、优化供风温度可提升HVAC系统效率"
+            }
+        }
+        
+        # 统计各类别的修改频率
+        category_usage = {cat: 0 for cat in optimization_categories.keys()}
+        
+        for field_key, count in self.field_modification_history.items():
+            obj_type = field_key.split('.')[0].upper()
+            field_name = field_key.split('.')[1].upper() if '.' in field_key else ""
+            
+            # 根据对象类型和字段名映射到类别
+            if "PEOPLE" in obj_type:
+                category_usage["人员密度"] += count
+            elif "LIGHTS" in obj_type:
+                category_usage["照明功率"] += count
+            elif "ELECTRICEQUIPMENT" in obj_type or "EQUIPMENT" in obj_type:
+                category_usage["设备功率"] += count
+            elif "OUTDOORAIR" in obj_type or "VENTILATION" in field_name:
+                category_usage["新风量"] += count
+            elif "WINDOW" in obj_type or "SHGC" in field_name or "SOLARHEATGAIN" in field_name:
+                category_usage["遮阳系数"] += count
+            elif "MATERIAL" in obj_type and "CONDUCTIVITY" in field_name:
+                category_usage["保温性能"] += count
+            elif "INFILTRATION" in obj_type:
+                category_usage["渗透率"] += count
+            elif "HVAC" in obj_type or "HEATRECOVERY" in field_name or "TEMPERATURE" in field_name:
+                category_usage["HVAC效率"] += count
+        
+        # 按频率排序（升序，低频在前）
+        sorted_categories = sorted(category_usage.items(), key=lambda x: (x[1], x[0]))
+        
+        # 选择3-4个低频类别（用于本轮优化）
+        # 使用迭代次数作为偏移，确保不同轮侧重不同类别
+        num_focus = min(4, len(sorted_categories))
+        offset = (iteration - 1) % len(sorted_categories)
+        
+        # 循环选择，确保覆盖所有类别
+        focus_categories = []
+        for i in range(num_focus):
+            idx = (offset + i) % len(sorted_categories)
+            focus_categories.append(sorted_categories[idx][0])
+        
+        # 构造优化方向文本（包含关键词，确保知识库匹配）
+        directions_text = "本轮应重点考虑以下优化方向：\n"
+        for cat_name in focus_categories:
+            cat_info = optimization_categories[cat_name]
+            usage_count = category_usage[cat_name]
+            keywords_str = "、".join(cat_info["keywords"])
+            
+            if usage_count == 0:
+                priority = "【高优先级-从未优化】"
+            elif usage_count <= 2:
+                priority = "【推荐优化】"
+            else:
+                priority = ""
+            
+            directions_text += f"  {priority} {cat_name}（{keywords_str}）：{cat_info['description']}\n"
+        
+        # 额外提示：避免过度集中
+        most_used_cat = sorted_categories[-1]
+        if most_used_cat[1] >= 3:
+            directions_text += f"\n⚠️ 注意：'{most_used_cat[0]}'已被修改{most_used_cat[1]}次，本轮应尽量避免"
+        
+        return directions_text
 
     def generate_plan_with_knowledge_base(self, user_request):
         """使用知识库生成修改计划（与 main.py 逻辑保持一致）"""
@@ -1052,12 +1173,23 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
         self.logger.info("="*100 + "\n")
     
     def _update_field_modification_history(self, target_updates):
-        """更新字段修改频率历史记录"""
+        """更新字段修改频率历史记录，并保存本轮字段列表供下轮差异性检查"""
+        # 保存本轮修改的字段（用于下一轮的差异性检查）
+        current_round_fields = set()
+        
         for update in target_updates:
             field_key = f"{update['type']}.{update['field']}"
+            
+            # 更新频率统计
             if field_key not in self.field_modification_history:
                 self.field_modification_history[field_key] = 0
             self.field_modification_history[field_key] += 1
+            
+            # 记录本轮字段
+            current_round_fields.add(field_key.upper())
+        
+        # 更新上一轮字段列表（供下一轮对比）
+        self.last_round_fields = current_round_fields
     
     def _get_field_usage_summary(self, max_high_freq=10, max_low_freq=10):
         """生成字段使用频率摘要，用于LLM prompt"""
@@ -1101,6 +1233,10 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
     
     def _check_field_diversity(self, plan):
         """检查优化方案的字段多样性
+        
+        改进：不仅检查类别覆盖度，还检查与上一轮的差异性
+        用户要求：不同轮的修改建议要有50%的不一样
+        
         返回: (is_diverse, issue_description)
         """
         if not isinstance(plan, dict) or 'modifications' not in plan:
@@ -1120,6 +1256,19 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
             for field_name in fields.keys():
                 field_key = f"{obj_type}.{str(field_name).upper()}"
                 current_fields.add(field_key)
+        
+        # ========== 新增检查：与上一轮的差异性（50%不同要求） ==========
+        if self.last_round_fields and len(current_fields) > 0:
+            overlap_fields = current_fields & self.last_round_fields
+            overlap_ratio = len(overlap_fields) / len(current_fields)
+            
+            # 如果重复率超过50%，则多样性不足
+            if overlap_ratio > 0.5:
+                return False, (
+                    f"本轮方案与上一轮重复率过高（{overlap_ratio:.1%}），"
+                    f"{len(overlap_fields)}/{len(current_fields)}个字段与上一轮相同。"
+                    f"要求不同轮次至少50%字段不同，请选择新的优化方向。"
+                )
         
         # 检查1：是否过度集中在高频字段
         if self.field_modification_history:
