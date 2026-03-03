@@ -498,67 +498,110 @@ class EnergyPlusOptimizer:
                     f"\n⚠️ 上一轮存在问题：{', '.join(problems)}。\n"
                     f"本轮必须针对性修正：\n"
                 )
-                if delta_cooling > 0:
+                
+                # ========== 关键改进：供暖和制冷的平衡优化 ==========
+                # 检查是否制冷和供暖都在上升（最棘手的情况）
+                if delta_cooling > 0 and delta_heating > 0:
+                    request += f"  ⚠️ 制冷（↑{delta_cooling:.2f}kWh）和供暖（↑{delta_heating:.2f}kWh）都上升，说明改键修改效果不理想。\n"
+                    request += f"  本轮应采用['同时降低制冷和供暖'的综合策略，优先选择对两者都有利的措施：\n"
+                    request += f"    • 增加围护结构保温性能（降低导热系数）- 减少冬季热损失 & 减少夏季散热失\n"
+                    request += f"    • 减少空气渗透（降低渗透率）- 减少冬季冷空气进入 & 减少夏季热空气进入\n"
+                    request += f"    • 提高热回收效率 - 冬季回收室外新风热量 & 夏季回收排风冷量\n"
+                    request += f"    • 降低内部热源（照明、设备、人员）- 直接减少制冷需求 & 增加供暖需求（但总能耗下降）\n"
+                    request += f"  ⚠️ 避免：修改遮阳系数（对制冷有利但对供暖有害）、修改供暖供风温度（影响设计）等相冲突的措施。\n"
+                elif delta_cooling > 0:
                     request += f"  - 制冷能耗上升了{delta_cooling:.2f} kWh，需要调整制冷相关参数（如提高制冷供风温度、增加窗户反射率、降低内部热源等）\n"
+                    request += f"  - 同时注意不要增加供暖负荷，避免修改会增加冬季需热的参数。\n"
                 if delta_heating > 0:
                     request += f"  - 供暖能耗上升了{delta_heating:.2f} kWh，需要调整供暖相关参数（如降低供暖供风温度、增加围护结构保温、减少渗透等）\n"
+                    request += f"  - 同时注意不要增加制冷负荷，避免修改会增加夏季散热困难的参数。\n"
                 request += f"  - 避免重复上一轮的修改方向，应反向调整或采用更小步长。"
             else:
                 request += "\n✓ 上一轮三项指标均下降，本轮继续沿此方向优化，但注意保持平衡。"
         
         # ========== 关键改进：动态添加优化方向关键词 ==========
         # 这确保知识库能匹配到多样化的对象类型
-        optimization_directions = self._get_dynamic_optimization_directions(iteration)
-        request += f"\n\n【建议优化方向】{optimization_directions}"
+        # 传递供暖和制冷的变化信息，让优化方向对目标更有针对性
+        if len(self.iteration_history) >= 2:
+            prev_metrics = self.iteration_history[-2]['metrics']
+            delta_cooling_for_directions = metrics['total_cooling_kwh'] - prev_metrics['total_cooling_kwh']
+            delta_heating_for_directions = metrics['total_heating_kwh'] - prev_metrics['total_heating_kwh']
+            optimization_directions = self._get_dynamic_optimization_directions(
+                iteration, 
+                delta_cooling=delta_cooling_for_directions, 
+                delta_heating=delta_heating_for_directions
+            )
+        else:
+            optimization_directions = self._get_dynamic_optimization_directions(iteration)
+        
+        request += f"\n{optimization_directions}"
         
         request += f"\n请根据物理原理，推荐可执行的IDF参数修改方案（允许某些字段增大、另一些字段减小）。"
         
         return request
     
-    def _get_dynamic_optimization_directions(self, iteration):
-        """基于历史修改频率，动态生成优化方向关键词
+    def _get_dynamic_optimization_directions(self, iteration, delta_cooling=None, delta_heating=None):
+        """基于历史修改频率和能耗变化，动态生成优化方向关键词
+        
+        关键改进：
+        - 当供暖和制冷都需要优化时，重点推荐对两者都有利的措施
+        - 避免或降低那些会产生冲突的措施
         
         核心逻辑：
         1. 统计各类别的修改频率
         2. 识别低频类别（被忽视的优化机会）
-        3. 每轮侧重3-4个不同的低频类别
-        4. 在请求中明确提及关键词，确保知识库能匹配到相关对象
+        3. 当供暖和制冷都上升时，优先选择"对两者都有利"的类别
+        4. 每轮侧重3-4个不同的低频类别
+        5. 在请求中明确提及关键词，确保知识库能匹配到相关对象
         
-        这解决了"为什么总是修改相同字段"的根本问题
+        这解决了"为什么总是修改相同字段"和"供暖制冷无法同时优化"的问题
         """
+        # 判断是否"制冷和供暖都需要优化"
+        has_heating_cooling_conflict = (delta_cooling is not None and delta_heating is not None 
+                                        and delta_cooling > 0 and delta_heating > 0)
+        
         # 定义核心优化类别及其关键词（用于知识库匹配）
+        # 添加"conflict_level"标注：0=对两者都有利，1=对一方有利，2=可能冲突
         optimization_categories = {
             "人员密度": {
                 "keywords": ["人员密度", "人员"],
-                "description": "降低人员密度可减少人体产热负荷，显著降低制冷能耗"
+                "description": "降低人员密度可减少内部产热，对制冷和供暖都有利",
+                "conflict_level": 0  # 对两者都有利
             },
             "照明功率": {
                 "keywords": ["照明功率密度", "照明"],
-                "description": "降低照明功率密度可减少照明发热，降低制冷能耗"
+                "description": "降低照明功率密度可减少内部发热，对制冷和供暖都有利",
+                "conflict_level": 0  # 对两者都有利
             },
             "设备功率": {
                 "keywords": ["设备功率密度", "设备"],
-                "description": "降低设备功率密度可减少设备发热，降低制冷能耗"
+                "description": "降低设备功率密度可减少内部发热，对制冷和供暖都有利",
+                "conflict_level": 0  # 对两者都有利
             },
             "新风量": {
                 "keywords": ["新风量", "新风", "室外空气"],
-                "description": "优化新风量可减少空调负荷，在满足健康标准前提下降低能耗"
-            },
-            "遮阳系数": {
-                "keywords": ["遮阳系数", "SHGC", "太阳热得系数", "窗"],
-                "description": "降低窗户遮阳系数(SHGC)可减少太阳辐射进入，显著降低制冷能耗"
+                "description": "优化新风量可在满足健康标准前提下降低HVAC负荷，对制冷和供暖都有利",
+                "conflict_level": 0  # 对两者都有利
             },
             "保温性能": {
                 "keywords": ["导热系数", "保温", "材料"],
-                "description": "降低材料导热系数可增强保温性能，降低供暖能耗"
+                "description": "降低材料导热系数可增强保温性能，减少冬季热损失和夏季散热困难，对两者都有利",
+                "conflict_level": 0  # 对两者都有利
             },
             "渗透率": {
                 "keywords": ["渗透率", "空气渗透"],
-                "description": "降低渗透率可减少冷热空气交换，显著降低供暖和制冷能耗"
+                "description": "降低渗透率可减少冷热空气交换，显著降低供暖和制冷能耗，对两者都有利",
+                "conflict_level": 0  # 对两者都有利
             },
             "HVAC效率": {
                 "keywords": ["热回收效率", "供风温度", "HVAC"],
-                "description": "提高热回收效率、优化供风温度可提升HVAC系统效率"
+                "description": "提高热回收效率、优化供风温度可提升HVAC系统效率，对两者都有利",
+                "conflict_level": 0  # 对两者都有利
+            },
+            "遮阳系数": {
+                "keywords": ["遮阳系数", "SHGC", "太阳热得系数", "窗"],
+                "description": "降低窗户遮阳系数(SHGC)可减少太阳辐射进入，但会增加冬季供暖需求",
+                "conflict_level": 1 if has_heating_cooling_conflict else 2  # 当两者都冲突时，标记为1；否则完全避免
             }
         }
         
@@ -587,22 +630,52 @@ class EnergyPlusOptimizer:
             elif "HVAC" in obj_type or "HEATRECOVERY" in field_name or "TEMPERATURE" in field_name:
                 category_usage["HVAC效率"] += count
         
-        # 按频率排序（升序，低频在前）
-        sorted_categories = sorted(category_usage.items(), key=lambda x: (x[1], x[0]))
+        # 按频率和冲突级别排序
+        # 策略：当供暖制冷冲突时，优先选择"对两者都有利"的（conflict_level=0）
+        if has_heating_cooling_conflict:
+            # 分类：对两者都有利的 vs 可能冲突的
+            beneficial_categories = {cat: (usage, cat_info) for cat, usage in category_usage.items()
+                                    if optimization_categories[cat]['conflict_level'] == 0}
+            conflict_categories = {cat: (usage, cat_info) for cat, usage in category_usage.items()
+                                  if optimization_categories[cat]['conflict_level'] >= 1}
+            
+            # 优先排序"对两者都有利"的类别（按使用频率）
+            sorted_beneficial = sorted(beneficial_categories.items(), 
+                                      key=lambda x: (x[1][0], x[0]))  # 按frequency升序
+            sorted_conflict = sorted(conflict_categories.items(), 
+                                    key=lambda x: (x[1][0], x[0]))
+            
+            # 组合：先取"对两者都有利"的，再补充冲突类别
+            sorted_categories = sorted_beneficial + sorted_conflict
+        else:
+            # 正常情况：按频率排序（升序，低频在前）
+            sorted_categories = sorted(category_usage.items(), key=lambda x: (x[1], x[0]))
         
         # 选择3-4个低频类别（用于本轮优化）
         # 使用迭代次数作为偏移，确保不同轮侧重不同类别
         num_focus = min(4, len(sorted_categories))
-        offset = (iteration - 1) % len(sorted_categories)
+        offset = (iteration - 1) % len([c for c in sorted_categories 
+                                        if optimization_categories[c[0]]['conflict_level'] < 2])  # 只在有效类别中轮转
         
         # 循环选择，确保覆盖所有类别
         focus_categories = []
+        category_idx = 0
         for i in range(num_focus):
-            idx = (offset + i) % len(sorted_categories)
-            focus_categories.append(sorted_categories[idx][0])
+            while category_idx < len(sorted_categories):
+                cat_name = sorted_categories[category_idx][0]
+                category_idx += 1
+                # 当存在冲突时，跳过"可能冲突"的类别（conflict_level=2）
+                if has_heating_cooling_conflict and optimization_categories[cat_name]['conflict_level'] >= 2:
+                    continue
+                focus_categories.append(cat_name)
+                break
         
         # 构造优化方向文本（包含关键词，确保知识库匹配）
-        directions_text = "本轮应重点考虑以下优化方向：\n"
+        if has_heating_cooling_conflict:
+            directions_text = "【制冷和供暖都需要优化 - 采用综合平衡策略】\n本轮应重点考虑对供暖和制冷都有利的优化方向：\n"
+        else:
+            directions_text = "【建议优化方向】本轮应重点考虑以下优化方向：\n"
+        
         for cat_name in focus_categories:
             cat_info = optimization_categories[cat_name]
             usage_count = category_usage[cat_name]
