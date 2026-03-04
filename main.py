@@ -297,7 +297,7 @@ class EnergyPlusOptimizer:
                     metrics['total_heating_kwh'] = round(heating_gj * 277.778, 2)
                     self.logger.debug(f"供暖能耗: {heating_gj} GJ = {metrics['total_heating_kwh']} kWh")
                 
-                # 4. 查询能耗强度 (MJ/m²) 并转换为 kWh/m²
+                # 4. 查询单位面积总建筑能耗 (MJ/m²) 并转换为 kWh/m²
                 cursor.execute("""
                     SELECT t.Value 
                     FROM TabularData t 
@@ -312,19 +312,58 @@ class EnergyPlusOptimizer:
                     try:
                         eui_mj_m2 = float(eui_result[0])
                         metrics['eui_kwh_per_m2'] = round(eui_mj_m2 / 3.6, 2)
-                        self.logger.debug(f"能耗强度: {eui_mj_m2} MJ/m² = {metrics['eui_kwh_per_m2']} kWh/m²")
+                        self.logger.debug(f"单位面积总建筑能耗: {eui_mj_m2} MJ/m² = {metrics['eui_kwh_per_m2']} kWh/m²")
                     except Exception as e:
-                        self.logger.warning(f"无法从SQL查询能耗强度: {e}")
+                        self.logger.warning(f"无法从SQL查询单位面积总建筑能耗: {e}")
                 
+                # 在关闭连接前，尝试根据 Total Site EUI 计算建筑面积并把冷/暖能耗转换为 kWh/m²
+                building_area_m2 = None
+                try:
+                    if metrics.get('eui_kwh_per_m2') and metrics.get('eui_kwh_per_m2') > 0 and metrics.get('total_site_energy_kwh') and metrics.get('total_site_energy_kwh') > 0:
+                        building_area_m2 = metrics['total_site_energy_kwh'] / metrics['eui_kwh_per_m2']
+                        self.logger.debug(f"计算建筑面积: {building_area_m2:.2f} m² (total_kWh / eui_kWh_per_m2)")
+                        # 保存为全局属性以便后续轮次回退使用
+                        try:
+                            self.building_area_m2 = float(building_area_m2)
+                        except Exception:
+                            self.building_area_m2 = None
+                        # 将冷/暖能耗从 kWh 转为 kWh/m²（按建筑总面积）
+                        if building_area_m2 and building_area_m2 > 0:
+                            old_cooling = metrics.get('total_cooling_kwh', 0)
+                            old_heating = metrics.get('total_heating_kwh', 0)
+                            metrics['total_cooling_kwh'] = round(old_cooling / building_area_m2, 4)
+                            metrics['total_heating_kwh'] = round(old_heating / building_area_m2, 4)
+                            self.logger.debug(f"冷却能耗: {old_cooling} kWh -> {metrics['total_cooling_kwh']} kWh/m²")
+                            self.logger.debug(f"供暖能耗: {old_heating} kWh -> {metrics['total_heating_kwh']} kWh/m²")
+                except Exception as e:
+                    self.logger.warning(f"计算建筑面积或转换冷/暖能耗为kWh/m²时出错: {e}")
+
+                # 如果本次未能从EUI计算出建筑面积，但之前已知建筑面积，则使用历史建筑面积进行转换
+                if (not building_area_m2 or building_area_m2 is None) and hasattr(self, 'building_area_m2') and self.building_area_m2:
+                    try:
+                        old_cooling = metrics.get('total_cooling_kwh', 0)
+                        old_heating = metrics.get('total_heating_kwh', 0)
+                        metrics['total_cooling_kwh'] = round(old_cooling / self.building_area_m2, 4)
+                        metrics['total_heating_kwh'] = round(old_heating / self.building_area_m2, 4)
+                        self.logger.debug(f"回退使用已知建筑面积 {self.building_area_m2:.2f} m² 进行冷/暖能耗转换: {old_cooling}->{metrics['total_cooling_kwh']} kWh/m²")
+                        building_area_m2 = self.building_area_m2
+                    except Exception as e:
+                        self.logger.warning(f"使用历史建筑面积转换冷/暖能耗时出错: {e}")
+
                 conn.close()
-                
+
                 # 验证数据完整性
                 if metrics['total_site_energy_kwh'] > 0:
                     self.logger.info(f"✓ 从SQL数据库成功提取能耗数据")
                     self.logger.info(f"  总建筑能耗: {metrics['total_site_energy_kwh']} kWh")
-                    self.logger.info(f"  能耗强度: {metrics['eui_kwh_per_m2']} kWh/m²")
-                    self.logger.info(f"  冷却能耗: {metrics['total_cooling_kwh']} kWh")
-                    self.logger.info(f"  供暖能耗: {metrics['total_heating_kwh']} kWh")
+                    self.logger.info(f"  单位面积总建筑能耗: {metrics['eui_kwh_per_m2']} kWh/m²")
+                    # 基于是否成功计算到建筑面积来标注单位
+                    if building_area_m2:
+                        self.logger.info(f"  冷却能耗: {metrics['total_cooling_kwh']} kWh/m²")
+                        self.logger.info(f"  供暖能耗: {metrics['total_heating_kwh']} kWh/m²")
+                    else:
+                        self.logger.info(f"  冷却能耗: {metrics['total_cooling_kwh']} kWh (未转换为 kWh/m²)")
+                        self.logger.info(f"  供暖能耗: {metrics['total_heating_kwh']} kWh (未转换为 kWh/m²)")
                     return metrics
                 else:
                     self.logger.warning(f"⚠ 无法从SQL数据库提取能耗数据")
@@ -464,9 +503,9 @@ class EnergyPlusOptimizer:
         request = (
             f"{status_note}。当前能耗指标：\n"
             f"- 总建筑能耗 {metrics['total_site_energy_kwh']} kWh\n"
-            f"- 能耗强度 {metrics['eui_kwh_per_m2']} kWh/m²\n"
-            f"- 冷却能耗 {metrics['total_cooling_kwh']} kWh\n"
-            f"- 供暖能耗 {metrics['total_heating_kwh']} kWh\n"
+            f"- 单位面积总建筑能耗 {metrics['eui_kwh_per_m2']} kWh/m²\n"
+            f"- 冷却能耗 {metrics['total_cooling_kwh']} kWh/m²\n"
+            f"- 供暖能耗 {metrics['total_heating_kwh']} kWh/m²\n"
             f"\n【核心优化目标】必须同时降低总能耗、供暖能耗、制冷能耗三者，不允许其中任何一项上升。"
         )
 
@@ -480,8 +519,8 @@ class EnergyPlusOptimizer:
             request += (
                 f"\n【上一轮效果反馈】\n"
                 f"  总能耗变化: {delta_total:+.2f} kWh\n"
-                f"  制冷能耗变化: {delta_cooling:+.2f} kWh\n"
-                f"  供暖能耗变化: {delta_heating:+.2f} kWh"
+                f"  制冷能耗变化: {delta_cooling:+.2f} kWh/m²\n"
+                f"  供暖能耗变化: {delta_heating:+.2f} kWh/m²"
             )
 
             # 详细分析每一项的变化
@@ -502,7 +541,7 @@ class EnergyPlusOptimizer:
                 # ========== 关键改进：供暖和制冷的平衡优化 ==========
                 # 检查是否制冷和供暖都在上升（最棘手的情况）
                 if delta_cooling > 0 and delta_heating > 0:
-                    request += f"  ⚠️ 制冷（↑{delta_cooling:.2f}kWh）和供暖（↑{delta_heating:.2f}kWh）都上升，说明改键修改效果不理想。\n"
+                    request += f"  ⚠️ 制冷（↑{delta_cooling:.2f} kWh/m²）和供暖（↑{delta_heating:.2f} kWh/m²）都上升，说明改键修改效果不理想。\n"
                     request += f"  本轮应采用['同时降低制冷和供暖'的综合策略，优先选择对两者都有利的措施：\n"
                     request += f"    • 增加围护结构保温性能（降低导热系数）- 减少冬季热损失 & 减少夏季散热失\n"
                     request += f"    • 减少空气渗透（降低渗透率）- 减少冬季冷空气进入 & 减少夏季热空气进入\n"
@@ -510,10 +549,10 @@ class EnergyPlusOptimizer:
                     request += f"    • 降低内部热源（照明、设备、人员）- 直接减少制冷需求 & 增加供暖需求（但总能耗下降）\n"
                     request += f"  ⚠️ 避免：修改遮阳系数（对制冷有利但对供暖有害）、修改供暖供风温度（影响设计）等相冲突的措施。\n"
                 elif delta_cooling > 0:
-                    request += f"  - 制冷能耗上升了{delta_cooling:.2f} kWh，需要调整制冷相关参数（如提高制冷供风温度、增加窗户反射率、降低内部热源等）\n"
+                    request += f"  - 制冷能耗上升了{delta_cooling:.2f} kWh/m²，需要调整制冷相关参数（如提高制冷供风温度、增加窗户反射率、降低内部热源等）\n"
                     request += f"  - 同时注意不要增加供暖负荷，避免修改会增加冬季需热的参数。\n"
                 if delta_heating > 0:
-                    request += f"  - 供暖能耗上升了{delta_heating:.2f} kWh，需要调整供暖相关参数（如降低供暖供风温度、增加围护结构保温、减少渗透等）\n"
+                    request += f"  - 供暖能耗上升了{delta_heating:.2f} kWh/m²，需要调整供暖相关参数（如降低供暖供风温度、增加围护结构保温、减少渗透等）\n"
                     request += f"  - 同时注意不要增加制冷负荷，避免修改会增加夏季散热困难的参数。\n"
                 request += f"  - 避免重复上一轮的修改方向，应反向调整或采用更小步长。"
             else:
@@ -2425,15 +2464,15 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
             f"({_safe_pct(total_saved_vs_baseline, baseline_metrics['total_site_energy_kwh']):+.2f}%)"
         )
         self.logger.info(
-            f"- 能耗强度(EUI): {eui_saved_vs_baseline:+.2f} kWh/m² "
+            f"- 单位面积总建筑能耗(EUI): {eui_saved_vs_baseline:+.2f} kWh/m² "
             f"({_safe_pct(eui_saved_vs_baseline, baseline_metrics['eui_kwh_per_m2']):+.2f}%)"
         )
         self.logger.info(
-            f"- 制冷能耗: {cooling_saved_vs_baseline:+.2f} kWh "
+            f"- 制冷能耗: {cooling_saved_vs_baseline:+.2f} kWh/m² "
             f"({_safe_pct(cooling_saved_vs_baseline, baseline_metrics['total_cooling_kwh']):+.2f}%)"
         )
         self.logger.info(
-            f"- 供暖能耗: {heating_saved_vs_baseline:+.2f} kWh "
+            f"- 供暖能耗: {heating_saved_vs_baseline:+.2f} kWh/m² "
             f"({_safe_pct(heating_saved_vs_baseline, baseline_metrics['total_heating_kwh']):+.2f}%)"
         )
 
@@ -2451,15 +2490,15 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
                 f"({_safe_pct(total_saved_vs_prev, prev_metrics['total_site_energy_kwh']):+.2f}%)"
             )
             self.logger.info(
-                f"- 能耗强度(EUI): {eui_saved_vs_prev:+.2f} kWh/m² "
+                f"- 单位面积总建筑能耗(EUI): {eui_saved_vs_prev:+.2f} kWh/m² "
                 f"({_safe_pct(eui_saved_vs_prev, prev_metrics['eui_kwh_per_m2']):+.2f}%)"
             )
             self.logger.info(
-                f"- 制冷能耗: {cooling_saved_vs_prev:+.2f} kWh "
+                f"- 制冷能耗: {cooling_saved_vs_prev:+.2f} kWh/m² "
                 f"({_safe_pct(cooling_saved_vs_prev, prev_metrics['total_cooling_kwh']):+.2f}%)"
             )
             self.logger.info(
-                f"- 供暖能耗: {heating_saved_vs_prev:+.2f} kWh "
+                f"- 供暖能耗: {heating_saved_vs_prev:+.2f} kWh/m² "
                 f"({_safe_pct(heating_saved_vs_prev, prev_metrics['total_heating_kwh']):+.2f}%)"
             )
     
@@ -2716,7 +2755,7 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
             
             self.logger.info(f"\n【优化效果】(第{self.best_iteration}轮最优)\n")
             self.logger.info(f"总建筑能耗节能: {total_savings:.2f} kWh ({total_savings_pct:.1f}%)")
-            self.logger.info(f"能耗强度改善: {eui_savings:.2f} kWh/m² ({eui_savings_pct:.1f}%)")
+            self.logger.info(f"单位面积总建筑能耗改善: {eui_savings:.2f} kWh/m² ({eui_savings_pct:.1f}%)")
             self.logger.info(f"冷却能耗节能: {cool_savings:.2f} kWh ({cool_savings_pct:.1f}%)")
             self.logger.info(f"供暖能耗节能: {heat_savings:.2f} kWh ({heat_savings_pct:.1f}%)")
             
