@@ -2786,6 +2786,59 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
         self.logger.info(f"  - Input Tokens: {getattr(self, 'total_input_tokens', 0):,}")
         self.logger.info(f"  - Output Tokens: {getattr(self, 'total_output_tokens', 0):,}")
         self.logger.info(f"  - Cached Input Tokens: {getattr(self, 'total_cached_input_tokens', 0):,}")
+
+        # 变化曲线可视化
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            import os
+            # 设置中文字体（优先使用 SimHei、Microsoft YaHei）
+            # 中英文混合字体，保证“²”等符号和中文都能显示
+            import matplotlib.font_manager as fm
+            font_candidates = ["Microsoft YaHei", "Arial Unicode MS", "DejaVu Sans", "SimHei", "STHeiti", "Arial"]
+            font_path = None
+            for font_name in font_candidates:
+                font_list = fm.findSystemFonts(fontpaths=None, fontext='ttf')
+                for f in font_list:
+                    if font_name.lower() in fm.FontProperties(fname=f).get_name().lower():
+                        font_path = f
+                        break
+                if font_path:
+                    break
+            if font_path:
+                font_prop = fm.FontProperties(fname=font_path)
+                matplotlib.rcParams['font.sans-serif'] = [font_prop.get_name()]
+                matplotlib.rcParams['axes.unicode_minus'] = False
+            else:
+                font_prop = None
+                self.logger.warning("未找到理想的中英文混合字体，可能仍有部分符号无法显示。建议安装 Microsoft YaHei 或 Arial Unicode MS 字体。")
+            plot_dir = "optimization_plot"
+            os.makedirs(plot_dir, exist_ok=True)
+            cooling = [item['metrics']['total_cooling_kwh'] for item in self.iteration_history]
+            heating = [item['metrics']['total_heating_kwh'] for item in self.iteration_history]
+            x = list(range(1, len(cooling)+1))
+            plt.figure(figsize=(8,5))
+            plt.plot(x, cooling, marker='o', label='冷却能耗 (kWh/m²)')
+            plt.plot(x, heating, marker='o', label='供暖能耗 (kWh/m²)')
+            if font_prop:
+                plt.xlabel('优化轮次', fontproperties=font_prop)
+                plt.ylabel('能耗 (kWh/m²)', fontproperties=font_prop)
+                plt.title('供冷/供暖能耗优化变化曲线', fontproperties=font_prop)
+                plt.legend(prop=font_prop)
+            else:
+                plt.xlabel('优化轮次')
+                plt.ylabel('能耗 (kWh/m²)')
+                plt.title('供冷/供暖能耗优化变化曲线')
+                plt.legend()
+            plt.grid(True)
+            from datetime import datetime
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            plot_path = os.path.join(plot_dir, f'cooling_heating_curve_{timestamp}.png')
+            plt.savefig(plot_path, bbox_inches='tight')
+            plt.close()
+            self.logger.info(f"已保存供冷/供暖能耗变化曲线: {plot_path}")
+        except Exception as e:
+            self.logger.warning(f"保存能耗变化曲线失败: {e}")
         
         # 计算API剩余tokens（假设API总配额，这里需要根据实际情况调整）
         # GPT-5.2的常见配额范围，这里以一个示例值展示
