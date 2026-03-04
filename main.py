@@ -1382,7 +1382,7 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
         return "existing_value * 0.96"
 
     def _request_plan_from_llm(self, system_prompt, user_prompt):
-        """统一的LLM请求入口，负责调用与token日志。"""
+        """统一的LLM请求入口，负责调用与token日志和详细token统计。"""
         self.llm_calls_count += 1
         self.logger.info(f"\n🤖 【调用LLM】第{self.llm_calls_count}次调用 - 模型: gpt-5.2")
 
@@ -1398,16 +1398,30 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
         plan = json.loads(response.choices[0].message.content)
         usage = response.usage
 
-        prompt_tokens = usage.prompt_tokens
-        completion_tokens = usage.completion_tokens
-        total_tokens = usage.total_tokens
-        self.total_tokens_used += total_tokens
+        # 详细token统计
+        input_tokens = getattr(usage, 'prompt_tokens', 0)
+        output_tokens = getattr(usage, 'completion_tokens', 0)
+        cached_input_tokens = getattr(usage, 'cached_prompt_tokens', 0) if hasattr(usage, 'cached_prompt_tokens') else 0
+        total_tokens = getattr(usage, 'total_tokens', input_tokens + output_tokens)
+
+        # 分别累计
+        if not hasattr(self, 'total_input_tokens'): self.total_input_tokens = 0
+        if not hasattr(self, 'total_output_tokens'): self.total_output_tokens = 0
+        if not hasattr(self, 'total_cached_input_tokens'): self.total_cached_input_tokens = 0
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cached_input_tokens += cached_input_tokens
+        self.total_tokens_used = getattr(self, 'total_tokens_used', 0) + total_tokens
 
         self.logger.info("✓ LLM分析完成")
-        self.logger.info(f"  - Prompt Tokens: {prompt_tokens:,}")
-        self.logger.info(f"  - Completion Tokens: {completion_tokens:,}")
+        self.logger.info(f"  - Input Tokens: {input_tokens:,}")
+        self.logger.info(f"  - Output Tokens: {output_tokens:,}")
+        self.logger.info(f"  - Cached Input Tokens: {cached_input_tokens:,}")
         self.logger.info(f"  - 本次总计: {total_tokens:,} tokens")
-        self.logger.info(f"  - 累计使用: {self.total_tokens_used:,} tokens")
+        self.logger.info(f"  - 累计 Input: {self.total_input_tokens:,} tokens")
+        self.logger.info(f"  - 累计 Output: {self.total_output_tokens:,} tokens")
+        self.logger.info(f"  - 累计 Cached Input: {self.total_cached_input_tokens:,} tokens")
+        self.logger.info(f"  - 累计总计: {self.total_tokens_used:,} tokens")
         return plan
 
     def _count_plan_categories(self, plan):
@@ -2769,6 +2783,9 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
         self.logger.info(f"{'='*80}")
         self.logger.info(f"LLM调用次数: {self.llm_calls_count}")
         self.logger.info(f"总计消耗Token: {self.total_tokens_used:,}")
+        self.logger.info(f"  - Input Tokens: {getattr(self, 'total_input_tokens', 0):,}")
+        self.logger.info(f"  - Output Tokens: {getattr(self, 'total_output_tokens', 0):,}")
+        self.logger.info(f"  - Cached Input Tokens: {getattr(self, 'total_cached_input_tokens', 0):,}")
         
         # 计算API剩余tokens（假设API总配额，这里需要根据实际情况调整）
         # GPT-5.2的常见配额范围，这里以一个示例值展示
