@@ -1384,10 +1384,10 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
     def _request_plan_from_llm(self, system_prompt, user_prompt):
         """统一的LLM请求入口，负责调用与token日志。"""
         self.llm_calls_count += 1
-        self.logger.info(f"\n🤖 【调用LLM】第{self.llm_calls_count}次调用 - 模型: gpt-4o")
+        self.logger.info(f"\n🤖 【调用LLM】第{self.llm_calls_count}次调用 - 模型: gpt-5.2")
 
         response = self.client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.2",
             temperature=0,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -2771,7 +2771,7 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
         self.logger.info(f"总计消耗Token: {self.total_tokens_used:,}")
         
         # 计算API剩余tokens（假设API总配额，这里需要根据实际情况调整）
-        # GPT-4的常见配额范围，这里以一个示例值展示
+        # GPT-5.2的常见配额范围，这里以一个示例值展示
         # 注意：实际配额需要从API账户查询，这里仅作演示
         try:
             with open("api_key.txt", 'r') as f:
