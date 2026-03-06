@@ -10,6 +10,10 @@
 /in.idf
 /optimization_logs
 /optimization_results
+/optimization_logs_并行
+/optimization_results_并行
+/optimization_logs_并行2
+/optimization_results_并行2
 /optimization_plot
 /temp_files
 /weather.epw

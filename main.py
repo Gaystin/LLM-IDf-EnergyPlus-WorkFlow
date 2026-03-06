@@ -10,6 +10,9 @@ import subprocess
 import logging
 import sys
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from datetime import datetime
 from pathlib import Path
 from eppy.modeleditor import IDF
@@ -18,14 +21,16 @@ from knowledge_base import EnergyPlusKnowledgeBase
 
 
 class EnergyPlusOptimizer:
-    """EnergyPlus 5轮迭代自动优化系统"""
+    """EnergyPlus 5轮并行工作流迭代自动优化系统"""
     
-    def __init__(self, idf_path, idd_path, api_key_path, epw_path="weather.epw", log_dir="optimization_logs"):
+    def __init__(self, idf_path, idd_path, api_key_path, epw_path="weather.epw", log_dir="optimization_logs_并行2", num_workflows=2):
         self.idf_path = idf_path
         self.idd_path = idd_path
         self.epw_path = epw_path
         self.log_dir = log_dir
-        self.optimization_dir = "optimization_results"
+        self.optimization_dir = "optimization_results_并行2"
+        # 线程级日志上下文：仅用于汇总日志添加[workflow_x]前缀
+        self._log_context = threading.local()
         
         # 创建日志目录
         os.makedirs(log_dir, exist_ok=True)
@@ -82,7 +87,30 @@ class EnergyPlusOptimizer:
             self.logger.error("未找到EnergyPlus安装")
             raise RuntimeError("EnergyPlus not found")
         
-        # 初始化追踪数据
+        # 并行工作流配置
+        self.num_workflows = num_workflows
+        self.workflows = {}  # 存储各工作流的独立数据
+        self.workflows_lock = Lock()  # 保护共享资源的锁
+        self.logger.info(f"初始化{num_workflows}条并行工作流")
+        
+        # 初始化各工作流的数据结构
+        for i in range(num_workflows):
+            workflow_id = f"workflow_{i+1}"
+            self.workflows[workflow_id] = {
+                'best_metrics': None,
+                'best_iteration': 0,
+                'iteration_history': [],
+                'current_idf_path': idf_path,
+                'field_modification_history': {},
+                'last_round_fields': set(),
+                'logger': self._setup_workflow_logger(workflow_id)  # 为每个workflow创建独立logger
+            }
+        
+        # 全局最优指标（所有工作流中最优）
+        self.best_metrics_global = None
+        self.best_workflow_id = None
+        
+        # 初始化追踪数据（兼容旧版本）
         self.best_metrics = None
         self.best_iteration = 0
         self.iteration_history = []
@@ -139,9 +167,24 @@ class EnergyPlusOptimizer:
         ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(logging.INFO)
         
-        # 格式器
+        # 仅在汇总日志处理器上加工作流前缀，分工作流日志保持老版格式
+        class _WorkflowPrefixFilter(logging.Filter):
+            def __init__(self, context):
+                super().__init__()
+                self._context = context
+
+            def filter(self, record):
+                workflow_id = getattr(self._context, 'workflow_id', None)
+                record.workflow_prefix = f"[{workflow_id}] " if workflow_id else ""
+                return True
+
+        prefix_filter = _WorkflowPrefixFilter(self._log_context)
+        fh.addFilter(prefix_filter)
+        ch.addFilter(prefix_filter)
+
+        # 格式器（汇总日志会自动加 workflow 前缀）
         formatter = logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s',
+            '%(asctime)s - %(levelname)s - %(workflow_prefix)s%(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         fh.setFormatter(formatter)
@@ -151,6 +194,77 @@ class EnergyPlusOptimizer:
         logger.addHandler(ch)
         
         return logger
+    
+    def _setup_workflow_logger(self, workflow_id):
+        """为单个workflow初始化独立的日志系统
+        
+        参数:
+            workflow_id: 工作流ID（如 "workflow_1"）
+        
+        返回:
+            独立的logger实例
+        """
+        # 生成工作流专属日志文件名
+        log_file = os.path.join(
+            self.log_dir, 
+            f"optimization_{workflow_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        
+        # 创建独立的logger实例（使用workflow_id作为名称避免冲突）
+        workflow_logger = logging.getLogger(f"{__name__}.{workflow_id}")
+        workflow_logger.handlers = []  # 清除之前的处理器
+        workflow_logger.setLevel(logging.DEBUG)
+        workflow_logger.propagate = False  # 不向父logger传播，避免重复输出
+        
+        # 文件处理器 - 输出到workflow专属日志文件
+        fh = logging.FileHandler(log_file, encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        
+        # 控制台处理器 - 不添加，避免在控制台重复输出
+        # 控制台输出由主logger统一管理
+        
+        # 格式器
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        fh.setFormatter(formatter)
+        
+        workflow_logger.addHandler(fh)
+        
+        return workflow_logger
+
+    def _attach_workflow_thread_handler(self, workflow_id):
+        """按线程分流日志到工作流文件，确保子方法日志完整落盘。"""
+        log_file = os.path.join(
+            self.log_dir,
+            f"optimization_{workflow_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+
+        handler = logging.FileHandler(log_file, encoding='utf-8')
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+
+        current_thread_name = threading.current_thread().name
+
+        class _ThreadFilter(logging.Filter):
+            def filter(self, record):
+                return record.threadName == current_thread_name
+
+        handler.addFilter(_ThreadFilter())
+        self.logger.addHandler(handler)
+        return handler
+
+    def _detach_workflow_thread_handler(self, handler):
+        """卸载线程分流handler，防止句柄泄漏。"""
+        try:
+            self.logger.removeHandler(handler)
+            handler.close()
+        except Exception:
+            pass
     
     def _locate_energyplus(self):
         """定位EnergyPlus安装"""
@@ -171,13 +285,17 @@ class EnergyPlusOptimizer:
         
         return None
     
-    def run_simulation(self, idf_path, iteration_name):
+    def run_simulation(self, idf_path, iteration_name, workflow_id=None):
         """运行EnergyPlus模拟"""
         self.logger.info(f"\n【模拟】{iteration_name}")
         self.logger.info("-" * 80)
         
         try:
-            run_dir = os.path.join(self.optimization_dir, iteration_name)
+            # 运行目录按工作流隔离，避免并行时同名轮次目录冲突
+            if workflow_id:
+                run_dir = os.path.join(self.optimization_dir, workflow_id, iteration_name)
+            else:
+                run_dir = os.path.join(self.optimization_dir, iteration_name)
             os.makedirs(run_dir, exist_ok=True)
             
             # 复制IDF到运行目录
@@ -195,7 +313,8 @@ class EnergyPlusOptimizer:
             ]
             
             self.logger.info(f"执行EnergyPlus: {iteration_name}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            # 使用二进制捕获后手动容错解码，避免Windows默认GBK解码失败
+            result = subprocess.run(cmd, capture_output=True, text=False, timeout=600)
             
             if result.returncode == 0:
                 self.logger.info(f"✓ 模拟完成: {iteration_name}")
@@ -203,8 +322,11 @@ class EnergyPlusOptimizer:
             else:
                 self.logger.error(f"✗ 模拟失败: {iteration_name}")
                 self.logger.error(f"返回码: {result.returncode}")
+                stderr_text = ""
                 if result.stderr:
-                    self.logger.error(f"错误: {result.stderr[:500]}")
+                    stderr_text = result.stderr.decode('utf-8', errors='replace')
+                if stderr_text:
+                    self.logger.error(f"错误: {stderr_text[:500]}")
                 return None
         
         except subprocess.TimeoutExpired:
@@ -477,7 +599,11 @@ class EnergyPlusOptimizer:
                     f"  【关键词过滤】对象类型 {obj_type} 的所有字段因关键词限制被过滤，不会进行任何修改"
                 )
         
-        output_idf = os.path.join(self.optimization_dir, f"iteration_{iteration}_optimized.idf")
+        # 生成输出文件名：如果存在 workflow_id，则加入文件名以区分不同工作流
+        if hasattr(self, 'current_workflow_id') and self.current_workflow_id:
+            output_idf = os.path.join(self.optimization_dir, f"{self.current_workflow_id}_iteration_{iteration}_optimized.idf")
+        else:
+            output_idf = os.path.join(self.optimization_dir, f"iteration_{iteration}_optimized.idf")
         self._execute_modifications(refined_plan, output_idf, self.current_idf_path)
         
         if os.path.exists(output_idf):
@@ -2517,68 +2643,260 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
             )
     
     def run_optimization_loop(self, max_iterations=5):
-        """运行5次迭代优化循环"""
+        """运行并行工作流优化循环 - 5条工作流同时进行
+        
+        直接复制原有的单工作流逻辑 5 遍并行执行，不改变任何 prompt、代码逻辑、字段修改规则等。
+        """
         self.logger.info(f"\n\n{'█'*80}")
-        self.logger.info(f"启动{max_iterations}轮迭代优化")
+        self.logger.info(f"启动{max_iterations}轮迭代优化 (并行{self.num_workflows}条工作流)")
         self.logger.info(f"{'█'*80}\n")
         
-        for iteration in range(1, max_iterations + 1):
-            self.logger.info(f"\n\n{'═'*80}")
-            self.logger.info(f"【第{iteration}轮/{max_iterations}】")
-            self.logger.info(f"{'═'*80}\n")
+        # 并行调用 5 条工作流的优化循环
+        with ThreadPoolExecutor(max_workers=self.num_workflows) as executor:
+            futures = []
+            for workflow_id in self.workflows.keys():
+                future = executor.submit(
+                    self._single_workflow_optimization_loop,
+                    workflow_id,
+                    max_iterations
+                )
+                futures.append(future)
             
-            # 第一轮使用原始IDF，后续使用优化后的IDF
-            if iteration == 1:
-                sim_idf = self.idf_path
-                iter_name = "initial_baseline"
-            else:
-                sim_idf = self.current_idf_path
-                iter_name = f"iteration_{iteration}"
-            
-            # 1. 运行模拟
-            sim_dir = self.run_simulation(sim_idf, iter_name)
-            if not sim_dir:
-                self.logger.error(f"第{iteration}轮模拟失败，中断优化")
-                break
-            
-            # 2. 提取能耗指标
-            metrics = self.extract_metrics(sim_dir)
-            if not metrics:
-                self.logger.error(f"第{iteration}轮无法提取能耗数据，中断优化")
-                break
-            
-            # 保存到历史
-            self.iteration_history.append({
-                'iteration': iteration,
-                'metrics': metrics,
-                'idf_path': sim_idf
-            })
-
-            # 3.5 打印每轮节能明细
-            self._print_iteration_savings(metrics, iteration)
-            
-            # 3. 更新最优值
-            self.update_best_metrics(metrics, iteration)
-            
-            # 4. 最后一轮不需要优化
-            if iteration == max_iterations:
-                self.logger.info(f"\n✓ 优化循环完成！")
-                break
-            
-            # 5. LLM分析建议
-            plan = self.generate_optimization_suggestions(metrics, iteration)
-            if not plan:
-                self.logger.warning(f"第{iteration}轮无法获得优化建议，使用默认优化")
-                plan = self._get_default_suggestions(iteration)
-            
-            # 6. 应用优化
-            new_idf = self.apply_optimization(plan, iteration)
-            if not new_idf:
-                self.logger.warning(f"第{iteration}轮优化应用失败，继续下一轮")
-                # 继续使用当前IDF
+            # 等待所有工作流完成
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    self.logger.error(f"工作流优化出错: {e}")
         
-        # 优化循环结束
-        self._print_final_report()
+        # 所有工作流完成后汇总报告
+        self._print_parallel_final_report()
+    
+    def _single_workflow_optimization_loop(self, workflow_id, max_iterations):
+        """单工作流优化循环 - 直接复制原有的单工作流逻辑
+        
+        参数:
+            workflow_id: 工作流ID（如 "workflow_1"）
+            max_iterations: 最大迭代次数
+        """
+        thread_handler = self._attach_workflow_thread_handler(workflow_id)
+        try:
+            self._log_context.workflow_id = workflow_id
+            self.logger.info(f"\n\n{'█'*80}")
+            self.logger.info(f"启动{max_iterations}轮迭代优化")
+            self.logger.info(f"{'█'*80}\n")
+
+            for iteration in range(1, max_iterations + 1):
+                self.logger.info(f"\n\n{'═'*80}")
+                self.logger.info(f"【第{iteration}轮/{max_iterations}】")
+                self.logger.info(f"{'═'*80}\n")
+
+                with self.workflows_lock:
+                    current_idf_path = self.workflows[workflow_id]['current_idf_path']
+                    self.current_idf_path = current_idf_path
+                    self.current_workflow_id = workflow_id
+                    self.iteration_history = self.workflows[workflow_id]['iteration_history']
+                    self.best_metrics = self.workflows[workflow_id]['best_metrics']
+                    self.best_iteration = self.workflows[workflow_id]['best_iteration']
+
+                if iteration == 1:
+                    sim_idf = current_idf_path
+                    iter_name = "initial_baseline"
+                else:
+                    with self.workflows_lock:
+                        current_metrics = self.workflows[workflow_id]['best_metrics']
+                    if not current_metrics:
+                        self.logger.error(f"第{iteration}轮无有效指标，中断优化")
+                        break
+
+                    # 生成优化建议（保持原逻辑）
+                    with self.workflows_lock:
+                        self.current_idf_path = self.workflows[workflow_id]['current_idf_path']
+                        self.current_workflow_id = workflow_id
+                        self.iteration_history = self.workflows[workflow_id]['iteration_history']
+                    plan = self.generate_optimization_suggestions(current_metrics, iteration)
+                    if not plan:
+                        self.logger.warning(f"第{iteration}轮LLM无法生成建议，使用默认方案")
+                        plan = self._get_default_suggestions(iteration)
+                    if not plan:
+                        self.logger.error(f"第{iteration}轮无有效计划，中断优化")
+                        break
+
+                    # 应用优化（保持并行安全）
+                    with self.workflows_lock:
+                        self.current_idf_path = self.workflows[workflow_id]['current_idf_path']
+                        self.current_workflow_id = workflow_id
+                        self.iteration_history = self.workflows[workflow_id]['iteration_history']
+                        modified_idf_path = self.apply_optimization(plan, iteration)
+
+                    if not modified_idf_path or not os.path.exists(modified_idf_path):
+                        self.logger.warning(f"第{iteration}轮优化应用失败，使用当前IDF重新运行")
+                        sim_idf = current_idf_path
+                    else:
+                        sim_idf = modified_idf_path
+                        with self.workflows_lock:
+                            self.workflows[workflow_id]['current_idf_path'] = modified_idf_path
+
+                    iter_name = f"iteration_{iteration}"
+
+                sim_dir = self.run_simulation(sim_idf, iter_name, workflow_id=workflow_id)
+                if not sim_dir:
+                    self.logger.error(f"第{iteration}轮模拟失败，中断优化")
+                    break
+
+                metrics = self.extract_metrics(sim_dir)
+                if not metrics:
+                    self.logger.error(f"第{iteration}轮无法提取能耗数据，中断优化")
+                    break
+
+                with self.workflows_lock:
+                    self.workflows[workflow_id]['iteration_history'].append({
+                        'iteration': iteration,
+                        'metrics': metrics,
+                        'idf_path': sim_idf,
+                        'plan_description': '基准模拟' if iteration == 1 else '优化方案'
+                    })
+                    self.iteration_history = self.workflows[workflow_id]['iteration_history']
+                    self.best_metrics = self.workflows[workflow_id]['best_metrics']
+                    self.best_iteration = self.workflows[workflow_id]['best_iteration']
+
+                self._print_iteration_savings(metrics, iteration)
+                self.update_best_metrics(metrics, iteration)
+
+                with self.workflows_lock:
+                    self.workflows[workflow_id]['best_metrics'] = self.best_metrics
+                    self.workflows[workflow_id]['best_iteration'] = self.best_iteration
+            
+        except Exception as e:
+            self.logger.error(f"优化循环异常: {e}", exc_info=True)
+        finally:
+            if hasattr(self._log_context, 'workflow_id'):
+                del self._log_context.workflow_id
+            self._detach_workflow_thread_handler(thread_handler)
+
+    def _print_parallel_final_report(self):
+        """【并行工作流】汇总所有工作流的优化结果"""
+        try:
+            self.logger.info(f"\n\n{'='*80}")
+            self.logger.info(f"【最终汇总报告 - {self.num_workflows}条并行工作流】")
+            self.logger.info(f"{'='*80}\n")
+            
+            # 线程安全地读取所有工作流数据
+            with self.workflows_lock:
+                all_workflows = dict(self.workflows)
+            
+            # 找出全局最优方案
+            global_best = None
+            global_best_workflow = None
+            global_best_energy = float('inf')
+            
+            for workflow_id in sorted(all_workflows.keys()):
+                workflow_data = all_workflows[workflow_id]
+                best_metrics = workflow_data['best_metrics']
+                
+                if best_metrics:
+                    self.logger.info(f"\n[{workflow_id}] 优化结果")
+                    self.logger.info(f"  最优轮次: 第{workflow_data['best_iteration']}轮")
+                    self.logger.info(f"  总建筑能耗: {best_metrics['total_site_energy_kwh']} kWh")
+                    self.logger.info(f"  单位面积能耗: {best_metrics['eui_kwh_per_m2']} kWh/m²")
+                    self.logger.info(f"  制冷能耗: {best_metrics['total_cooling_kwh']} kWh/m²")
+                    self.logger.info(f"  供暖能耗: {best_metrics['total_heating_kwh']} kWh/m²")
+                    
+                    # 计算与基准的4个指标的变化 - 检查 iteration_history 是否为空
+                    if workflow_data['iteration_history'] and len(workflow_data['iteration_history']) > 0:
+                        baseline_metrics = workflow_data['iteration_history'][0]['metrics']
+                        
+                        # 计算4个指标的变化
+                        total_energy_saved = baseline_metrics['total_site_energy_kwh'] - best_metrics['total_site_energy_kwh']
+                        total_energy_pct = (total_energy_saved / baseline_metrics['total_site_energy_kwh'] * 100) if baseline_metrics['total_site_energy_kwh'] > 0 else 0
+                        
+                        eui_saved = baseline_metrics['eui_kwh_per_m2'] - best_metrics['eui_kwh_per_m2']
+                        eui_pct = (eui_saved / baseline_metrics['eui_kwh_per_m2'] * 100) if baseline_metrics['eui_kwh_per_m2'] > 0 else 0
+                        
+                        cooling_saved = baseline_metrics['total_cooling_kwh'] - best_metrics['total_cooling_kwh']
+                        cooling_pct = (cooling_saved / baseline_metrics['total_cooling_kwh'] * 100) if baseline_metrics['total_cooling_kwh'] > 0 else 0
+                        
+                        heating_saved = baseline_metrics['total_heating_kwh'] - best_metrics['total_heating_kwh']
+                        heating_pct = (heating_saved / baseline_metrics['total_heating_kwh'] * 100) if baseline_metrics['total_heating_kwh'] > 0 else 0
+                        
+                        # 输出4个指标的节能百分比
+                        self.logger.info(f"  【较基准节能】")
+                        self.logger.info(f"    - 总建筑能耗: {total_energy_saved:+.2f} kWh ({total_energy_pct:+.1f}%)")
+                        self.logger.info(f"    - 单位面积能耗: {eui_saved:+.2f} kWh/m² ({eui_pct:+.1f}%)")
+                        self.logger.info(f"    - 制冷能耗: {cooling_saved:+.2f} kWh/m² ({cooling_pct:+.1f}%)")
+                        self.logger.info(f"    - 供暖能耗: {heating_saved:+.2f} kWh/m² ({heating_pct:+.1f}%)")
+                        
+                        self.logger.info(f"  迭代次数: {len(workflow_data['iteration_history'])}轮")
+                    else:
+                        self.logger.warning(f"  ⚠️ {workflow_id} 无迭代历史记录")
+                    
+                    # 记录全局最优
+                    if best_metrics['total_site_energy_kwh'] < global_best_energy:
+                        global_best_energy = best_metrics['total_site_energy_kwh']
+                        global_best = best_metrics
+                        global_best_workflow = workflow_id
+            
+            # 打印全局最优结果
+            if global_best and global_best_workflow:
+                self.logger.info(f"\n\n{'─'*80}")
+                self.logger.info(f"【🏆 全局最优方案】{global_best_workflow}")
+                self.logger.info(f"{'─'*80}")
+                self.logger.info(f"总建筑能耗: {global_best['total_site_energy_kwh']} kWh")
+                self.logger.info(f"单位面积能耗: {global_best['eui_kwh_per_m2']} kWh/m²")
+                self.logger.info(f"制冷能耗: {global_best['total_cooling_kwh']} kWh/m²")
+                self.logger.info(f"供暖能耗: {global_best['total_heating_kwh']} kWh/m²")
+                
+                # 计算全局最优的4个指标与基准的变化 - 检查 iteration_history 是否为空
+                if all_workflows[global_best_workflow]['iteration_history'] and len(all_workflows[global_best_workflow]['iteration_history']) > 0:
+                    baseline_metrics = all_workflows[global_best_workflow]['iteration_history'][0]['metrics']
+                    
+                    # 计算4个指标的变化
+                    total_energy_saved = baseline_metrics['total_site_energy_kwh'] - global_best['total_site_energy_kwh']
+                    total_energy_pct = (total_energy_saved / baseline_metrics['total_site_energy_kwh'] * 100) if baseline_metrics['total_site_energy_kwh'] > 0 else 0
+                    
+                    eui_saved = baseline_metrics['eui_kwh_per_m2'] - global_best['eui_kwh_per_m2']
+                    eui_pct = (eui_saved / baseline_metrics['eui_kwh_per_m2'] * 100) if baseline_metrics['eui_kwh_per_m2'] > 0 else 0
+                    
+                    cooling_saved = baseline_metrics['total_cooling_kwh'] - global_best['total_cooling_kwh']
+                    cooling_pct = (cooling_saved / baseline_metrics['total_cooling_kwh'] * 100) if baseline_metrics['total_cooling_kwh'] > 0 else 0
+                    
+                    heating_saved = baseline_metrics['total_heating_kwh'] - global_best['total_heating_kwh']
+                    heating_pct = (heating_saved / baseline_metrics['total_heating_kwh'] * 100) if baseline_metrics['total_heating_kwh'] > 0 else 0
+                    
+                    # 输出4个指标的节能百分比
+                    self.logger.info(f"【较基准节能汇总】")
+                    self.logger.info(f"  - 总建筑能耗: {total_energy_saved:+.2f} kWh ({total_energy_pct:+.1f}%)")
+                    self.logger.info(f"  - 单位面积能耗: {eui_saved:+.2f} kWh/m² ({eui_pct:+.1f}%)")
+                    self.logger.info(f"  - 制冷能耗: {cooling_saved:+.2f} kWh/m² ({cooling_pct:+.1f}%)")
+                    self.logger.info(f"  - 供暖能耗: {heating_saved:+.2f} kWh/m² ({heating_pct:+.1f}%)")
+                    
+                    # 保存最优IDF路径 - 检查索引是否合法
+                    iteration_history = all_workflows[global_best_workflow]['iteration_history']
+                    best_iteration = all_workflows[global_best_workflow]['best_iteration']
+                    if best_iteration > 0 and best_iteration <= len(iteration_history):
+                        best_idf_path = iteration_history[best_iteration - 1]['idf_path']
+                        self.logger.info(f"最优IDF文件: {best_idf_path}")
+                    else:
+                        self.logger.warning(f"⚠️ 无效的最优轮次索引: {best_iteration}")
+                else:
+                    self.logger.warning(f"⚠️ 全局最优方案所在工作流无迭代历史记录")
+            
+            # Token使用统计
+            self.logger.info(f"\n{'─'*80}")
+            self.logger.info(f"【Token使用统计】")
+            self.logger.info(f"{'─'*80}")
+            self.logger.info(f"总Token消耗: {self.total_tokens_used}")
+            self.logger.info(f"LLM调用次数: {self.llm_calls_count}")
+            if self.llm_calls_count > 0:
+                avg_tokens = self.total_tokens_used / self.llm_calls_count
+                self.logger.info(f"平均每次Token数: {avg_tokens:.2f}")
+            
+            self.logger.info(f"\n{'='*80}")
+            self.logger.info(f"【并行优化循环完成】")
+            self.logger.info(f"{'='*80}\n")
+            
+        except Exception as e:
+            self.logger.error(f"最终报告汇总异常: {e}", exc_info=True)
     
     def _get_default_suggestions(self, iteration):
         """无法获得LLM建议时的默认优化方案"""
