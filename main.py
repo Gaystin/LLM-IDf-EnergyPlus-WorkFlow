@@ -327,6 +327,20 @@ class EnergyPlusOptimizer:
                     stderr_text = result.stderr.decode('utf-8', errors='replace')
                 if stderr_text:
                     self.logger.error(f"错误: {stderr_text[:500]}")
+
+                # 追加读取 eplusout.err，提取 Severe/Fatal 关键行，便于快速定位失败原因
+                err_file = os.path.join(run_dir, "eplusout.err")
+                if os.path.exists(err_file):
+                    try:
+                        with open(err_file, 'r', encoding='utf-8', errors='replace') as ef:
+                            err_lines = ef.readlines()
+                        key_lines = [ln.strip() for ln in err_lines if ("** Severe" in ln or "**  Fatal" in ln or "Terminated" in ln)]
+                        if key_lines:
+                            self.logger.error("EnergyPlus错误摘要（eplusout.err）:")
+                            for ln in key_lines[-8:]:
+                                self.logger.error(f"  {ln}")
+                    except Exception as _e:
+                        self.logger.warning(f"读取eplusout.err失败: {_e}")
                 return None
         
         except subprocess.TimeoutExpired:
@@ -2060,6 +2074,153 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
         
         return None
 
+    def _enforce_physical_constraints(self, target_updates):
+        """对计划修改进行物理约束修正，避免生成非法 IDF。"""
+        if not target_updates:
+            return target_updates
+
+        def _to_float(v):
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        def _clamp(v, lo, hi):
+            return max(lo, min(hi, v))
+
+        def _norm(s):
+            return str(s).upper().replace(" ", "")
+
+        # 基础对象索引：用于读取未被修改字段的现值
+        base_obj_lookup = {}
+        for obj_type, objs in self.base_idf.idfobjects.items():
+            obj_type_u = str(obj_type).upper()
+            for obj in objs:
+                obj_name_u = self._get_object_identifier(obj).upper()
+                base_obj_lookup[(obj_type_u, obj_name_u)] = obj
+
+        updates_by_key = {}
+        for upd in target_updates:
+            key = (str(upd.get('type', '')).upper(), str(upd.get('name', '')).upper(), str(upd.get('field', '')).upper())
+            updates_by_key[key] = upd
+
+        def _find_field_name(obj, candidate):
+            candidate_norm = _norm(candidate)
+            for fn in getattr(obj, 'fieldnames', []):
+                if _norm(fn) == candidate_norm:
+                    return fn
+            return candidate
+
+        def _get_value(obj_type_u, obj_name_u, field_name):
+            key = (obj_type_u, obj_name_u, field_name.upper())
+            if key in updates_by_key:
+                return updates_by_key[key].get('value'), True
+
+            obj = base_obj_lookup.get((obj_type_u, obj_name_u))
+            if obj is None:
+                return None, False
+
+            resolved = _find_field_name(obj, field_name)
+            return getattr(obj, resolved, None), False
+
+        def _set_value(obj_type_u, obj_name_u, field_name, new_value, reason):
+            key = (obj_type_u, obj_name_u, field_name.upper())
+            if key in updates_by_key:
+                upd = updates_by_key[key]
+                old_plan_val = upd.get('value')
+                upd['value'] = new_value
+                old_num = _to_float(upd.get('old_value'))
+                new_num = _to_float(new_value)
+                upd['coefficient'] = (new_num / old_num) if (old_num not in (None, 0.0) and new_num is not None) else None
+                upd['expression'] = f"{upd.get('expression', '')} | auto_constraint: {reason}".strip()
+                self.logger.warning(
+                    f"  [约束修正] {obj_type_u} ({obj_name_u}) {field_name}: {old_plan_val} -> {new_value} ({reason})"
+                )
+                return
+
+            # 未在计划中但需要补充修正，追加一条自动修正更新
+            base_obj = base_obj_lookup.get((obj_type_u, obj_name_u))
+            if base_obj is None:
+                return
+            resolved = _find_field_name(base_obj, field_name)
+            old_value = getattr(base_obj, resolved, None)
+            old_num = _to_float(old_value)
+            new_num = _to_float(new_value)
+            coefficient = (new_num / old_num) if (old_num not in (None, 0.0) and new_num is not None) else None
+            upd = {
+                'type': obj_type_u,
+                'name': obj_name_u,
+                'field': resolved,
+                'old_value': old_value,
+                'value': new_value,
+                'coefficient': coefficient,
+                'expression': f"auto_constraint: {reason}"
+            }
+            target_updates.append(upd)
+            updates_by_key[(obj_type_u, obj_name_u, resolved.upper())] = upd
+            self.logger.warning(
+                f"  [约束补充] {obj_type_u} ({obj_name_u}) {resolved}: {old_value} -> {new_value} ({reason})"
+            )
+
+        # 仅处理本次涉及的 WindowMaterial:Glazing 对象
+        glazing_keys = set()
+        for upd in target_updates:
+            if str(upd.get('type', '')).upper() == 'WINDOWMATERIAL:GLAZING':
+                glazing_keys.add((str(upd.get('type', '')).upper(), str(upd.get('name', '')).upper()))
+
+        for obj_type_u, obj_name_u in glazing_keys:
+            t_field = 'Solar_Transmittance_at_Normal_Incidence'
+            rf_field = 'Front_Side_Solar_Reflectance_at_Normal_Incidence'
+            rb_field = 'Back_Side_Solar_Reflectance_at_Normal_Incidence'
+
+            t_val, t_mod = _get_value(obj_type_u, obj_name_u, t_field)
+            rf_val, rf_mod = _get_value(obj_type_u, obj_name_u, rf_field)
+            rb_val, rb_mod = _get_value(obj_type_u, obj_name_u, rb_field)
+
+            t = _to_float(t_val)
+            rf = _to_float(rf_val)
+            rb = _to_float(rb_val)
+            if t is None or rf is None or rb is None:
+                continue
+
+            # 基本区间约束 [0, 1]
+            t2 = _clamp(t, 0.0, 1.0)
+            rf2 = _clamp(rf, 0.0, 1.0)
+            rb2 = _clamp(rb, 0.0, 1.0)
+            if t2 != t:
+                _set_value(obj_type_u, obj_name_u, t_field, t2, 'clamp_to_[0,1]')
+            if rf2 != rf:
+                _set_value(obj_type_u, obj_name_u, rf_field, rf2, 'clamp_to_[0,1]')
+            if rb2 != rb:
+                _set_value(obj_type_u, obj_name_u, rb_field, rb2, 'clamp_to_[0,1]')
+
+            t, rf, rb = t2, rf2, rb2
+            max_sum = 0.999
+
+            # 组合约束：透射率 + 前/后表面反射率 <= 1
+            # 若只有透射率被修改，优先下调透射率；否则下调对应反射率。
+            if (t + rf) > max_sum:
+                if t_mod and (not rf_mod):
+                    new_t = _clamp(max_sum - rf, 0.0, 1.0)
+                    _set_value(obj_type_u, obj_name_u, t_field, new_t, 'enforce T+FrontR<=1')
+                    t = new_t
+                else:
+                    new_rf = _clamp(max_sum - t, 0.0, 1.0)
+                    _set_value(obj_type_u, obj_name_u, rf_field, new_rf, 'enforce T+FrontR<=1')
+                    rf = new_rf
+
+            if (t + rb) > max_sum:
+                if t_mod and (not rb_mod):
+                    new_t = _clamp(max_sum - rb, 0.0, 1.0)
+                    _set_value(obj_type_u, obj_name_u, t_field, new_t, 'enforce T+BackR<=1')
+                    t = new_t
+                else:
+                    new_rb = _clamp(max_sum - t, 0.0, 1.0)
+                    _set_value(obj_type_u, obj_name_u, rb_field, new_rb, 'enforce T+BackR<=1')
+                    rb = new_rb
+
+        return target_updates
+
     def _normalize_field_label(self, text):
         """标准化字段名/注释名，用于精确匹配（避免子串误匹配）。"""
         if text is None:
@@ -2349,6 +2510,9 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
         
         # ========== 【关键】在应用前强制过滤相关参数反向修改 ==========
         target_updates = self._filter_conflicting_parameter_modifications(target_updates)
+
+        # ========== 物理约束修正：防止生成非法IDF（如玻璃参数组合越界） ==========
+        target_updates = self._enforce_physical_constraints(target_updates)
         
         if not target_updates:
             self.logger.warning("所有修改因参数冲突被过滤，跳过保存")
@@ -2781,62 +2945,292 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
             self.logger.info(f"【最终汇总报告 - {self.num_workflows}条并行工作流】")
             self.logger.info(f"{'='*80}\n")
             
-            # 线程安全地读取所有工作流数据
+            # 线程安全地读取所有工作流数据快照
             with self.workflows_lock:
                 all_workflows = dict(self.workflows)
-            
-            # 找出全局最优方案
+
+            # ---------- 随后为每个工作流打印完整的最优详情（也写入各自的工作流日志） ----------
+            printed_workflow_optimal = set()
             global_best = None
             global_best_workflow = None
             global_best_energy = float('inf')
-            
+
             for workflow_id in sorted(all_workflows.keys()):
                 workflow_data = all_workflows[workflow_id]
-                best_metrics = workflow_data['best_metrics']
-                
+                best_metrics = workflow_data.get('best_metrics')
+
                 if best_metrics:
-                    self.logger.info(f"\n[{workflow_id}] 优化结果")
-                    self.logger.info(f"  最优轮次: 第{workflow_data['best_iteration']}轮")
-                    self.logger.info(f"  总建筑能耗: {best_metrics['total_site_energy_kwh']} kWh")
-                    self.logger.info(f"  单位面积能耗: {best_metrics['eui_kwh_per_m2']} kWh/m²")
-                    self.logger.info(f"  制冷能耗: {best_metrics['total_cooling_kwh']} kWh/m²")
-                    self.logger.info(f"  供暖能耗: {best_metrics['total_heating_kwh']} kWh/m²")
-                    
+                    # 基本信息（同时写入汇总）
+                    # 分隔符：每个工作流详情块前后清晰区分
+                    self.logger.info(f"\n{'─'*80}")
+                    self.logger.info(f"[{workflow_id}] 优化结果")
+                    self.logger.info(f"{'─'*80}")
+                    self.logger.info(f"  最优轮次: 第{workflow_data.get('best_iteration', 0)}轮")
+                    self.logger.info(f"  总建筑能耗: {best_metrics.get('total_site_energy_kwh')} kWh")
+                    self.logger.info(f"  单位面积能耗: {best_metrics.get('eui_kwh_per_m2')} kWh/m²")
+                    self.logger.info(f"  制冷能耗: {best_metrics.get('total_cooling_kwh')} kWh/m²")
+                    self.logger.info(f"  供暖能耗: {best_metrics.get('total_heating_kwh')} kWh/m²")
+
                     # 计算与基准的4个指标的变化 - 检查 iteration_history 是否为空
-                    if workflow_data['iteration_history'] and len(workflow_data['iteration_history']) > 0:
-                        baseline_metrics = workflow_data['iteration_history'][0]['metrics']
-                        
-                        # 计算4个指标的变化
-                        total_energy_saved = baseline_metrics['total_site_energy_kwh'] - best_metrics['total_site_energy_kwh']
-                        total_energy_pct = (total_energy_saved / baseline_metrics['total_site_energy_kwh'] * 100) if baseline_metrics['total_site_energy_kwh'] > 0 else 0
-                        
-                        eui_saved = baseline_metrics['eui_kwh_per_m2'] - best_metrics['eui_kwh_per_m2']
-                        eui_pct = (eui_saved / baseline_metrics['eui_kwh_per_m2'] * 100) if baseline_metrics['eui_kwh_per_m2'] > 0 else 0
-                        
-                        cooling_saved = baseline_metrics['total_cooling_kwh'] - best_metrics['total_cooling_kwh']
-                        cooling_pct = (cooling_saved / baseline_metrics['total_cooling_kwh'] * 100) if baseline_metrics['total_cooling_kwh'] > 0 else 0
-                        
-                        heating_saved = baseline_metrics['total_heating_kwh'] - best_metrics['total_heating_kwh']
-                        heating_pct = (heating_saved / baseline_metrics['total_heating_kwh'] * 100) if baseline_metrics['total_heating_kwh'] > 0 else 0
-                        
-                        # 输出4个指标的节能百分比
-                        self.logger.info(f"  【较基准节能】")
-                        self.logger.info(f"    - 总建筑能耗: {total_energy_saved:+.2f} kWh ({total_energy_pct:+.1f}%)")
-                        self.logger.info(f"    - 单位面积能耗: {eui_saved:+.2f} kWh/m² ({eui_pct:+.1f}%)")
-                        self.logger.info(f"    - 制冷能耗: {cooling_saved:+.2f} kWh/m² ({cooling_pct:+.1f}%)")
-                        self.logger.info(f"    - 供暖能耗: {heating_saved:+.2f} kWh/m² ({heating_pct:+.1f}%)")
-                        
-                        self.logger.info(f"  迭代次数: {len(workflow_data['iteration_history'])}轮")
+                    iteration_history = workflow_data.get('iteration_history', [])
+                    wlogger = workflow_data.get('logger')
+                    if iteration_history and len(iteration_history) > 0:
+                        baseline_metrics = iteration_history[0].get('metrics', {})
+
+                        # ---------- 打印各轮能耗对比表（既写汇总日志，也写工作流专属日志） ----------
+                        header = "【各轮能耗对比】"
+                        table_header = f"{'轮次':<8} {'总建筑能耗':<15} {'EUI':<15} {'冷却能耗':<15} {'供暖能耗':<15} {'状态'}"
+                        self.logger.info(header)
+                        if wlogger:
+                            wlogger.info(header)
+                        self.logger.info(table_header)
+                        if wlogger:
+                            wlogger.info(table_header)
+                        self.logger.info("-" * 85)
+                        if wlogger:
+                            wlogger.info("-" * 85)
+
+                        for item in iteration_history:
+                            iteration = item.get('iteration')
+                            m = item.get('metrics', {})
+                            if iteration == 1:
+                                status = '基准'
+                            elif iteration == workflow_data.get('best_iteration'):
+                                status = '最优 ✓'
+                            else:
+                                status = ''
+
+                            # 基准值用于计算百分比变化
+                            def _pct_str(curr, base):
+                                try:
+                                    base = float(base)
+                                    curr = float(curr)
+                                except Exception:
+                                    return '(N/A)'
+                                if base == 0:
+                                    return '(N/A)'
+                                pct = (curr - base) / base * 100
+                                return f"({pct:+.1f}%)"
+
+                            total_val = m.get('total_site_energy_kwh', 0)
+                            eui_val = m.get('eui_kwh_per_m2', 0)
+                            cool_val = m.get('total_cooling_kwh', 0)
+                            heat_val = m.get('total_heating_kwh', 0)
+
+                            total_pct = _pct_str(total_val, baseline_metrics.get('total_site_energy_kwh', 0))
+                            eui_pct = _pct_str(eui_val, baseline_metrics.get('eui_kwh_per_m2', 0))
+                            cool_pct = _pct_str(cool_val, baseline_metrics.get('total_cooling_kwh', 0))
+                            heat_pct = _pct_str(heat_val, baseline_metrics.get('total_heating_kwh', 0))
+
+                            total_str = f"{total_val:<12.2f} {total_pct:<8}"
+                            eui_str = f"{eui_val:<12.2f} {eui_pct:<8}"
+                            cool_str = f"{cool_val:<12.2f} {cool_pct:<8}"
+                            heat_str = f"{heat_val:<12.2f} {heat_pct:<8}"
+
+                            line = f"{iteration:<8} {total_str} {eui_str} {cool_str} {heat_str} {status}"
+                            self.logger.info(line)
+                            if wlogger:
+                                wlogger.info(line)
+
+                        # 在表格之后补充两行：最优来源与对应IDF路径（与单工作流格式一致）
+                        best_iter = workflow_data.get('best_iteration', 0)
+                        best_idf_path = None
+                        if best_iter and iteration_history and 1 <= best_iter <= len(iteration_history):
+                            best_idf_path = iteration_history[best_iter - 1].get('idf_path')
+
+                        best_from_line = f"最优方案来自: 第{best_iter}轮优化" if best_iter else "最优方案来自: N/A"
+                        idf_line = f"对应IDF: {best_idf_path or 'N/A'}"
+                        self.logger.info("")
+                        self.logger.info(best_from_line)
+                        self.logger.info(idf_line)
+                        if wlogger:
+                            wlogger.info("")
+                            wlogger.info(best_from_line)
+                            wlogger.info(idf_line)
+
+                        # 计算节能效果
+                        total_energy_saved = baseline_metrics.get('total_site_energy_kwh', 0) - best_metrics.get('total_site_energy_kwh', 0)
+                        total_energy_pct = (total_energy_saved / baseline_metrics.get('total_site_energy_kwh', 1) * 100) if baseline_metrics.get('total_site_energy_kwh', 0) > 0 else 0
+
+                        eui_saved = baseline_metrics.get('eui_kwh_per_m2', 0) - best_metrics.get('eui_kwh_per_m2', 0)
+                        eui_pct = (eui_saved / baseline_metrics.get('eui_kwh_per_m2', 1) * 100) if baseline_metrics.get('eui_kwh_per_m2', 0) > 0 else 0
+
+                        cooling_saved = baseline_metrics.get('total_cooling_kwh', 0) - best_metrics.get('total_cooling_kwh', 0)
+                        cooling_pct = (cooling_saved / baseline_metrics.get('total_cooling_kwh', 1) * 100) if baseline_metrics.get('total_cooling_kwh', 0) > 0 else 0
+
+                        heating_saved = baseline_metrics.get('total_heating_kwh', 0) - best_metrics.get('total_heating_kwh', 0)
+                        heating_pct = (heating_saved / baseline_metrics.get('total_heating_kwh', 1) * 100) if baseline_metrics.get('total_heating_kwh', 0) > 0 else 0
+
+                        # 输出4个指标的节能百分比（也会写入工作流日志）
+                        summary_lines = [
+                            "  【优化效果】",
+                            f"  总建筑能耗节能: {total_energy_saved:.2f} kWh ({total_energy_pct:.1f}%)",
+                            f"  单位面积总建筑能耗改善: {eui_saved:.2f} kWh/m² ({eui_pct:.1f}%)",
+                            f"  冷却能耗节能: {cooling_saved:.2f} kWh ({cooling_pct:.1f}%)",
+                            f"  供暖能耗节能: {heating_saved:.2f} kWh ({heating_pct:.1f}%)",
+                            f"  迭代次数: {len(iteration_history)}轮"
+                        ]
+                        for sl in summary_lines:
+                            self.logger.info(sl)
+                            if wlogger:
+                                wlogger.info(sl)
                     else:
                         self.logger.warning(f"  ⚠️ {workflow_id} 无迭代历史记录")
-                    
-                    # 记录全局最优
-                    if best_metrics['total_site_energy_kwh'] < global_best_energy:
-                        global_best_energy = best_metrics['total_site_energy_kwh']
+
+                    # 记录全局最优候选
+                    if best_metrics.get('total_site_energy_kwh', float('inf')) < global_best_energy:
+                        global_best_energy = best_metrics.get('total_site_energy_kwh')
                         global_best = best_metrics
                         global_best_workflow = workflow_id
+
+                    # ========== 打印该工作流的最优参数逐项对比（旧单工作流格式），并写入工作流专属日志和汇总日志 ==========
+                    try:
+                        best_iter = workflow_data.get('best_iteration', 0)
+                        if best_iter and iteration_history and 1 <= best_iter <= len(iteration_history):
+                            best_idf = iteration_history[best_iter - 1].get('idf_path')
+                            lines = self._format_optimal_parameters(self.idf_path, best_idf)
+
+                            # 写入汇总日志（带前缀）
+                            try:
+                                self._log_context.workflow_id = workflow_id
+                                for l in lines:
+                                    self.logger.info(l)
+                            finally:
+                                if hasattr(self._log_context, 'workflow_id'):
+                                    del self._log_context.workflow_id
+
+                            # 写入工作流专属日志（旧格式）
+                            wlogger = workflow_data.get('logger')
+                            if wlogger:
+                                for l in lines:
+                                    wlogger.info(l)
+
+                            printed_workflow_optimal.add(workflow_id)
+                        else:
+                            self.logger.info(f"[{workflow_id}] 无有效最优轮次或最优IDF，跳过最优参数逐项对比输出")
+                    except Exception as _e:
+                        self.logger.warning(f"打印{workflow_id}最优参数逐项对比时出错: {_e}")
+                else:
+                    self.logger.info(f"\n[{workflow_id}] 无有效最优结果")
+
+                    # ========== 打印该工作流的最优参数逐项对比（旧单工作流格式） ==========
+                    try:
+                        iteration_history = workflow_data.get('iteration_history', [])
+                        best_iter = workflow_data.get('best_iteration', 0)
+                        if best_iter and iteration_history and 1 <= best_iter <= len(iteration_history):
+                            best_idf = iteration_history[best_iter - 1].get('idf_path')
+                            # 生成文本行
+                            lines = self._format_optimal_parameters(self.idf_path, best_idf)
+
+                            # 写入汇总日志（带前缀）
+                            try:
+                                self._log_context.workflow_id = workflow_id
+                                for l in lines:
+                                    self.logger.info(l)
+                            finally:
+                                if hasattr(self._log_context, 'workflow_id'):
+                                    del self._log_context.workflow_id
+
+                            # 写入工作流专属日志（旧格式）
+                            wlogger = workflow_data.get('logger')
+                            if wlogger:
+                                for l in lines:
+                                    wlogger.info(l)
+                        else:
+                            self.logger.info(f"[{workflow_id}] 无有效最优轮次或最优IDF，跳过最优参数逐项对比输出")
+                    except Exception as _e:
+                        self.logger.warning(f"打印{workflow_id}最优参数逐项对比时出错: {_e}")
             
             # 打印全局最优结果
+            # ---------- 在所有工作流详情输出完成后，生成并打印各工作流最优能耗对比表（汇总） ----------
+            try:
+                summary_rows = []
+                for workflow_id in sorted(all_workflows.keys()):
+                    wd = all_workflows[workflow_id]
+                    bm = wd.get('best_metrics')
+                    # 尝试获取基准值用于计算百分比
+                    baseline = None
+                    iteration_history = wd.get('iteration_history') or []
+                    if iteration_history and len(iteration_history) > 0:
+                        baseline = iteration_history[0].get('metrics', {})
+
+                    if bm:
+                        total = bm.get('total_site_energy_kwh', None)
+                        eui = bm.get('eui_kwh_per_m2', None)
+                        cooling = bm.get('total_cooling_kwh', None)
+                        heating = bm.get('total_heating_kwh', None)
+
+                        def _pct(curr, base):
+                            try:
+                                if base is None or float(base) == 0:
+                                    return 0
+                                return (float(curr) - float(base)) / float(base) * 100
+                            except Exception:
+                                return 0
+
+                        total_pct = _pct(total, (baseline.get('total_site_energy_kwh') if baseline else None))
+                        eui_pct = _pct(eui, (baseline.get('eui_kwh_per_m2') if baseline else None))
+                        cooling_pct = _pct(cooling, (baseline.get('total_cooling_kwh') if baseline else None))
+                        heating_pct = _pct(heating, (baseline.get('total_heating_kwh') if baseline else None))
+
+                        summary_rows.append({
+                            'workflow': workflow_id,
+                            'best_iter': wd.get('best_iteration', 0),
+                            'total': total,
+                            'eui': eui,
+                            'cooling': cooling,
+                            'heating': heating,
+                            'total_pct': total_pct,
+                            'eui_pct': eui_pct,
+                            'cooling_pct': cooling_pct,
+                            'heating_pct': heating_pct
+                        })
+                    else:
+                        summary_rows.append({
+                            'workflow': workflow_id,
+                            'best_iter': 0,
+                            'total': None,
+                            'eui': None,
+                            'cooling': None,
+                            'heating': None,
+                            'total_pct': 0,
+                            'eui_pct': 0,
+                            'cooling_pct': 0,
+                            'heating_pct': 0
+                        })
+
+                self.logger.info("\n【各工作流最优能耗对比】")
+                self.logger.info(f"{'Workflow':<12} {'BestIter':<8} {'TotalEnergy(kWh)':<22} {'EUI(kWh/m2)':<18} {'Cooling(kWh)':<18} {'Heating(kWh)':<18}")
+                self.logger.info('=' * 100)
+                for row in summary_rows:
+                    def _fmt(v):
+                        try:
+                            return float(v)
+                        except Exception:
+                            return None
+
+                    def _fmt_val_pct(val, pct):
+                        if val is None:
+                            return 'N/A'
+                        try:
+                            return f"{val:.2f} ({pct:+.1f}%)"
+                        except Exception:
+                            return str(val)
+
+                    total = _fmt(row['total'])
+                    eui = _fmt(row['eui'])
+                    cooling = _fmt(row['cooling'])
+                    heating = _fmt(row['heating'])
+
+                    total_display = _fmt_val_pct(total, row.get('total_pct', 0)) if total is not None else 'N/A'
+                    eui_display = _fmt_val_pct(eui, row.get('eui_pct', 0)) if eui is not None else 'N/A'
+                    cooling_display = _fmt_val_pct(cooling, row.get('cooling_pct', 0)) if cooling is not None else 'N/A'
+                    heating_display = _fmt_val_pct(heating, row.get('heating_pct', 0)) if heating is not None else 'N/A'
+
+                    self.logger.info(f"{row['workflow']:<12} {row['best_iter']:<8} {total_display:<28} {eui_display:<22} {cooling_display:<22} {heating_display:<22}")
+                self.logger.info('\n')
+            except Exception:
+                pass
             if global_best and global_best_workflow:
                 self.logger.info(f"\n\n{'─'*80}")
                 self.logger.info(f"【🏆 全局最优方案】{global_best_workflow}")
@@ -2880,6 +3274,32 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
                         self.logger.warning(f"⚠️ 无效的最优轮次索引: {best_iteration}")
                 else:
                     self.logger.warning(f"⚠️ 全局最优方案所在工作流无迭代历史记录")
+
+                # ========== 打印全局最优参数逐项对比（格式同单工作流） ==========
+                try:
+                    if global_best and global_best_workflow:
+                        gh_iteration_history = all_workflows[global_best_workflow].get('iteration_history', [])
+                        gh_best_iter = all_workflows[global_best_workflow].get('best_iteration', 0)
+                        if gh_best_iter and gh_iteration_history and 1 <= gh_best_iter <= len(gh_iteration_history):
+                            gh_best_idf = gh_iteration_history[gh_best_iter - 1].get('idf_path')
+                            gh_lines = self._format_optimal_parameters(self.idf_path, gh_best_idf)
+                            # 写到汇总日志（无需额外前缀，因为已在全局上下文）
+                            for ln in gh_lines:
+                                self.logger.info(ln)
+                            # 同时写入该工作流的专属日志（如果存在且尚未为该工作流写过相同最优输出）
+                            wlogger = all_workflows[global_best_workflow].get('logger')
+                            if wlogger:
+                                if global_best_workflow not in printed_workflow_optimal:
+                                    for ln in gh_lines:
+                                        wlogger.info(ln)
+                                    printed_workflow_optimal.add(global_best_workflow)
+                                else:
+                                    # 如果已在先前为该工作流写过最优详情，则跳过写入以避免重复
+                                    self.logger.debug(f"已为{global_best_workflow}写入最优详情，跳过重复写入到其工作流日志")
+                        else:
+                            self.logger.info("全局最优没有有效IDF路径，跳过详细参数对比输出")
+                except Exception as _e:
+                    self.logger.warning(f"打印全局最优参数逐项对比时出错: {_e}")
             
             # Token使用统计
             self.logger.info(f"\n{'─'*80}")
@@ -3014,61 +3434,46 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
         }
         return defaults
     
-    def _extract_and_print_optimal_parameters(self):
-        """提取和打印最优方案中的所有参数修改"""
-        if self.best_iteration == 0 or not self.iteration_history:
-            return
-        
-        self.logger.info(f"\n\n{'═'*80}")
-        self.logger.info(f"【最优优化方案 - 参数修改详情】")
-        self.logger.info(f"{'═'*80}\n")
-        
-        baseline_idf_path = self.idf_path
-        optimal_idf_path = self.iteration_history[self.best_iteration-1]['idf_path']
-        
+    def _format_optimal_parameters(self, baseline_idf_path, optimal_idf_path):
+        """比较基准IDF与最优IDF，生成逐项参数修改的文本行列表（不直接写日志）。
+
+        返回: list[str]，每一行为一条待写入日志的文本
+        """
+        lines = []
         if not os.path.exists(optimal_idf_path):
-            self.logger.warning(f"最优IDF文件不存在: {optimal_idf_path}")
-            return
-        
+            lines.append(f"最优IDF文件不存在: {optimal_idf_path}")
+            return lines
+
         try:
-            # 加载基准和最优IDF进行比较
             baseline_idf = IDF(baseline_idf_path)
             optimal_idf = IDF(optimal_idf_path)
-            
-            # 收集所有修改
+
             modifications = []
             modified_objects = set()
-            
-            # 遍历最优IDF中的所有对象类别
+
             for obj_type in optimal_idf.idfobjects:
                 if obj_type not in baseline_idf.idfobjects:
                     continue
-                
+
                 baseline_objs = {getattr(o, 'Name', str(i)): o for i, o in enumerate(baseline_idf.idfobjects[obj_type])}
                 optimal_objs = {getattr(o, 'Name', str(i)): o for i, o in enumerate(optimal_idf.idfobjects[obj_type])}
-                
+
                 for obj_name in optimal_objs:
                     if obj_name not in baseline_objs:
                         continue
-                    
+
                     baseline_obj = baseline_objs[obj_name]
                     optimal_obj = optimal_objs[obj_name]
-                    
-                    # 比较每个字段
+
                     for field in optimal_obj.fieldnames:
                         try:
                             baseline_val = getattr(baseline_obj, field, None)
                             optimal_val = getattr(optimal_obj, field, None)
-                            
-                            # 字符串/数值比较
                             if baseline_val != optimal_val:
-                                # 过滤掉非相关字段（如Name、Type等）
                                 if field.lower() not in ['name', 'type']:
                                     try:
-                                        # 尝试转换为数值进行对比
-                                        baseline_num = float(baseline_val) if baseline_val else 0
-                                        optimal_num = float(optimal_val) if optimal_val else 0
-                                        
+                                        baseline_num = float(baseline_val) if baseline_val is not None and str(baseline_val) != '' else 0
+                                        optimal_num = float(optimal_val) if optimal_val is not None and str(optimal_val) != '' else 0
                                         if baseline_num != optimal_num:
                                             change_pct = ((optimal_num - baseline_num) / baseline_num * 100) if baseline_num != 0 else 0
                                             modifications.append({
@@ -3081,7 +3486,6 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
                                             })
                                             modified_objects.add(obj_type)
                                     except (ValueError, TypeError):
-                                        # 非数值字段，做字符串对比
                                         if str(baseline_val) != str(optimal_val):
                                             modifications.append({
                                                 'object_type': obj_type,
@@ -3092,193 +3496,232 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
                                                 'change_pct': 'N/A'
                                             })
                                             modified_objects.add(obj_type)
-                        except Exception as e:
+                        except Exception:
                             continue
-            
-            # 按对象类型分组打印
+
+            # format lines similar to 原始单工作流格式
             if modifications:
-                self.logger.info(f"【修改对象类型】({len(modified_objects)}种)")
-                self.logger.info(f"{', '.join(sorted(modified_objects))}\n")
-                
-                self.logger.info(f"【参数修改详情】(共{len(modifications)}项修改)\n")
-                
+                lines.append(f"【修改对象类型】({len(modified_objects)}种)")
+                lines.append(', '.join(sorted(modified_objects)))
+                lines.append("")
+                lines.append(f"【参数修改详情】(共{len(modifications)}项修改)")
+
                 current_obj_type = None
+                def _fmt_num(n):
+                    try:
+                        n = float(n)
+                    except Exception:
+                        return str(n)
+                    an = abs(n)
+                    if an == 0:
+                        return "0"
+                    if an < 1e-4:
+                        return f"{n:.8f}"
+                    if an < 1e-2:
+                        return f"{n:.6f}"
+                    if an < 1:
+                        return f"{n:.4f}"
+                    if an < 1000:
+                        return f"{n:.2f}"
+                    return f"{n:.2f}"
+
                 for mod in sorted(modifications, key=lambda x: (x['object_type'], x['object_name'])):
                     if mod['object_type'] != current_obj_type:
                         current_obj_type = mod['object_type']
-                        self.logger.info(f"\n━━ {current_obj_type} ━━")
-                    
+                        lines.append(f"\n━━ {current_obj_type} ━━")
+
                     obj_name = mod['object_name']
                     field = mod['field']
                     baseline = mod['baseline_value']
                     optimal = mod['optimal_value']
                     change_pct = mod['change_pct']
-                    
+
                     if isinstance(change_pct, str):
                         change_str = f"{baseline} → {optimal}"
-                        self.logger.info(f"  • {obj_name}")
-                        self.logger.info(f"    └─ {field}: {change_str}")
+                        lines.append(f"  • {obj_name}")
+                        lines.append(f"    └─ {field}: {change_str}")
                     else:
-                        change_str = f"{baseline:.4f} → {optimal:.4f}"
+                        # 使用更高精度输出，避免非常小的数被截断为0
+                        baseline_str = _fmt_num(baseline)
+                        optimal_str = _fmt_num(optimal)
+                        change_str = f"{baseline_str} → {optimal_str}"
                         pct_str = f"({change_pct:+.2f}%)" if change_pct != 0 else ""
-                        self.logger.info(f"  • {obj_name}")
-                        self.logger.info(f"    └─ {field}: {change_str} {pct_str}")
+                        lines.append(f"  • {obj_name}")
+                        lines.append(f"    └─ {field}: {change_str} {pct_str}")
             else:
-                self.logger.info("未检测到参数修改（可能原始文件和优化文件相同）")
-            
-            self.logger.info(f"\n{'═'*80}\n")
-            
-        except Exception as e:
-            self.logger.error(f"解析最优方案修改详情时出错: {e}")
-            import traceback
-            self.logger.error(traceback.format_exc())
+                lines.append("未检测到参数修改（可能原始文件和优化文件相同）")
 
-    def _print_final_report(self):
-        """打印最终优化报告"""
-        self.logger.info(f"\n\n{'█'*80}")
-        self.logger.info(f"优化完成总结报告")
-        self.logger.info(f"{'█'*80}\n")
+            return lines
+        except Exception as e:
+            return [f"解析最优方案修改详情时出错: {e}"]
+    #                 
+    #                 if isinstance(change_pct, str):
+    #                     change_str = f"{baseline} → {optimal}"
+    #                     self.logger.info(f"  • {obj_name}")
+    #                     self.logger.info(f"    └─ {field}: {change_str}")
+    #                 else:
+    #                     change_str = f"{baseline:.4f} → {optimal:.4f}"
+    #                     pct_str = f"({change_pct:+.2f}%)" if change_pct != 0 else ""
+    #                     self.logger.info(f"  • {obj_name}")
+    #                     self.logger.info(f"    └─ {field}: {change_str} {pct_str}")
+    #         else:
+    #             self.logger.info("未检测到参数修改（可能原始文件和优化文件相同）")
+    #         
+    #         self.logger.info(f"\n{'═'*80}\n")
+    #         
+    #     except Exception as e:
+    #         self.logger.error(f"解析最优方案修改详情时出错: {e}")
+    #         import traceback
+    #         self.logger.error(traceback.format_exc())
+    
+    # def _print_final_report(self):
+    #     """打印最终优化报告"""
+    #     self.logger.info(f"\n\n{'█'*80}")
+    #     self.logger.info(f"优化完成总结报告")
+    #     self.logger.info(f"{'█'*80}\n")
         
         # 先打印最优参数修改细节
-        self._extract_and_print_optimal_parameters()
+        #self._extract_and_print_optimal_parameters()
         
-        if not self.iteration_history:
-            self.logger.info("无优化数据")
-            return
+        #if not self.iteration_history:
+            #self.logger.info("无优化数据")
+            #return
         
-        initial_metrics = self.iteration_history[0]['metrics']
+        #initial_metrics = self.iteration_history[0]['metrics']
         
-        self.logger.info("【各轮能耗对比】\n")
-        self.logger.info(f"{'轮次':<8} {'总建筑能耗':<15} {'EUI':<15} {'冷却能耗':<15} {'供暖能耗':<15} {'状态'}")
-        self.logger.info("-" * 85)
+        #self.logger.info("【各轮能耗对比】\n")
+        #self.logger.info(f"{'轮次':<8} {'总建筑能耗':<15} {'EUI':<15} {'冷却能耗':<15} {'供暖能耗':<15} {'状态'}")
+        #self.logger.info("-" * 85)
         
-        for item in self.iteration_history:
-            iteration = item['iteration']
-            m = item['metrics']
+        #for item in self.iteration_history:
+            #iteration = item['iteration']
+            #m = item['metrics']
             
-            if iteration == 1:
-                status = "基准"
-            elif iteration == self.best_iteration:
-                status = "最优 ✓"
-            else:
-                status = ""
+            #if iteration == 1:
+                #status = "基准"
+            #elif iteration == self.best_iteration:
+                #status = "最优 ✓"
+            #else:
+                #status = ""
             
-            self.logger.info(
-                f"{iteration:<8} {m['total_site_energy_kwh']:<15.2f} "
-                f"{m['eui_kwh_per_m2']:<15.2f} {m['total_cooling_kwh']:<15.2f} "
-                f"{m['total_heating_kwh']:<15.2f} {status}"
-            )
+            #self.logger.info(
+                #f"{iteration:<8} {m['total_site_energy_kwh']:<15.2f} "
+                #f"{m['eui_kwh_per_m2']:<15.2f} {m['total_cooling_kwh']:<15.2f} "
+                #f"{m['total_heating_kwh']:<15.2f} {status}"
+            #)
         
         # 计算最优值相比初始值的节能效果
-        if self.best_metrics:
-            total_savings = initial_metrics['total_site_energy_kwh'] - self.best_metrics['total_site_energy_kwh']
-            total_savings_pct = (total_savings / initial_metrics['total_site_energy_kwh'] * 100)
+        #if self.best_metrics:
+            #total_savings = initial_metrics['total_site_energy_kwh'] - self.best_metrics['total_site_energy_kwh']
+            #total_savings_pct = (total_savings / initial_metrics['total_site_energy_kwh'] * 100)
             
-            eui_savings = initial_metrics['eui_kwh_per_m2'] - self.best_metrics['eui_kwh_per_m2']
-            eui_savings_pct = (eui_savings / initial_metrics['eui_kwh_per_m2'] * 100)
+            #eui_savings = initial_metrics['eui_kwh_per_m2'] - self.best_metrics['eui_kwh_per_m2']
+            #eui_savings_pct = (eui_savings / initial_metrics['eui_kwh_per_m2'] * 100)
             
-            cool_savings = initial_metrics['total_cooling_kwh'] - self.best_metrics['total_cooling_kwh']
-            cool_savings_pct = (cool_savings / initial_metrics['total_cooling_kwh'] * 100) if initial_metrics['total_cooling_kwh'] > 0 else 0
+            #cool_savings = initial_metrics['total_cooling_kwh'] - self.best_metrics['total_cooling_kwh']
+            #cool_savings_pct = (cool_savings / initial_metrics['total_cooling_kwh'] * 100) if initial_metrics['total_cooling_kwh'] > 0 else 0
             
-            heat_savings = initial_metrics['total_heating_kwh'] - self.best_metrics['total_heating_kwh']
-            heat_savings_pct = (heat_savings / initial_metrics['total_heating_kwh'] * 100) if initial_metrics['total_heating_kwh'] > 0 else 0
+            #heat_savings = initial_metrics['total_heating_kwh'] - self.best_metrics['total_heating_kwh']
+            #heat_savings_pct = (heat_savings / initial_metrics['total_heating_kwh'] * 100) if initial_metrics['total_heating_kwh'] > 0 else 0
             
-            self.logger.info(f"\n【优化效果】(第{self.best_iteration}轮最优)\n")
-            self.logger.info(f"总建筑能耗节能: {total_savings:.2f} kWh ({total_savings_pct:.1f}%)")
-            self.logger.info(f"单位面积总建筑能耗改善: {eui_savings:.2f} kWh/m² ({eui_savings_pct:.1f}%)")
-            self.logger.info(f"冷却能耗节能: {cool_savings:.2f} kWh ({cool_savings_pct:.1f}%)")
-            self.logger.info(f"供暖能耗节能: {heat_savings:.2f} kWh ({heat_savings_pct:.1f}%)")
+            #self.logger.info(f"\n【优化效果】(第{self.best_iteration}轮最优)\n")
+            #self.logger.info(f"总建筑能耗节能: {total_savings:.2f} kWh ({total_savings_pct:.1f}%)")
+            #self.logger.info(f"单位面积总建筑能耗改善: {eui_savings:.2f} kWh/m² ({eui_savings_pct:.1f}%)")
+            #self.logger.info(f"冷却能耗节能: {cool_savings:.2f} kWh ({cool_savings_pct:.1f}%)")
+            #self.logger.info(f"供暖能耗节能: {heat_savings:.2f} kWh ({heat_savings_pct:.1f}%)")
             
-            self.logger.info(f"\n【最优参数】\n")
-            self.logger.info(f"最优方案来自: 第{self.best_iteration}轮优化")
-            self.logger.info(f"对应IDF: {self.iteration_history[self.best_iteration-1]['idf_path']}")
+            #self.logger.info(f"\n【最优参数】\n")
+            #self.logger.info(f"最优方案来自: 第{self.best_iteration}轮优化")
+            #self.logger.info(f"对应IDF: {self.iteration_history[self.best_iteration-1]['idf_path']}")
         
         # Token使用统计
-        self.logger.info(f"\n{'='*80}")
-        self.logger.info(f"【Token使用统计】")
-        self.logger.info(f"{'='*80}")
-        self.logger.info(f"LLM调用次数: {self.llm_calls_count}")
-        self.logger.info(f"总计消耗Token: {self.total_tokens_used:,}")
-        self.logger.info(f"  - Input Tokens: {getattr(self, 'total_input_tokens', 0):,}")
-        self.logger.info(f"  - Output Tokens: {getattr(self, 'total_output_tokens', 0):,}")
-        self.logger.info(f"  - Cached Input Tokens: {getattr(self, 'total_cached_input_tokens', 0):,}")
+        #self.logger.info(f"\n{'='*80}")
+        #self.logger.info(f"【Token使用统计】")
+        #self.logger.info(f"{'='*80}")
+        #self.logger.info(f"LLM调用次数: {self.llm_calls_count}")
+        #self.logger.info(f"总计消耗Token: {self.total_tokens_used:,}")
+        #self.logger.info(f"  - Input Tokens: {getattr(self, 'total_input_tokens', 0):,}")
+        #self.logger.info(f"  - Output Tokens: {getattr(self, 'total_output_tokens', 0):,}")
+        #self.logger.info(f"  - Cached Input Tokens: {getattr(self, 'total_cached_input_tokens', 0):,}")
 
         # 变化曲线可视化
-        try:
-            import matplotlib.pyplot as plt
-            import matplotlib
-            import os
+        #try:
+            #import matplotlib.pyplot as plt
+            #import matplotlib
+            #import os
             # 设置中文字体（优先使用 SimHei、Microsoft YaHei）
             # 中英文混合字体，保证“²”等符号和中文都能显示
-            import matplotlib.font_manager as fm
-            font_candidates = ["Microsoft YaHei", "Arial Unicode MS", "DejaVu Sans", "SimHei", "STHeiti", "Arial"]
-            font_path = None
-            for font_name in font_candidates:
-                font_list = fm.findSystemFonts(fontpaths=None, fontext='ttf')
-                for f in font_list:
-                    if font_name.lower() in fm.FontProperties(fname=f).get_name().lower():
-                        font_path = f
-                        break
-                if font_path:
-                    break
-            if font_path:
-                font_prop = fm.FontProperties(fname=font_path)
-                matplotlib.rcParams['font.sans-serif'] = [font_prop.get_name()]
-                matplotlib.rcParams['axes.unicode_minus'] = False
-            else:
-                font_prop = None
-                self.logger.warning("未找到理想的中英文混合字体，可能仍有部分符号无法显示。建议安装 Microsoft YaHei 或 Arial Unicode MS 字体。")
-            plot_dir = "optimization_plot_并行"
-            os.makedirs(plot_dir, exist_ok=True)
-            cooling = [item['metrics']['total_cooling_kwh'] for item in self.iteration_history]
-            heating = [item['metrics']['total_heating_kwh'] for item in self.iteration_history]
-            x = list(range(1, len(cooling)+1))
-            plt.figure(figsize=(8,5))
-            plt.plot(x, cooling, marker='o', label='冷却能耗 (kWh/m²)')
-            plt.plot(x, heating, marker='o', label='供暖能耗 (kWh/m²)')
-            if font_prop:
-                plt.xlabel('优化轮次', fontproperties=font_prop)
-                plt.ylabel('能耗 (kWh/m²)', fontproperties=font_prop)
-                plt.title('供冷/供暖能耗优化变化曲线', fontproperties=font_prop)
-                plt.legend(prop=font_prop)
-            else:
-                plt.xlabel('优化轮次')
-                plt.ylabel('能耗 (kWh/m²)')
-                plt.title('供冷/供暖能耗优化变化曲线')
-                plt.legend()
-            plt.grid(True)
-            from datetime import datetime
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            plot_path = os.path.join(plot_dir, f'cooling_heating_curve_{timestamp}.png')
-            plt.savefig(plot_path, bbox_inches='tight')
-            plt.close()
-            self.logger.info(f"已保存供冷/供暖能耗变化曲线: {plot_path}")
-        except Exception as e:
-            self.logger.warning(f"保存能耗变化曲线失败: {e}")
+            #import matplotlib.font_manager as fm
+            #font_candidates = ["Microsoft YaHei", "Arial Unicode MS", "DejaVu Sans", "SimHei", "STHeiti", "Arial"]
+            #font_path = None
+            #for font_name in font_candidates:
+                #font_list = fm.findSystemFonts(fontpaths=None, fontext='ttf')
+                #for f in font_list:
+                    #if font_name.lower() in fm.FontProperties(fname=f).get_name().lower():
+                        #font_path = f
+                        #break
+                #if font_path:
+                    #break
+            #if font_path:
+                #font_prop = fm.FontProperties(fname=font_path)
+                #matplotlib.rcParams['font.sans-serif'] = [font_prop.get_name()]
+                #matplotlib.rcParams['axes.unicode_minus'] = False
+            #else:
+                #font_prop = None
+                #self.logger.warning("未找到理想的中英文混合字体，可能仍有部分符号无法显示。建议安装 Microsoft YaHei 或 Arial Unicode MS 字体。")
+            #plot_dir = "optimization_plot_并行"
+            #os.makedirs(plot_dir, exist_ok=True)
+            #cooling = [item['metrics']['total_cooling_kwh'] for item in self.iteration_history]
+            #heating = [item['metrics']['total_heating_kwh'] for item in self.iteration_history]
+            #x = list(range(1, len(cooling)+1))
+            #plt.figure(figsize=(8,5))
+            #plt.plot(x, cooling, marker='o', label='冷却能耗 (kWh/m²)')
+            #plt.plot(x, heating, marker='o', label='供暖能耗 (kWh/m²)')
+            #if font_prop:
+                #plt.xlabel('优化轮次', fontproperties=font_prop)
+                #plt.ylabel('能耗 (kWh/m²)', fontproperties=font_prop)
+                #plt.title('供冷/供暖能耗优化变化曲线', fontproperties=font_prop)
+                #plt.legend(prop=font_prop)
+            #else:
+                #plt.xlabel('优化轮次')
+                #plt.ylabel('能耗 (kWh/m²)')
+                #plt.title('供冷/供暖能耗优化变化曲线')
+                #plt.legend()
+            #plt.grid(True)
+            #from datetime import datetime
+            #timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            #plot_path = os.path.join(plot_dir, f'cooling_heating_curve_{timestamp}.png')
+            #plt.savefig(plot_path, bbox_inches='tight')
+            #plt.close()
+            #self.logger.info(f"已保存供冷/供暖能耗变化曲线: {plot_path}")
+        #except Exception as e:
+            #self.logger.warning(f"保存能耗变化曲线失败: {e}")
         
         # 计算API剩余tokens（假设API总配额，这里需要根据实际情况调整）
         # GPT-5.2的常见配额范围，这里以一个示例值展示
         # 注意：实际配额需要从API账户查询，这里仅作演示
-        try:
-            with open("api_key.txt", 'r') as f:
-                api_key = f.read().strip()
+        #try:
+            #with open("api_key.txt", 'r') as f:
+                #api_key = f.read().strip()
             
             # 这里使用一个假设的总配额值（用户需根据实际情况调整）
             # 不同API key有不同的配额限制，可以从OpenAI dashboard查看
             # 这里假设总配额为 10,000,000 tokens（仅为示例）
-            assumed_total_quota = 10_000_000
-            remaining_tokens = assumed_total_quota - self.total_tokens_used
+            #assumed_total_quota = 10_000_000
+            #remaining_tokens = assumed_total_quota - self.total_tokens_used
             
-            self.logger.info(f"估算剩余Token: {remaining_tokens:,} (基于假设总配额 {assumed_total_quota:,})")
-            self.logger.info(f"")
-            self.logger.info(f"⚠️  注意：剩余Token为估算值，实际配额请登录OpenAI账户查看")
-            self.logger.info(f"    不同API key配额不同，上述计算基于假设值 {assumed_total_quota:,} tokens")
-        except Exception as e:
-            self.logger.warning(f"无法读取API key文件: {e}")
+            #self.logger.info(f"估算剩余Token: {remaining_tokens:,} (基于假设总配额 {assumed_total_quota:,})")
+            #self.logger.info(f"")
+            #self.logger.info(f"⚠️  注意：剩余Token为估算值，实际配额请登录OpenAI账户查看")
+            #self.logger.info(f"    不同API key配额不同，上述计算基于假设值 {assumed_total_quota:,} tokens")
+        #except Exception as e:
+            #self.logger.warning(f"无法读取API key文件: {e}")
         
-        self.logger.info(f"{'='*80}\n")
+        #self.logger.info(f"{'='*80}\n")
         
-        self.logger.info(f"\n{'█'*80}\n")
+        #self.logger.info(f"\n{'█'*80}\n")
+    
+    # ========== 未使用方法注释结束 ==========
 
 
 if __name__ == "__main__":
