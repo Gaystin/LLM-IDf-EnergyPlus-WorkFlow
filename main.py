@@ -2890,6 +2890,9 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
             if self.llm_calls_count > 0:
                 avg_tokens = self.total_tokens_used / self.llm_calls_count
                 self.logger.info(f"平均每次Token数: {avg_tokens:.2f}")
+
+            # 生成并行可视化曲线：每个工作流单独图 + 所有工作流汇总图
+            self._generate_parallel_energy_plots(all_workflows)
             
             self.logger.info(f"\n{'='*80}")
             self.logger.info(f"【并行优化循环完成】")
@@ -2897,6 +2900,101 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
             
         except Exception as e:
             self.logger.error(f"最终报告汇总异常: {e}", exc_info=True)
+
+    def _generate_parallel_energy_plots(self, all_workflows):
+        """生成并行工作流能耗变化曲线。
+
+        输出内容：
+        1) 每个工作流单独图：供冷实线、供暖虚线
+        2) 所有工作流汇总图：不同工作流使用不同颜色，供冷实线、供暖虚线
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+
+            plot_dir = "optimization_plot_并行2"
+            os.makedirs(plot_dir, exist_ok=True)
+
+            # 尽量设置中文字体，找不到则使用默认字体继续绘图
+            try:
+                import matplotlib.font_manager as fm
+                font_candidates = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
+                font_name = None
+                for candidate in font_candidates:
+                    try:
+                        fm.findfont(candidate, fallback_to_default=False)
+                        font_name = candidate
+                        break
+                    except Exception:
+                        continue
+                if font_name:
+                    matplotlib.rcParams['font.sans-serif'] = [font_name]
+                matplotlib.rcParams['axes.unicode_minus'] = False
+            except Exception:
+                pass
+
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+            # ---------- 1) 每个工作流单独曲线 ----------
+            valid_workflows = []
+            for workflow_id in sorted(all_workflows.keys()):
+                history = all_workflows[workflow_id].get('iteration_history', [])
+                if not history:
+                    self.logger.warning(f"[{workflow_id}] 无迭代历史，跳过单工作流曲线生成")
+                    continue
+
+                x = [item.get('iteration', idx + 1) for idx, item in enumerate(history)]
+                cooling = [item['metrics']['total_cooling_kwh'] for item in history]
+                heating = [item['metrics']['total_heating_kwh'] for item in history]
+
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.plot(x, cooling, color='tab:blue', linestyle='-', marker='o', linewidth=2,
+                        label='Cooling (solid)')
+                ax.plot(x, heating, color='tab:orange', linestyle='--', marker='s', linewidth=2,
+                        label='Heating (dashed)')
+
+                ax.set_title(f"{workflow_id} Cooling/Heating Energy Curve")
+                ax.set_xlabel("Iteration")
+                ax.set_ylabel("Energy (kWh/m2)")
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+
+                workflow_plot_path = os.path.join(plot_dir, f"{workflow_id}_cooling_heating_curve_{timestamp}.png")
+                fig.savefig(workflow_plot_path, bbox_inches='tight', dpi=150)
+                plt.close(fig)
+
+                self.logger.info(f"[{workflow_id}] 已保存单工作流能耗曲线: {workflow_plot_path}")
+                valid_workflows.append((workflow_id, x, cooling, heating))
+
+            # ---------- 2) 所有工作流汇总曲线 ----------
+            if valid_workflows:
+                fig, ax = plt.subplots(figsize=(12, 7))
+                cmap = plt.get_cmap('tab10')
+
+                for idx, (workflow_id, x, cooling, heating) in enumerate(valid_workflows):
+                    color = cmap(idx % 10)
+                    # 供冷：实线；供暖：虚线；同一workflow同色
+                    ax.plot(x, cooling, color=color, linestyle='-', marker='o', linewidth=2,
+                            label=f"{workflow_id} Cooling")
+                    ax.plot(x, heating, color=color, linestyle='--', marker='s', linewidth=2,
+                            label=f"{workflow_id} Heating")
+
+                ax.set_title("All Workflows Cooling/Heating Energy Curves")
+                ax.set_xlabel("Iteration")
+                ax.set_ylabel("Energy (kWh/m2)")
+                ax.grid(True, alpha=0.3)
+                ax.legend(ncol=2, fontsize=9)
+
+                summary_plot_path = os.path.join(plot_dir, f"all_workflows_cooling_heating_curve_{timestamp}.png")
+                fig.savefig(summary_plot_path, bbox_inches='tight', dpi=150)
+                plt.close(fig)
+
+                self.logger.info(f"已保存并行汇总能耗曲线: {summary_plot_path}")
+            else:
+                self.logger.warning("无有效工作流历史，未生成汇总能耗曲线")
+
+        except Exception as e:
+            self.logger.warning(f"生成并行能耗曲线失败: {e}")
     
     def _get_default_suggestions(self, iteration):
         """无法获得LLM建议时的默认优化方案"""
@@ -3130,7 +3228,7 @@ modifications数组应包含至少5-8条修改记录，并覆盖至少5个对象
             else:
                 font_prop = None
                 self.logger.warning("未找到理想的中英文混合字体，可能仍有部分符号无法显示。建议安装 Microsoft YaHei 或 Arial Unicode MS 字体。")
-            plot_dir = "optimization_plot"
+            plot_dir = "optimization_plot_并行"
             os.makedirs(plot_dir, exist_ok=True)
             cooling = [item['metrics']['total_cooling_kwh'] for item in self.iteration_history]
             heating = [item['metrics']['total_heating_kwh'] for item in self.iteration_history]

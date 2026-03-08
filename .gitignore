@@ -16,6 +16,8 @@
 /optimization_logs_并行2
 /optimization_results_并行2
 /optimization_plot
+/optimization_plot_并行
+/optimization_plot_并行2
 /temp_files
 /weather.epw
 /__pycache__
