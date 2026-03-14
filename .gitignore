@@ -18,6 +18,7 @@
 /optimization_plot
 /optimization_plot_并行5
 /optimization_plot_并行2
+/optimization_logs_并行2_web
 /temp_files
 /weather.epw
 /__pycache__
@@ -25,3 +26,4 @@
 /模拟课大作业-郁哲轩.pptx
 /基准.log
 /分成多个python文件的代码
+/.web_runtime
