@@ -31,6 +31,8 @@ DEFAULT_EPW_PATH = "weather.epw"
 DEFAULT_LOG_DIR = "optimization_logs_并行2_web"
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_NUM_WORKFLOWS = 2
+AUTO_REFRESH_SECONDS = 2.0
+UI_ACTION_COOLDOWN_SECONDS = 3.0
 
 
 def _build_default_capture_state() -> dict[str, Any]:
@@ -45,10 +47,14 @@ def _build_default_capture_state() -> dict[str, Any]:
         "plan_metrics_history": [],
         "latest_round_stats": None,
         "round_stats_history": [],
+        "latest_parameter_details": None,
+        "parameter_details_history": [],
         "latest_status": "等待启动",
         "status_updated_at": None,
         "collecting_summary": False,
         "summary_lines": [],
+        "collecting_parameter_details": False,
+        "parameter_detail_lines": [],
     }
 
 
@@ -69,6 +75,8 @@ def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "i
             "plan_metrics_history": [],
             "latest_round_stats": None,
             "round_stats_history": [],
+            "latest_parameter_details": None,
+            "parameter_details_history": [],
             "latest_status": "等待启动",
             "status_updated_at": None,
             "iteration_history": [],
@@ -149,21 +157,22 @@ def _clean_summary_lines(lines: list[str]) -> str:
     prev_blank = False
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("=") or stripped.startswith("-"):
+        raw_for_check = _strip_log_prefix(stripped)
+        if raw_for_check.startswith("=") or raw_for_check.startswith("-"):
             continue
-        if stripped == "【修改摘要】汇总 - 快速查看修改概览":
+        if raw_for_check == "【修改摘要】汇总 - 快速查看修改概览":
             continue
-        if stripped.startswith("[计划修改]") or stripped.startswith("[文本替换"):
+        if raw_for_check.startswith("[计划修改]") or raw_for_check.startswith("[文本替换"):
             continue
-        if "警告" in stripped or stripped.startswith("⚠"):
+        if "警告" in raw_for_check or raw_for_check.startswith("⚠"):
             continue
-        if not stripped:
+        if not raw_for_check:
             if cleaned and not prev_blank:
                 cleaned.append("")
                 prev_blank = True
             continue
 
-        if stripped.startswith("▶") and cleaned and not prev_blank:
+        if raw_for_check.startswith("▶") and cleaned and not prev_blank:
             cleaned.append("")
 
         cleaned.append(stripped)
@@ -206,6 +215,37 @@ def _short_status(message: str) -> str:
     if len(first_line) > 72:
         return f"{first_line[:72]}..."
     return first_line
+
+
+def _strip_log_prefix(line: str) -> str:
+    return re.sub(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s-\s[A-Z]+\s-\s", "", str(line or "")).strip()
+
+
+def _format_record_lines(record: logging.LogRecord, message: str) -> list[str]:
+    ts = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
+    level = str(record.levelname or "INFO").upper()
+    lines = str(message or "").splitlines() or [str(message or "")]
+    return [f"{ts} - {level} - {line}" if line else f"{ts} - {level} - " for line in lines]
+
+
+def _clean_parameter_detail_lines(lines: list[str]) -> str:
+    cleaned = []
+    prev_blank = False
+    for line in lines:
+        raw = _strip_log_prefix(line)
+        if not raw:
+            if cleaned and not prev_blank:
+                cleaned.append("")
+                prev_blank = True
+            continue
+        if raw.startswith("【计时】") or raw.startswith("【最终汇总报告") or raw.startswith("全局最佳"):
+            continue
+        cleaned.append(line.strip())
+        prev_blank = False
+
+    while cleaned and cleaned[-1] == "":
+        cleaned.pop()
+    return "\n".join(cleaned)
 
 
 def _extract_int_after_label(text: str, label: str) -> int | None:
@@ -298,12 +338,25 @@ def _compose_snapshot(
             "plan_metrics_history": capture.get("plan_metrics_history", []),
             "latest_round_stats": capture.get("latest_round_stats"),
             "round_stats_history": capture.get("round_stats_history", []),
+            "latest_parameter_details": capture.get("latest_parameter_details"),
+            "parameter_details_history": capture.get("parameter_details_history", []),
             "latest_status": capture.get("latest_status", "等待日志输出"),
             "status_updated_at": capture.get("status_updated_at"),
             "iteration_history": history,
             "best_metrics": workflow_data.get("best_metrics"),
             "best_iteration": int(workflow_data.get("best_iteration", 0) or 0),
         }
+
+        if not snapshot["workflows"][workflow_id].get("latest_parameter_details"):
+            pending_lines = capture.get("parameter_detail_lines", []) or []
+            if pending_lines:
+                pending_text = _clean_parameter_detail_lines(pending_lines)
+                if pending_text:
+                    snapshot["workflows"][workflow_id]["latest_parameter_details"] = {
+                        "updated_at": datetime.now().strftime("%H:%M:%S"),
+                        "iteration": current_iteration,
+                        "text": pending_text,
+                    }
 
     return snapshot
 
@@ -328,6 +381,7 @@ class WebCaptureHandler(logging.Handler):
             workflow_state = self.capture_state.setdefault(workflow_id, _build_default_capture_state())
             workflow_state["latest_status"] = _short_status(message)
             workflow_state["status_updated_at"] = datetime.now().strftime("%H:%M:%S")
+            formatted_lines = _format_record_lines(record, message)
 
             round_match = ROUND_REGEX.search(message)
             if round_match:
@@ -396,7 +450,33 @@ class WebCaptureHandler(logging.Handler):
                     workflow_state["collecting_summary"] = False
                     workflow_state["summary_lines"] = []
                 else:
-                    workflow_state["summary_lines"].extend(message.splitlines())
+                    workflow_state["summary_lines"].extend(formatted_lines)
+
+            if "【参数修改详情】" in message:
+                workflow_state["collecting_parameter_details"] = True
+                workflow_state["parameter_detail_lines"] = []
+
+            if workflow_state.get("collecting_parameter_details"):
+                workflow_state["parameter_detail_lines"].extend(formatted_lines)
+                raw_message = _strip_log_prefix(message)
+                stop_markers = [
+                    "【计时】",
+                    "【最终汇总报告",
+                    "【全局最佳",
+                    "启动",
+                ]
+                if any(raw_message.startswith(marker) for marker in stop_markers):
+                    detail_text = _clean_parameter_detail_lines(workflow_state.get("parameter_detail_lines", []))
+                    if detail_text:
+                        payload = {
+                            "updated_at": datetime.now().strftime("%H:%M:%S"),
+                            "iteration": workflow_state.get("current_iteration", 0),
+                            "text": detail_text,
+                        }
+                        workflow_state["latest_parameter_details"] = payload
+                        _upsert_iteration_payload(workflow_state.setdefault("parameter_details_history", []), payload)
+                    workflow_state["collecting_parameter_details"] = False
+                    workflow_state["parameter_detail_lines"] = []
 
     def _resolve_workflow_id(self, record: logging.LogRecord, message: str) -> str | None:
         logger_name = str(getattr(record, "name", "") or "")
@@ -669,6 +749,27 @@ def _render_style() -> None:
         .stMarkdown p, .stCaption, label, .stRadio label, .stSelectbox label, .stFileUploader label {
             color: #2C3A3F !important;
         }
+        div[data-testid="stExpander"] {
+            background: rgba(255, 255, 255, 0.88);
+            border: 1px solid rgba(52, 103, 115, 0.16);
+            border-radius: 12px;
+        }
+        div[data-testid="stExpander"] summary,
+        div[data-testid="stExpander"] summary * {
+            color: #1F3942 !important;
+            background: transparent !important;
+        }
+        div[data-testid="stExpanderDetails"] {
+            background: rgba(255, 255, 255, 0.92) !important;
+            color: #2C3A3F !important;
+        }
+        div[data-testid="stFileUploaderDropzone"] {
+            background: #F7F3E9 !important;
+            border: 1px dashed #B88E4A !important;
+        }
+        div[data-testid="stFileUploaderDropzone"] * {
+            color: #3F2D16 !important;
+        }
         .stButton button {
             background: #F6F3EC;
             border: 1px solid #C5B79A;
@@ -825,6 +926,7 @@ def _render_workflow_best_section(workflow_id: str, workflow_snapshot: dict[str,
     best_metrics = _best_metrics_from_history(workflow_snapshot) or {}
     best_idf = _best_idf_from_history(workflow_snapshot, best_iteration)
     summary_payload = _pick_iteration_payload(workflow_snapshot.get("summary_history", []) or [], best_iteration)
+    details_payload = workflow_snapshot.get("latest_parameter_details")
 
     st.markdown("### 当前工作流最优结果")
     st.markdown(
@@ -845,6 +947,7 @@ def _render_workflow_best_section(workflow_id: str, workflow_snapshot: dict[str,
         c4.metric("最优供暖能耗(kWh/m²)", f"{float(best_metrics.get('total_heating_kwh', 0) or 0):.4f}")
 
     _render_text_panel("最优轮次对应修改摘要", summary_payload, "当前还没有抓取到最优轮次的修改摘要。")
+    _render_text_panel("本工作流最终参数修改详情", details_payload, "当前还没有抓取到本工作流最终参数修改详情。")
 
 
 def _render_summary_page(snapshot: dict[str, Any]) -> None:
@@ -858,14 +961,23 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
     for workflow_id, workflow_snapshot in sorted(workflows.items()):
         best_iteration = _pick_best_iteration(workflow_snapshot)
         best_metrics = _best_metrics_from_history(workflow_snapshot) or {}
+        history = workflow_snapshot.get("iteration_history", []) or []
+        baseline_metrics = (history[0].get("metrics", {}) if history else {})
+
+        def _fmt_with_pct(value: float, baseline: float) -> str:
+            value_num = float(value or 0)
+            baseline_num = float(baseline or 0)
+            pct = ((baseline_num - value_num) / baseline_num * 100.0) if baseline_num else 0.0
+            return f"{value_num:.4f} ({pct:+.2f}%)"
+
         rows.append(
             {
                 "工作流": workflow_id,
                 "最优轮次": best_iteration,
-                "总建筑能耗(kWh)": float(best_metrics.get("total_site_energy_kwh", 0) or 0),
-                "EUI(kWh/m²)": float(best_metrics.get("eui_kwh_per_m2", 0) or 0),
-                "制冷能耗(kWh/m²)": float(best_metrics.get("total_cooling_kwh", 0) or 0),
-                "供暖能耗(kWh/m²)": float(best_metrics.get("total_heating_kwh", 0) or 0),
+                "总建筑能耗(kWh)": _fmt_with_pct(best_metrics.get("total_site_energy_kwh", 0), baseline_metrics.get("total_site_energy_kwh", 0)),
+                "EUI(kWh/m²)": _fmt_with_pct(best_metrics.get("eui_kwh_per_m2", 0), baseline_metrics.get("eui_kwh_per_m2", 0)),
+                "制冷能耗(kWh/m²)": _fmt_with_pct(best_metrics.get("total_cooling_kwh", 0), baseline_metrics.get("total_cooling_kwh", 0)),
+                "供暖能耗(kWh/m²)": _fmt_with_pct(best_metrics.get("total_heating_kwh", 0), baseline_metrics.get("total_heating_kwh", 0)),
             }
         )
 
@@ -874,13 +986,24 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
         st.info("暂无可汇总数据。")
         return
 
-    valid_df = summary_df[summary_df["总建筑能耗(kWh)"] > 0]
+    valid_rows = []
+    for workflow_id, workflow_snapshot in sorted(workflows.items()):
+        best_metrics = _best_metrics_from_history(workflow_snapshot) or {}
+        total = float(best_metrics.get("total_site_energy_kwh", 0) or 0)
+        if total > 0:
+            valid_rows.append((workflow_id, total))
+
     global_best_workflow = None
-    if not valid_df.empty:
-        global_best_workflow = valid_df.loc[valid_df["总建筑能耗(kWh)"].idxmin(), "工作流"]
+    if valid_rows:
+        global_best_workflow = min(valid_rows, key=lambda item: item[1])[0]
+
+    if global_best_workflow:
+        summary_df["最优标识"] = summary_df["工作流"].apply(lambda wf: "✅" if wf == global_best_workflow else "")
+    else:
+        summary_df["最优标识"] = ""
 
     st.markdown("### 各工作流最优轮次对比")
-    st.dataframe(summary_df.round(4), width="stretch", hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
 
     if global_best_workflow:
         st.success(f"全局最佳工作流：{global_best_workflow}")
@@ -1030,8 +1153,8 @@ def main() -> None:
     status = snapshot.get("status", "idle")
     running = status in {"running", "starting"}
 
-    st.title("EnergyPlus 并行工作流可视化驾驶舱")
-    st.caption("不改动原有优化逻辑，只把并行工作流的全过程稳定地展示在网页上。")
+    st.title("EnergyPlus 并行工作流可视化Web界面")
+    st.caption("Version 1.0 | Powered by Streamlit | By OpenAI")
 
     st.markdown(
         """
@@ -1157,7 +1280,6 @@ def main() -> None:
                 page_state["selected_view"] = view_name
                 page_state["selected_workflow"] = view_name if view_name != "summary" else page_state.get("selected_workflow", workflow_keys[0])
                 page_state["last_ui_action_ts"] = time.time()
-                st.rerun()
 
     if page_state.get("selected_view") == "summary":
         _render_summary_page(snapshot)
@@ -1181,10 +1303,11 @@ def main() -> None:
     summary_history = workflow_snapshot.get("summary_history", []) or []
     plan_metrics_history = workflow_snapshot.get("plan_metrics_history", []) or []
     round_stats_history = workflow_snapshot.get("round_stats_history", []) or []
+    parameter_details_history = workflow_snapshot.get("parameter_details_history", []) or []
     history_iterations = sorted(
         {
             int(item.get("iteration", 0) or 0)
-            for item in reasoning_history + summary_history + plan_metrics_history + round_stats_history
+            for item in reasoning_history + summary_history + plan_metrics_history + round_stats_history + parameter_details_history
             if int(item.get("iteration", 0) or 0) > 0
         }
     )
@@ -1210,11 +1333,13 @@ def main() -> None:
         selected_summary = _pick_iteration_payload(summary_history, int(selected_iteration))
         selected_plan_metrics = _pick_iteration_payload(plan_metrics_history, int(selected_iteration))
         selected_round_stats = _pick_iteration_payload(round_stats_history, int(selected_iteration))
+        selected_parameter_details = _pick_iteration_payload(parameter_details_history, int(selected_iteration))
     else:
         selected_reasoning = workflow_snapshot.get("latest_reasoning")
         selected_summary = workflow_snapshot.get("latest_summary")
         selected_plan_metrics = workflow_snapshot.get("latest_plan_metrics")
         selected_round_stats = workflow_snapshot.get("latest_round_stats")
+        selected_parameter_details = workflow_snapshot.get("latest_parameter_details")
 
     _render_text_panel("LLM推理过程", selected_reasoning, "等待当前工作流产出最终采用的 LLM 推理过程。", numbered=True)
     _render_text_panel("修改摘要", selected_summary, "等待当前工作流产出成功执行后的修改摘要。")
@@ -1223,6 +1348,7 @@ def main() -> None:
         _render_plan_metrics_panel(selected_plan_metrics)
     with metrics_right:
         _render_round_stats_panel(selected_round_stats)
+    _render_text_panel("参数修改详情（日志可视化）", selected_parameter_details, "等待输出参数修改详情。")
 
     iteration_history = workflow_snapshot.get("iteration_history", []) or []
     dataframe = _build_metrics_dataframe(iteration_history)
@@ -1270,8 +1396,8 @@ def main() -> None:
 
     _render_workflow_best_section(selected_workflow, workflow_snapshot)
 
-    if running and (time.time() - float(page_state.get("last_ui_action_ts", 0.0) or 0.0) > 1.2):
-        time.sleep(0.8)
+    if running and (time.time() - float(page_state.get("last_ui_action_ts", 0.0) or 0.0) > UI_ACTION_COOLDOWN_SECONDS):
+        time.sleep(AUTO_REFRESH_SECONDS)
         st.rerun()
 
 
