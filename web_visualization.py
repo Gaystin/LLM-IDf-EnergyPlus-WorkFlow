@@ -12,6 +12,7 @@ from typing import Any
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
@@ -31,8 +32,16 @@ DEFAULT_EPW_PATH = "weather.epw"
 DEFAULT_LOG_DIR = "optimization_logs_并行2_web"
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_NUM_WORKFLOWS = 2
-AUTO_REFRESH_SECONDS = 2.0
+AUTO_REFRESH_SECONDS = 1.0
 UI_ACTION_COOLDOWN_SECONDS = 3.0
+
+
+def _real_to_display_iteration(real_iteration: int) -> int:
+    return max(int(real_iteration or 0) - 1, 0)
+
+
+def _real_to_display_max_iterations(real_max_iterations: int) -> int:
+    return max(int(real_max_iterations or 0) - 1, 0)
 
 
 def _build_default_capture_state() -> dict[str, Any]:
@@ -49,23 +58,28 @@ def _build_default_capture_state() -> dict[str, Any]:
         "round_stats_history": [],
         "latest_parameter_details": None,
         "parameter_details_history": [],
+        "baseline_log": None,
+        "baseline_log_history": [],
         "latest_status": "等待启动",
         "status_updated_at": None,
         "collecting_summary": False,
         "summary_lines": [],
         "collecting_parameter_details": False,
         "parameter_detail_lines": [],
+        "collecting_baseline_log": False,
+        "baseline_log_lines": [],
     }
 
 
 def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "idle", error: str | None = None) -> dict[str, Any]:
     config = config or {}
     max_iterations = int(config.get("max_iterations", 5) or 5)
+    optimization_rounds = int(config.get("optimization_rounds", _real_to_display_max_iterations(max_iterations)) or _real_to_display_max_iterations(max_iterations))
     num_workflows = int(config.get("num_workflows", 2) or 2)
     workflows = {
         f"workflow_{index + 1}": {
             "current_iteration": 0,
-            "max_iterations": max_iterations,
+            "max_iterations": optimization_rounds,
             "progress": 0.0,
             "latest_reasoning": None,
             "latest_summary": None,
@@ -77,6 +91,8 @@ def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "i
             "round_stats_history": [],
             "latest_parameter_details": None,
             "parameter_details_history": [],
+            "baseline_log": None,
+            "baseline_log_history": [],
             "latest_status": "等待启动",
             "status_updated_at": None,
             "iteration_history": [],
@@ -98,6 +114,7 @@ def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "i
             "epw_path": config.get("epw_path", DEFAULT_EPW_PATH),
             "log_dir": config.get("log_dir", DEFAULT_LOG_DIR),
             "max_iterations": max_iterations,
+            "optimization_rounds": optimization_rounds,
             "num_workflows": num_workflows,
         },
         "workflows": workflows,
@@ -287,7 +304,7 @@ def _simplify_iteration_history(iteration_history: list[dict[str, Any]]) -> list
         metrics = item.get("metrics", {}) or {}
         rows.append(
             {
-                "iteration": int(item.get("iteration", 0) or 0),
+                "iteration": _real_to_display_iteration(int(item.get("iteration", 0) or 0)),
                 "metrics": {
                     "total_site_energy_kwh": float(metrics.get("total_site_energy_kwh", 0) or 0),
                     "eui_kwh_per_m2": float(metrics.get("eui_kwh_per_m2", 0) or 0),
@@ -320,12 +337,15 @@ def _compose_snapshot(
 
     for workflow_id in sorted(optimizer.workflows.keys()):
         workflow_data = optimizer.workflows.get(workflow_id, {}) or {}
-        history = _simplify_iteration_history(workflow_data.get("iteration_history", []) or [])
+        raw_history = workflow_data.get("iteration_history", []) or []
+        history = _simplify_iteration_history(raw_history)
         capture = capture_state.get(workflow_id, _build_default_capture_state())
-        current_iteration = int(capture.get("current_iteration", 0) or 0)
-        if not current_iteration and history:
-            current_iteration = int(history[-1].get("iteration", 0) or 0)
-        max_iterations = int(capture.get("max_iterations", config.get("max_iterations", 5)) or config.get("max_iterations", 5))
+        current_iteration_real = int(capture.get("current_iteration", 0) or 0)
+        if not current_iteration_real and raw_history:
+            current_iteration_real = int(raw_history[-1].get("iteration", 0) or 0)
+        max_iterations_real = int(capture.get("max_iterations", config.get("max_iterations", 5)) or config.get("max_iterations", 5))
+        current_iteration = _real_to_display_iteration(current_iteration_real)
+        max_iterations = _real_to_display_max_iterations(max_iterations_real)
         snapshot["workflows"][workflow_id] = {
             "current_iteration": current_iteration,
             "max_iterations": max_iterations,
@@ -340,11 +360,13 @@ def _compose_snapshot(
             "round_stats_history": capture.get("round_stats_history", []),
             "latest_parameter_details": capture.get("latest_parameter_details"),
             "parameter_details_history": capture.get("parameter_details_history", []),
+            "baseline_log": capture.get("baseline_log"),
+            "baseline_log_history": capture.get("baseline_log_history", []),
             "latest_status": capture.get("latest_status", "等待日志输出"),
             "status_updated_at": capture.get("status_updated_at"),
             "iteration_history": history,
             "best_metrics": workflow_data.get("best_metrics"),
-            "best_iteration": int(workflow_data.get("best_iteration", 0) or 0),
+            "best_iteration": _real_to_display_iteration(int(workflow_data.get("best_iteration", 0) or 0)),
         }
 
         if not snapshot["workflows"][workflow_id].get("latest_parameter_details"):
@@ -356,6 +378,17 @@ def _compose_snapshot(
                         "updated_at": datetime.now().strftime("%H:%M:%S"),
                         "iteration": current_iteration,
                         "text": pending_text,
+                    }
+
+        if not snapshot["workflows"][workflow_id].get("baseline_log"):
+            baseline_lines = capture.get("baseline_log_lines", []) or []
+            if baseline_lines:
+                baseline_text = "\n".join(baseline_lines).strip()
+                if baseline_text:
+                    snapshot["workflows"][workflow_id]["baseline_log"] = {
+                        "updated_at": datetime.now().strftime("%H:%M:%S"),
+                        "iteration": 0,
+                        "text": baseline_text,
                     }
 
     return snapshot
@@ -388,6 +421,27 @@ class WebCaptureHandler(logging.Handler):
                 workflow_state["current_iteration"] = int(round_match.group(1))
                 workflow_state["max_iterations"] = int(round_match.group(2))
 
+            if "【模拟】initial_baseline" in message:
+                workflow_state["collecting_baseline_log"] = True
+                workflow_state["baseline_log_lines"] = []
+
+            if workflow_state.get("collecting_baseline_log"):
+                stop_match = ROUND_REGEX.search(message)
+                if stop_match and int(stop_match.group(1)) >= 2:
+                    baseline_text = "\n".join(workflow_state.get("baseline_log_lines", [])).strip()
+                    if baseline_text:
+                        payload = {
+                            "updated_at": datetime.now().strftime("%H:%M:%S"),
+                            "iteration": 0,
+                            "text": baseline_text,
+                        }
+                        workflow_state["baseline_log"] = payload
+                        _upsert_iteration_payload(workflow_state.setdefault("baseline_log_history", []), payload)
+                    workflow_state["collecting_baseline_log"] = False
+                    workflow_state["baseline_log_lines"] = []
+                else:
+                    workflow_state["baseline_log_lines"].extend(formatted_lines)
+
             reasoning_match = REASONING_HEADER_REGEX.search(message)
             if reasoning_match and "最终采用方案" in reasoning_match.group(1):
                 lines = [line for line in message.splitlines()[1:] if line.strip()]
@@ -395,7 +449,7 @@ class WebCaptureHandler(logging.Handler):
                 if reasoning_text:
                     reasoning_payload = {
                         "updated_at": datetime.now().strftime("%H:%M:%S"),
-                        "iteration": workflow_state.get("current_iteration", 0),
+                        "iteration": _real_to_display_iteration(workflow_state.get("current_iteration", 0)),
                         "text": reasoning_text,
                     }
                     workflow_state["latest_reasoning"] = reasoning_payload
@@ -404,7 +458,7 @@ class WebCaptureHandler(logging.Handler):
             if "【建议指标】" in message:
                 metrics_payload = {
                     "updated_at": datetime.now().strftime("%H:%M:%S"),
-                    "iteration": workflow_state.get("current_iteration", 0),
+                    "iteration": _real_to_display_iteration(workflow_state.get("current_iteration", 0)),
                     **_parse_plan_metrics_line(message),
                 }
                 workflow_state["latest_plan_metrics"] = metrics_payload
@@ -413,7 +467,7 @@ class WebCaptureHandler(logging.Handler):
             if "【本轮修改统计】" in message:
                 stats_payload = {
                     "updated_at": datetime.now().strftime("%H:%M:%S"),
-                    "iteration": workflow_state.get("current_iteration", 0),
+                    "iteration": _real_to_display_iteration(workflow_state.get("current_iteration", 0)),
                     "modified_objects": None,
                     "modified_fields": None,
                 }
@@ -423,7 +477,7 @@ class WebCaptureHandler(logging.Handler):
             if "修改对象总数:" in message or "修改字段总数:" in message:
                 stats_payload = dict(workflow_state.get("latest_round_stats") or {})
                 stats_payload["updated_at"] = datetime.now().strftime("%H:%M:%S")
-                stats_payload["iteration"] = workflow_state.get("current_iteration", 0)
+                stats_payload["iteration"] = _real_to_display_iteration(workflow_state.get("current_iteration", 0))
                 if "修改对象总数:" in message:
                     stats_payload["modified_objects"] = _extract_int_after_label(message, "修改对象总数:")
                 if "修改字段总数:" in message:
@@ -442,7 +496,7 @@ class WebCaptureHandler(logging.Handler):
                     if summary_text:
                         summary_payload = {
                             "updated_at": datetime.now().strftime("%H:%M:%S"),
-                            "iteration": workflow_state.get("current_iteration", 0),
+                            "iteration": _real_to_display_iteration(workflow_state.get("current_iteration", 0)),
                             "text": summary_text,
                         }
                         workflow_state["latest_summary"] = summary_payload
@@ -470,7 +524,7 @@ class WebCaptureHandler(logging.Handler):
                     if detail_text:
                         payload = {
                             "updated_at": datetime.now().strftime("%H:%M:%S"),
-                            "iteration": workflow_state.get("current_iteration", 0),
+                            "iteration": _real_to_display_iteration(workflow_state.get("current_iteration", 0)),
                             "text": detail_text,
                         }
                         workflow_state["latest_parameter_details"] = payload
@@ -676,24 +730,130 @@ def _build_progressive_curve(dataframe: pd.DataFrame, workflow_id: str):
     rounds = sorted({int(value) for value in dataframe["轮次"].tolist()})
     return (
         alt.Chart(melted)
-        .mark_line(point=alt.OverlayMarkDef(size=88, filled=True), strokeWidth=2.4)
+        .mark_line(point=alt.OverlayMarkDef(size=120, filled=True), strokeWidth=3.2)
         .encode(
-            x=alt.X("轮次:O", title="迭代轮次", sort=rounds, axis=alt.Axis(labelAngle=0)),
-            y=alt.Y("数值:Q", title="能耗 (kWh/m²)"),
+            x=alt.X(
+                "轮次:O",
+                title="迭代轮次",
+                sort=rounds,
+                axis=alt.Axis(labelAngle=0, labelFontSize=17, titleFontSize=22, labelPadding=8, titlePadding=16, titleFontWeight="bold"),
+            ),
+            y=alt.Y(
+                "数值:Q",
+                title="能耗 (kWh/m²)",
+                axis=alt.Axis(labelFontSize=17, titleFontSize=22, labelPadding=8, titlePadding=14, tickCount=6, titleFontWeight="bold"),
+            ),
             color=alt.Color(
                 "指标:N",
-                scale=alt.Scale(domain=["制冷能耗", "供暖能耗"], range=["#2F80ED", "#F2994A"]),
+                scale=alt.Scale(domain=["制冷能耗", "供暖能耗"], range=["#1F77B4", "#E67E22"]),
+                legend=None,
             ),
             strokeDash=alt.StrokeDash(
                 "指标:N",
-                scale=alt.Scale(domain=["制冷能耗", "供暖能耗"], range=[[1, 0], [6, 4]]),
+                scale=alt.Scale(domain=["制冷能耗", "供暖能耗"], range=[[1, 0], [8, 4]]),
             ),
             tooltip=["轮次:O", "指标:N", alt.Tooltip("数值:Q", format=".4f")],
         )
-        .properties(title=f"{workflow_id} 冷暖能耗迭代曲线", width=520, height=220)
-        .configure_view(strokeWidth=0)
-        .configure_title(fontSize=15, color="#204051")
+        .properties(
+            width=1080,
+            height=460,
+            padding={"left": 24, "right": 20, "top": 8, "bottom": 20},
+        )
+        .configure(background="#FCFCFA")
+        .configure_view(strokeWidth=1, stroke="#C8D3DE", fill="#FFFFFF")
+        .configure_axis(
+            grid=True,
+            gridColor="#D2DCE6",
+            domainColor="#516575",
+            tickColor="#516575",
+            labelColor="#253946",
+            titleColor="#1A2E3A",
+        )
     )
+
+
+def _table_column_config(dataframe: pd.DataFrame) -> dict[str, Any]:
+    config = {}
+    for column in dataframe.columns:
+        if column in {"轮次", "最优轮次", "工作流", "全局最佳标识", "最优迭代标识"}:
+            width = "small"
+        elif "路径" in column:
+            width = "large"
+        else:
+            width = "medium"
+        config[column] = st.column_config.Column(column, width=width)
+    return config
+
+
+def _stringify_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    rendered = dataframe.copy()
+    for column in rendered.columns:
+        rendered[column] = rendered[column].apply(lambda value: "" if value is None else str(value))
+    return rendered
+
+
+def _left_align_dataframe(dataframe: pd.DataFrame):
+    return dataframe.style.hide(axis="index").set_properties(**{"text-align": "left"}).set_table_styles(
+        [
+            {"selector": "th", "props": [("text-align", "left"), ("font-size", "20px"), ("font-weight", "800"), ("color", "#1F2F36")]},
+            {"selector": "td", "props": [("text-align", "left"), ("font-size", "19px"), ("font-weight", "800"), ("color", "#1F2F36")]},
+        ]
+    )
+
+
+def _render_html_table(dataframe: pd.DataFrame) -> None:
+    html_table = dataframe.to_html(index=False, escape=False, classes="custom-html-table")
+    st.markdown(f"<div class='table-wrap'>{html_table}</div>", unsafe_allow_html=True)
+
+
+def _render_notice(message: str, kind: str = "info") -> None:
+    css_class = "notice-info" if kind == "info" else "notice-error"
+    st.markdown(f"<div class='notice-banner {css_class}'>{html.escape(str(message))}</div>", unsafe_allow_html=True)
+
+
+def _render_metric_card(title: str, value: str, delta: str | None = None) -> None:
+    delta_class = ""
+    if delta:
+        delta_text = str(delta).strip()
+        if delta_text.startswith("+"):
+            delta_class = " pos"
+        elif delta_text.startswith("-"):
+            delta_class = " neg"
+        else:
+            delta_class = " neutral"
+    delta_html = f"<div class='metric-card-delta{delta_class}'>{html.escape(delta)}</div>" if delta else ""
+    st.markdown(
+        f"""
+        <div class='metric-card'>
+            <div class='metric-card-title'>{html.escape(title)}</div>
+            <div class='metric-card-value'>{html.escape(value)}</div>
+            {delta_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _visible_workflow_ids(snapshot: dict[str, Any]) -> list[str]:
+    workflows = snapshot.get("workflows") or {}
+    snapshot_status = str(snapshot.get("status", "idle") or "idle")
+    session_count = int(st.session_state.get("cfg_num_workflows", 0) or 0)
+    fallback_count = len(workflows) if workflows else DEFAULT_NUM_WORKFLOWS
+    configured_count = session_count if session_count > 0 else int(snapshot.get("config", {}).get("num_workflows", fallback_count) or fallback_count)
+    if configured_count <= 0:
+        return sorted(workflows.keys())
+
+    # 在未启动时，直接按当前配置显示对应数量的工作流模块。
+    if snapshot_status == "idle":
+        return [f"workflow_{index + 1}" for index in range(configured_count)]
+
+    if not workflows:
+        return []
+
+    preferred = [f"workflow_{index + 1}" for index in range(configured_count) if f"workflow_{index + 1}" in workflows]
+    if preferred:
+        return preferred
+    return sorted(workflows.keys())[:configured_count]
 
 
 def _pick_best_iteration(workflow_snapshot: dict[str, Any]) -> int:
@@ -744,9 +904,74 @@ def _render_style() -> None:
                 radial-gradient(820px 420px at 100% 0%, rgba(255, 183, 128, 0.22), rgba(255, 183, 128, 0) 60%),
                 linear-gradient(180deg, #F7F5F0 0%, #EFE8DB 100%);
             color: #2C3A3F;
-            font-family: 'Noto Sans SC', 'Space Grotesk', sans-serif;
+            font-family: 'Times New Roman', 'Noto Sans SC', serif;
+            line-height: 1.55;
+        }
+        html, body {
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        [data-testid="stAppViewContainer"] {
+            overflow: hidden !important;
+        }
+        section[data-testid="stMain"] {
+            overflow-y: scroll !important;
+            overflow-x: hidden !important;
+            height: 100vh !important;
+        }
+        header[data-testid="stHeader"] {
+            background: transparent !important;
+            border-bottom: none !important;
+            box-shadow: none !important;
+        }
+        div[data-testid="stToolbar"] {
+            background: transparent !important;
+        }
+        [data-testid="stToolbar"] button,
+        [data-testid="stToolbar"] a,
+        [data-testid="stToolbar"] [role="button"],
+        [data-testid="stStatusWidget"] button,
+        [data-testid="stStatusWidget"] [role="button"] {
+            color: #000000 !important;
+            font-size: 15px !important;
+            font-weight: 700 !important;
+        }
+        [data-testid="stToolbar"] button span,
+        [data-testid="stToolbar"] a span,
+        [data-testid="stToolbar"] [role="button"] span,
+        [data-testid="stStatusWidget"] button span,
+        [data-testid="stStatusWidget"] [role="button"] span {
+            color: #000000 !important;
+            font-size: 15px !important;
+            font-weight: 700 !important;
+        }
+        [data-testid="stStatusWidget"] svg,
+        [data-testid="stStatusWidget"] img {
+            filter: brightness(0.42) contrast(1.12);
+        }
+        .stApp :lang(zh),
+        .stApp [lang="zh"],
+        .stApp h1,
+        .stApp h2,
+        .stApp h3,
+        .stApp h4,
+        .stApp h5,
+        .stApp h6 {
+            font-family: 'Noto Sans SC', 'Times New Roman', sans-serif;
         }
         .stMarkdown p, .stCaption, label, .stRadio label, .stSelectbox label, .stFileUploader label {
+            color: #2C3A3F !important;
+        }
+        .stCaption {
+            font-size: 16px !important;
+            font-weight: 700 !important;
+        }
+        [data-testid="stCaptionContainer"],
+        [data-testid="stCaptionContainer"] p,
+        [data-testid="stCaptionContainer"] span {
+            font-size: 16px !important;
+            font-weight: 700 !important;
             color: #2C3A3F !important;
         }
         div[data-testid="stExpander"] {
@@ -758,24 +983,111 @@ def _render_style() -> None:
         div[data-testid="stExpander"] summary * {
             color: #1F3942 !important;
             background: transparent !important;
+            font-size: 21px !important;
+            font-weight: 700 !important;
         }
         div[data-testid="stExpanderDetails"] {
             background: rgba(255, 255, 255, 0.92) !important;
             color: #2C3A3F !important;
         }
-        div[data-testid="stFileUploaderDropzone"] {
-            background: #F7F3E9 !important;
-            border: 1px dashed #B88E4A !important;
+        div[data-testid="stFileUploader"] label,
+        div[data-testid="stNumberInput"] label,
+        div[data-testid="stTextInput"] label,
+        div[data-testid="stSelectbox"] label,
+        div[data-testid="stRadio"] label,
+        div[data-testid="stCheckbox"] label {
+            font-size: 18px !important;
+            font-weight: 700 !important;
         }
-        div[data-testid="stFileUploaderDropzone"] * {
-            color: #3F2D16 !important;
+        [data-testid="stWidgetLabel"],
+        [data-testid="stWidgetLabel"] *,
+        [data-testid="stFileUploader"] [data-testid="stWidgetLabel"],
+        [data-testid="stNumberInput"] [data-testid="stWidgetLabel"] {
+            font-size: 18px !important;
+            font-weight: 700 !important;
+            color: #1F3942 !important;
+        }
+        div[data-testid="stFileUploaderDropzone"] {
+            background: #F6F1E4 !important;
+            border: 1px dashed #A38A5A !important;
+        }
+        div[data-testid="stFileUploaderDropzone"] p,
+        div[data-testid="stFileUploaderDropzone"] span,
+        div[data-testid="stFileUploaderDropzone"] small,
+        div[data-testid="stFileUploaderDropzone"] label {
+            color: #2F2413 !important;
+        }
+        div[data-testid="stFileUploaderDropzone"] svg {
+            fill: #2F2413 !important;
+            color: #2F2413 !important;
+        }
+        div[data-testid="stFileUploader"] {
+            background: rgba(255, 255, 255, 0.9) !important;
+            border-radius: 12px;
+        }
+        /* NumberInput: suppress sticky focus ring on +/- steppers after click. */
+        div[data-testid="stNumberInput"] button,
+        div[data-testid="stNumberInput"] button:focus,
+        div[data-testid="stNumberInput"] button:focus-visible,
+        div[data-testid="stNumberInput"] button:active,
+        div[data-testid="stNumberInput"] [role="button"],
+        div[data-testid="stNumberInput"] [role="button"]:focus,
+        div[data-testid="stNumberInput"] [role="button"]:focus-visible,
+        div[data-testid="stNumberInput"] [role="button"]:active {
+            outline: none !important;
+            box-shadow: none !important;
+            border-color: #C5B79A !important;
+        }
+        div[data-testid="stNumberInput"] input,
+        div[data-testid="stNumberInput"] input:focus,
+        div[data-testid="stNumberInput"] input:focus-visible,
+        div[data-testid="stNumberInput"] input:active {
+            outline: none !important;
+            box-shadow: none !important;
+            border-color: #C5B79A !important;
+        }
+        div[data-testid="stNumberInput"] [data-baseweb="input"],
+        div[data-testid="stNumberInput"] [data-baseweb="input"]:focus-within,
+        div[data-testid="stNumberInput"] div:focus-within {
+            outline: none !important;
+            box-shadow: none !important;
+            border-color: #C5B79A !important;
+        }
+        div[data-testid="stFileUploader"] button,
+        div[data-testid="stFileUploader"] [role="button"] {
+            background: #F2E8D5 !important;
+            border: 1px solid #9C7A40 !important;
+            color: #2F2413 !important;
+        }
+        div[data-testid="stFileUploader"] button:hover,
+        div[data-testid="stFileUploader"] [role="button"]:hover {
+            background: #EAD8B8 !important;
+            border-color: #7D5E2C !important;
+            color: #20170C !important;
+        }
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] *,
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileName"],
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileName"] * {
+            color: #111111 !important;
+        }
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] svg,
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileName"] svg {
+            fill: #111111 !important;
+            color: #111111 !important;
         }
         .stButton button {
             background: #F6F3EC;
             border: 1px solid #C5B79A;
             color: #2C3A3F;
-            border-radius: 10px;
-            font-weight: 600;
+            border-radius: 12px;
+            font-weight: 700;
+            font-size: 17px;
+        }
+        div[data-testid="stButton"] button,
+        div[data-testid="stButton"] button *,
+        [data-testid^="stBaseButton-"] {
+            font-size: 17px !important;
+            font-weight: 700 !important;
         }
         .stButton button:hover {
             border-color: #6A8D92;
@@ -786,15 +1098,80 @@ def _render_style() -> None:
             color: #FFFFFF;
             border-color: #2D6A8E;
         }
+        .metric-card {
+            background: rgba(255, 255, 255, 0.78);
+            border: 1px solid rgba(52, 103, 115, 0.18);
+            border-radius: 12px;
+            padding: 10px 12px;
+            min-height: 118px;
+        }
+        .metric-card-title {
+            font-size: 21px;
+            font-weight: 800;
+            color: #1E3D47;
+            line-height: 1.25;
+        }
+        .metric-card-value {
+            font-size: 33px;
+            font-weight: 800;
+            color: #2C3A3F;
+            margin-top: 2px;
+            line-height: 1.15;
+        }
+        .metric-card-delta {
+            font-size: 20px;
+            font-weight: 800;
+            margin-top: 3px;
+            color: #1F3942;
+        }
+        .metric-card-delta.pos {
+            color: #1F8A4C;
+            border-left: 4px solid #1F8A4C;
+            padding-left: 8px;
+        }
+        .metric-card-delta.neg {
+            color: #BE3D37;
+            border-left: 4px solid #BE3D37;
+            padding-left: 8px;
+        }
+        .metric-card-delta.neutral {
+            color: #1F3942;
+            border-left: 4px solid #6F8792;
+            padding-left: 8px;
+        }
         div[data-testid="stMetric"] {
             background: rgba(255, 255, 255, 0.7);
             border: 1px solid rgba(52, 103, 115, 0.15);
             border-radius: 12px;
-            padding: 8px 10px;
+            padding: 10px 12px;
         }
         div[data-testid="stMetric"] label,
         div[data-testid="stMetric"] div {
             color: #2C3A3F !important;
+        }
+        div[data-testid="stMetricLabel"] *,
+        div[data-testid="stMetricLabel"] label {
+            font-size: 21px !important;
+            font-weight: 700 !important;
+        }
+        div[data-testid="stMetricLabel"] p,
+        div[data-testid="stMetricLabel"] div,
+        div[data-testid="stMetricLabel"] span {
+            font-size: 21px !important;
+            font-weight: 700 !important;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 33px !important;
+            font-weight: 700 !important;
+            line-height: 1.2 !important;
+        }
+        div[data-testid="stMetricDelta"] {
+            font-size: 20px !important;
+            font-weight: 700 !important;
+        }
+        div[data-testid="stMetric"] small,
+        div[data-testid="stMetric"] p {
+            font-size: 16px !important;
         }
         h1, h2, h3 {
             font-family: 'Space Grotesk', 'Noto Sans SC', sans-serif;
@@ -821,11 +1198,13 @@ def _render_style() -> None:
             min-height: 72px;
             background: linear-gradient(135deg, #E9D8A6, #FAEDCD);
             border: 1px solid rgba(202, 103, 2, 0.18);
-            font-size: 13px;
+            font-size: 14px;
+            font-weight: 700;
         }
         .flow-item strong {
             display: block;
             margin-bottom: 6px;
+            font-size: 17px;
         }
         .workflow-chip-row {
             display: grid;
@@ -834,9 +1213,18 @@ def _render_style() -> None:
         }
         .workflow-chip {
             border-radius: 14px;
-            padding: 12px;
+            padding: 14px;
             background: rgba(255,255,255,0.82);
             border: 1px solid rgba(0, 95, 115, 0.14);
+            font-size: 17px;
+            font-weight: 700;
+            line-height: 1.45;
+        }
+        .workflow-chip strong {
+            display: block;
+            font-size: 19px;
+            font-weight: 700;
+            margin-bottom: 6px;
         }
         .mono-block {
             white-space: pre-wrap;
@@ -844,10 +1232,124 @@ def _render_style() -> None:
             line-height: 1.55;
             margin: 0;
         }
+        .metrics-bold-block {
+            font-size: 22px !important;
+            font-weight: 800 !important;
+            line-height: 1.7 !important;
+            color: #1F2F36 !important;
+        }
         .scroll-block {
-            max-height: 340px;
-            overflow-y: auto;
+            max-height: 560px;
+            overflow-y: scroll !important;
             padding-right: 6px;
+        }
+        .chart-shell-header {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            align-items: center;
+            background: #FFFFFF;
+            border: 1px solid #C8D3DE;
+            border-bottom: none;
+            border-radius: 16px 16px 0 0;
+            padding: 10px 16px 6px 16px;
+            margin-bottom: 0;
+        }
+        .chart-shell-title {
+            grid-column: 2;
+            justify-self: center;
+            font-size: 26px;
+            font-weight: 700;
+            color: #163342;
+            text-align: center;
+            line-height: 1.2;
+        }
+        .chart-shell-legend {
+            grid-column: 3;
+            justify-self: end;
+            display: flex;
+            gap: 14px;
+            align-items: center;
+            font-size: 16px;
+            font-weight: 700;
+            color: #203746;
+        }
+        .chart-shell-legend-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            white-space: nowrap;
+        }
+        .chart-shell-legend-line {
+            display: inline-block;
+            width: 18px;
+            height: 0;
+            border-top-width: 3px;
+        }
+        .chart-shell-legend-cooling {
+            border-top: 3px solid #1F77B4;
+        }
+        .chart-shell-legend-heating {
+            border-top: 3px dashed #E67E22;
+        }
+        div[data-testid="stVegaLiteChart"] {
+            background: #FFFFFF;
+            border: 1px solid #C8D3DE;
+            border-top: none;
+            border-radius: 0 0 16px 16px;
+            padding-top: 2px;
+            margin-top: 0 !important;
+        }
+        .scroll-block::-webkit-scrollbar,
+        section[data-testid="stMain"]::-webkit-scrollbar {
+            width: 11px;
+            height: 11px;
+        }
+        .scroll-block::-webkit-scrollbar-thumb,
+        section[data-testid="stMain"]::-webkit-scrollbar-thumb {
+            background: #5E6A75;
+            border-radius: 8px;
+            border: 2px solid #DDE5EB;
+        }
+        .scroll-block::-webkit-scrollbar-track,
+        section[data-testid="stMain"]::-webkit-scrollbar-track {
+            background: #DDE5EB;
+        }
+        .scroll-block {
+            scrollbar-width: auto;
+            scrollbar-color: #5E6A75 #DDE5EB;
+        }
+        section[data-testid="stMain"] {
+            scrollbar-width: auto;
+            scrollbar-color: #5E6A75 #DDE5EB;
+        }
+        div[data-testid="stAlert"] {
+            background: #EAF2F8 !important;
+            border: 1px solid #8FB3CC !important;
+            border-radius: 10px !important;
+            color: #18435A !important;
+        }
+        div[data-testid="stAlert"] * {
+            color: #18435A !important;
+            font-size: 16px !important;
+            font-weight: 600 !important;
+        }
+        .notice-banner {
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin-top: 8px;
+            margin-bottom: 10px;
+            font-weight: 700;
+            font-size: 16px;
+        }
+        .notice-info {
+            background: #EAF2F8;
+            border: 1px solid #8FB3CC;
+            color: #18435A;
+        }
+        .notice-error {
+            background: #FCEDEC;
+            border: 1px solid #D79A96;
+            color: #8B2E28;
         }
         .metric-box {
             border-radius: 14px;
@@ -855,13 +1357,39 @@ def _render_style() -> None:
             background: rgba(255, 255, 255, 0.82);
             padding: 10px 12px;
             margin-bottom: 10px;
+            font-size: 17px;
+        }
+        .metric-box-title {
+            font-size: 22px;
+            font-weight: 800;
+            color: #1F3942;
+            line-height: 1.25;
+        }
+        .metric-box-value {
+            font-size: 32px;
+            font-weight: 800;
+            color: #1E3D47;
+            line-height: 1.2;
+            margin-top: 4px;
+        }
+        .config-card {
+            margin-top: 8px;
+            margin-bottom: 18px;
+            font-size: 17px;
+            font-weight: 700;
+            line-height: 1.55;
+        }
+        .config-card strong {
+            font-size: 19px;
+            font-weight: 700;
         }
         .status-pill {
             display: inline-block;
             border-radius: 999px;
-            padding: 4px 10px;
+            padding: 6px 12px;
             margin-right: 8px;
-            font-size: 12px;
+            font-size: 15px;
+            font-weight: 700;
             border: 1px solid #98A9AD;
             background: #F8F6F2;
             color: #274047;
@@ -876,6 +1404,105 @@ def _render_style() -> None:
             background: #FCEDEC;
             color: #9E2F2A;
         }
+        .best-workflow-banner {
+            background: #EAF2F8;
+            border: 1px solid #8FB3CC;
+            color: #18435A;
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin-top: 8px;
+            margin-bottom: 10px;
+            font-weight: 700;
+            font-size: 17px;
+        }
+        .workflow-best-summary {
+            font-size: 17px;
+            font-weight: 700;
+            line-height: 1.6;
+        }
+        .glass strong {
+            font-size: 19px;
+        }
+        .glass {
+            font-size: 16px;
+        }
+        div[data-testid="stDataFrame"] [role="columnheader"],
+        div[data-testid="stDataFrame"] [role="gridcell"] {
+            justify-content: flex-start !important;
+            text-align: left !important;
+        }
+        div[data-testid="stDataFrame"] [data-testid="stDataFrameResizable"] {
+            justify-content: flex-start !important;
+        }
+        div[data-testid="stDataFrame"] [role="gridcell"] > div,
+        div[data-testid="stDataFrame"] [role="columnheader"] > div {
+            text-align: left !important;
+            justify-content: flex-start !important;
+        }
+        div[data-testid="stDataFrame"] [role="gridcell"],
+        div[data-testid="stDataFrame"] [role="columnheader"],
+        div[data-testid="stDataFrame"] [role="gridcell"] *,
+        div[data-testid="stDataFrame"] [role="columnheader"] * {
+            font-size: 16px !important;
+            font-weight: 700 !important;
+            color: #1F2F36 !important;
+        }
+        div[data-testid="stDataFrame"] [role="columnheader"] {
+            background: #EAF2F8 !important;
+        }
+        div[data-testid="stDataFrame"] [role="gridcell"] {
+            background: #FFFFFF !important;
+        }
+        div[data-testid="stTable"] table,
+        div[data-testid="stTable"] th,
+        div[data-testid="stTable"] td,
+        .stTable table,
+        .stTable th,
+        .stTable td {
+            color: #1F2F36 !important;
+            background: #FFFFFF !important;
+            text-align: left !important;
+            font-size: 17px !important;
+            font-weight: 800 !important;
+        }
+        div[data-testid="stTable"] th,
+        .stTable th {
+            background: #EAF2F8 !important;
+        }
+        .progress-round-label {
+            font-size: 20px;
+            font-weight: 800;
+            color: #1E3D47;
+            margin-bottom: 6px;
+        }
+        .table-wrap {
+            margin-top: 14px;
+            overflow-x: auto;
+        }
+        .table-wrap .custom-html-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #FFFFFF;
+            border: 1px solid #D6E0E8;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .table-wrap .custom-html-table th,
+        .table-wrap .custom-html-table td {
+            text-align: left;
+            font-size: 22px;
+            font-weight: 800;
+            color: #1F2F36;
+            padding: 10px 12px;
+            border-bottom: 1px solid #E2E8EE;
+            white-space: nowrap;
+        }
+        .table-wrap .custom-html-table th {
+            background: #EAF2F8;
+        }
+        .table-wrap .custom-html-table tbody tr:nth-child(even) {
+            background: #F8FBFD;
+        }
         @media (max-width: 900px) {
             .flow-grid {
                 grid-template-columns: repeat(2, 1fr);
@@ -887,9 +1514,66 @@ def _render_style() -> None:
     )
 
 
+def _render_number_input_focus_fix() -> None:
+    components.html(
+        """
+        <script>
+        (function () {
+            const parentDoc = (window.parent && window.parent.document) ? window.parent.document : document;
+            if (!parentDoc || !parentDoc.body) {
+                return;
+            }
+
+            const guardAttr = "data-numinput-autoblur";
+            if (parentDoc.body.getAttribute(guardAttr) === "1") {
+                return;
+            }
+            parentDoc.body.setAttribute(guardAttr, "1");
+
+            const isNumberInputNode = (node) => {
+                return !!(node && node.closest && node.closest('[data-testid="stNumberInput"]'));
+            };
+
+            const blurIfNeeded = () => {
+                const active = parentDoc.activeElement;
+                if (isNumberInputNode(active) && typeof active.blur === "function") {
+                    active.blur();
+                }
+            };
+
+            const onPointerRelease = (event) => {
+                if (!isNumberInputNode(event.target)) {
+                    return;
+                }
+                window.setTimeout(blurIfNeeded, 0);
+            };
+
+            const onKeyConfirm = (event) => {
+                if (event.key !== "Enter" && event.key !== " ") {
+                    return;
+                }
+                if (!isNumberInputNode(event.target)) {
+                    return;
+                }
+                window.setTimeout(blurIfNeeded, 0);
+            };
+
+            parentDoc.addEventListener("pointerup", onPointerRelease, true);
+            parentDoc.addEventListener("mouseup", onPointerRelease, true);
+            parentDoc.addEventListener("touchend", onPointerRelease, true);
+            parentDoc.addEventListener("keydown", onKeyConfirm, true);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def _render_workflow_overview(snapshot: dict[str, Any]) -> None:
     cards = []
-    for workflow_id, workflow in sorted((snapshot.get("workflows") or {}).items()):
+    workflows = snapshot.get("workflows") or {}
+    for workflow_id in _visible_workflow_ids(snapshot):
+        workflow = workflows.get(workflow_id, {})
         current_iteration = int(workflow.get("current_iteration", 0) or 0)
         max_iterations = int(workflow.get("max_iterations", 0) or 0)
         progress_pct = int((float(workflow.get("progress", 0.0) or 0.0)) * 100)
@@ -925,13 +1609,20 @@ def _render_workflow_best_section(workflow_id: str, workflow_snapshot: dict[str,
 
     best_metrics = _best_metrics_from_history(workflow_snapshot) or {}
     best_idf = _best_idf_from_history(workflow_snapshot, best_iteration)
-    summary_payload = _pick_iteration_payload(workflow_snapshot.get("summary_history", []) or [], best_iteration)
     details_payload = workflow_snapshot.get("latest_parameter_details")
+    history = workflow_snapshot.get("iteration_history", []) or []
+    baseline_metrics = (history[0].get("metrics", {}) if history else {})
+
+    def _pct_str(best_value: float, baseline_value: float) -> str:
+        baseline_num = float(baseline_value or 0)
+        best_num = float(best_value or 0)
+        pct = ((baseline_num - best_num) / baseline_num * 100.0) if baseline_num else 0.0
+        return f"{pct:+.2f}%"
 
     st.markdown("### 当前工作流最优结果")
     st.markdown(
         f"""
-        <div class='glass'>
+        <div class='glass workflow-best-summary'>
             <strong>{workflow_id} 最优轮次：</strong> 第 {best_iteration} 轮<br/>
             <strong>最优IDF路径：</strong> {html.escape(str(best_idf or '-'))}
         </div>
@@ -941,20 +1632,41 @@ def _render_workflow_best_section(workflow_id: str, workflow_snapshot: dict[str,
 
     if best_metrics:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("最优总建筑能耗(kWh)", f"{float(best_metrics.get('total_site_energy_kwh', 0) or 0):.2f}")
-        c2.metric("最优EUI(kWh/m²)", f"{float(best_metrics.get('eui_kwh_per_m2', 0) or 0):.2f}")
-        c3.metric("最优制冷能耗(kWh/m²)", f"{float(best_metrics.get('total_cooling_kwh', 0) or 0):.4f}")
-        c4.metric("最优供暖能耗(kWh/m²)", f"{float(best_metrics.get('total_heating_kwh', 0) or 0):.4f}")
+        with c1:
+            _render_metric_card(
+                "最优总建筑能耗(kWh)",
+                f"{float(best_metrics.get('total_site_energy_kwh', 0) or 0):.2f}",
+                _pct_str(best_metrics.get('total_site_energy_kwh', 0), baseline_metrics.get('total_site_energy_kwh', 0)),
+            )
+        with c2:
+            _render_metric_card(
+                "最优EUI(kWh/m²)",
+                f"{float(best_metrics.get('eui_kwh_per_m2', 0) or 0):.2f}",
+                _pct_str(best_metrics.get('eui_kwh_per_m2', 0), baseline_metrics.get('eui_kwh_per_m2', 0)),
+            )
+        with c3:
+            _render_metric_card(
+                "最优制冷能耗(kWh/m²)",
+                f"{float(best_metrics.get('total_cooling_kwh', 0) or 0):.4f}",
+                _pct_str(best_metrics.get('total_cooling_kwh', 0), baseline_metrics.get('total_cooling_kwh', 0)),
+            )
+        with c4:
+            _render_metric_card(
+                "最优供暖能耗(kWh/m²)",
+                f"{float(best_metrics.get('total_heating_kwh', 0) or 0):.4f}",
+                _pct_str(best_metrics.get('total_heating_kwh', 0), baseline_metrics.get('total_heating_kwh', 0)),
+            )
 
-    _render_text_panel("最优轮次对应修改摘要", summary_payload, "当前还没有抓取到最优轮次的修改摘要。")
     _render_text_panel("本工作流最终参数修改详情", details_payload, "当前还没有抓取到本工作流最终参数修改详情。")
 
 
 def _render_summary_page(snapshot: dict[str, Any]) -> None:
     st.subheader("汇总")
-    workflows = snapshot.get("workflows") or {}
+    all_workflows = snapshot.get("workflows") or {}
+    visible_ids = _visible_workflow_ids(snapshot)
+    workflows = {workflow_id: all_workflows.get(workflow_id, {}) for workflow_id in visible_ids}
     if not workflows:
-        st.info("暂无可汇总数据。")
+        _render_notice("暂无可汇总数据。")
         return
 
     rows = []
@@ -983,7 +1695,7 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
 
     summary_df = pd.DataFrame(rows)
     if summary_df.empty:
-        st.info("暂无可汇总数据。")
+        _render_notice("暂无可汇总数据。")
         return
 
     valid_rows = []
@@ -998,34 +1710,48 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
         global_best_workflow = min(valid_rows, key=lambda item: item[1])[0]
 
     if global_best_workflow:
-        summary_df["最优标识"] = summary_df["工作流"].apply(lambda wf: "✅" if wf == global_best_workflow else "")
+        summary_df["全局最佳标识"] = summary_df["工作流"].apply(lambda wf: "✅" if wf == global_best_workflow else "")
     else:
-        summary_df["最优标识"] = ""
+        summary_df["全局最佳标识"] = ""
+
+    summary_df = summary_df[
+        [
+            "工作流",
+            "最优轮次",
+            "总建筑能耗(kWh)",
+            "EUI(kWh/m²)",
+            "制冷能耗(kWh/m²)",
+            "供暖能耗(kWh/m²)",
+            "全局最佳标识",
+        ]
+    ]
 
     st.markdown("### 各工作流最优轮次对比")
-    st.dataframe(summary_df, width="stretch", hide_index=True)
+    summary_display_df = _stringify_dataframe(summary_df)
+    _render_html_table(summary_display_df)
 
     if global_best_workflow:
-        st.success(f"全局最佳工作流：{global_best_workflow}")
+        st.markdown(f"<div class='best-workflow-banner'>全局最佳工作流：{global_best_workflow}</div>", unsafe_allow_html=True)
         workflow_snapshot = workflows.get(global_best_workflow, {})
         _render_workflow_best_section(global_best_workflow, workflow_snapshot)
     else:
-        st.info("尚无法判断全局最佳工作流（可能仍在运行初期）。")
+        _render_notice("尚无法判断全局最佳工作流（可能仍在运行初期）。")
 
 
 def _render_iteration_buttons(selected_workflow: str, workflow_snapshot: dict[str, Any], selected_iteration: int | None) -> int | None:
     max_iterations = int(workflow_snapshot.get("max_iterations", 0) or 0)
     current_iteration = int(workflow_snapshot.get("current_iteration", 0) or 0)
-    if max_iterations <= 0:
+    if max_iterations < 0:
         return selected_iteration
 
     st.markdown("### 迭代轮次切换")
-    cols = st.columns(max_iterations)
+    total_buttons = max_iterations + 1  # 包含第0轮基准
+    cols = st.columns(total_buttons)
     result = selected_iteration
-    for i in range(1, max_iterations + 1):
+    for i in range(0, total_buttons):
         done = i <= current_iteration
         label = f"{'🔵' if done else '🔴'} {i}"
-        with cols[i - 1]:
+        with cols[i]:
             clicked = st.button(
                 label,
                 key=f"iter_btn_{selected_workflow}_{i}",
@@ -1040,7 +1766,7 @@ def _render_iteration_buttons(selected_workflow: str, workflow_snapshot: dict[st
                     web_state["last_ui_action_ts"] = time.time()
 
     st.markdown(
-        "<div style='margin-top:6px'><span class='status-pill done'>🔵 已产生该轮数据</span><span class='status-pill pending'>🔴 尚未到该轮</span></div>",
+        "<div style='margin-top:6px'><span class='status-pill done'>🔵 已产生该轮数据（第0轮为基准模拟）</span><span class='status-pill pending'>🔴 尚未到该轮</span></div>",
         unsafe_allow_html=True,
     )
     return result
@@ -1064,9 +1790,9 @@ def _render_plan_metrics_panel(payload: dict[str, Any] | None) -> None:
     if not lines and payload.get("line"):
         lines.append(str(payload["line"]))
 
-    content = html.escape("\n".join(lines))
+    content = "<br/>".join(html.escape(line) for line in lines)
     st.caption(f"更新时间 {payload.get('updated_at', '-')} | 第{payload.get('iteration', 0)}轮")
-    st.markdown(f"<div class='glass'><pre class='mono-block'>{content}</pre></div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='glass metrics-bold-block'>{content}</div>", unsafe_allow_html=True)
 
 
 def _render_round_stats_panel(payload: dict[str, Any] | None) -> None:
@@ -1081,8 +1807,8 @@ def _render_round_stats_panel(payload: dict[str, Any] | None) -> None:
     st.markdown(
         """
         <div class='glass'>
-            <div class='metric-box'><strong>修改对象总数</strong><br/>{obj}</div>
-            <div class='metric-box'><strong>修改字段总数</strong><br/>{field}</div>
+            <div class='metric-box'><div class='metric-box-title'>修改对象总数</div><div class='metric-box-value'>{obj}</div></div>
+            <div class='metric-box'><div class='metric-box-title'>修改字段总数</div><div class='metric-box-value'>{field}</div></div>
         </div>
         """.format(
             obj=(obj_count if obj_count is not None else "-"),
@@ -1090,6 +1816,18 @@ def _render_round_stats_panel(payload: dict[str, Any] | None) -> None:
         ),
         unsafe_allow_html=True,
     )
+
+
+def _render_baseline_panel(workflow_snapshot: dict[str, Any]) -> None:
+    st.markdown("### 第0轮（基准模拟）")
+    baseline_payload = workflow_snapshot.get("baseline_log")
+    if not baseline_payload or not baseline_payload.get("text"):
+        st.markdown("<div class='glass'>等待基准模拟日志输出（initial_baseline）。</div>", unsafe_allow_html=True)
+        return
+
+    content = html.escape(str(baseline_payload.get("text", "")))
+    st.caption(f"更新时间 {baseline_payload.get('updated_at', '-')} | 第0轮")
+    st.markdown(f"<div class='glass scroll-block'><pre class='mono-block'>{content}</pre></div>", unsafe_allow_html=True)
 
 
 def _pick_iteration_payload(history: list[dict[str, Any]], iteration: int) -> dict[str, Any] | None:
@@ -1109,13 +1847,13 @@ def _save_uploaded_file(uploaded_file, save_dir: str) -> str:
 
 def _render_runtime_hint(status: str, workflow_snapshot: dict[str, Any]) -> None:
     if status == "idle":
-        st.info("等待启动：请先上传 IDF 与 API 文件，然后点击启动按钮。")
+        _render_notice("等待启动：请先上传 IDF 与 API 文件，然后点击启动按钮。")
         return
     if status == "starting":
-        st.info("准备中：正在初始化并行工作流与日志捕获。")
+        _render_notice("准备中：正在初始化并行工作流与日志捕获。")
         return
     if status == "error":
-        st.error("运行中断：可查看上方错误信息并重新启动。")
+        _render_notice("运行中断：可查看上方错误信息并重新启动。", kind="error")
         return
 
     current_iteration = int(workflow_snapshot.get("current_iteration", 0) or 0)
@@ -1124,9 +1862,9 @@ def _render_runtime_hint(status: str, workflow_snapshot: dict[str, Any]) -> None
     status_time = workflow_snapshot.get("status_updated_at")
     prefix = f"第 {current_iteration}/{max_iterations} 轮"
     if status_time:
-        st.info(f"{prefix} | {latest_status} | 更新时间 {status_time}")
+        _render_notice(f"{prefix} | {latest_status} | 更新时间 {status_time}")
     else:
-        st.info(f"{prefix} | {latest_status}")
+        _render_notice(f"{prefix} | {latest_status}")
 
 
 def _init_page_state() -> None:
@@ -1140,6 +1878,7 @@ def _init_page_state() -> None:
             "uploaded_idf": None,
             "uploaded_api": None,
             "last_ui_action_ts": 0.0,
+            "auto_summary_marker": None,
         }
 
 
@@ -1147,6 +1886,7 @@ def main() -> None:
     st.set_page_config(page_title="EnergyPlus 并行工作流可视化", layout="wide")
     _init_page_state()
     _render_style()
+    _render_number_input_focus_fix()
 
     page_state = st.session_state["web_ui_state"]
     snapshot = _read_snapshot(page_state.get("snapshot_path"))
@@ -1159,7 +1899,7 @@ def main() -> None:
     st.markdown(
         """
         <div class='glass'>
-            <strong>这套页面会完整呈现原始工作流：</strong>
+            <strong>工作流运行逻辑：</strong>
             <div class='flow-grid'>
                 <div class='flow-item'><strong>1. 基准模拟</strong>以初始 IDF 运行 EnergyPlus，得到第一轮基线结果。</div>
                 <div class='flow-item'><strong>2. 指标提取</strong>读取模拟输出，提取总能耗、EUI、制冷、供暖等关键指标。</div>
@@ -1174,7 +1914,7 @@ def main() -> None:
     )
 
     with st.expander("运行配置与说明", expanded=(status == "idle")):
-        st.info("上传 IDF 和 API 文件后，可自行设置工作流数量与迭代次数；其余配置保持默认逻辑。")
+        _render_notice("第0轮为基准模拟（不做优化）；设置的轮次为优化轮次。例如填写5，将执行 1次基准模拟 + 5次优化。")
         col_left, col_right = st.columns(2)
         with col_left:
             uploaded_idf = st.file_uploader("上传 IDF 模型文件", type=["idf"], key="idf_uploader", help="必填。上传后将自动复制到运行目录，不改动原始算法逻辑。")
@@ -1189,20 +1929,22 @@ def main() -> None:
                 max_value=10,
                 value=int(snapshot.get("config", {}).get("num_workflows", DEFAULT_NUM_WORKFLOWS) or DEFAULT_NUM_WORKFLOWS),
                 step=1,
+                key="cfg_num_workflows",
             )
         with col_cfg_2:
-            max_iterations = st.number_input(
-                "最大迭代轮次",
-                min_value=2,
+            optimization_rounds = st.number_input(
+                "优化轮次（不含第0轮基准）",
+                min_value=1,
                 max_value=30,
-                value=int(snapshot.get("config", {}).get("max_iterations", DEFAULT_MAX_ITERATIONS) or DEFAULT_MAX_ITERATIONS),
+                value=int(snapshot.get("config", {}).get("optimization_rounds", DEFAULT_MAX_ITERATIONS) or DEFAULT_MAX_ITERATIONS),
                 step=1,
+                key="cfg_optimization_rounds",
             )
 
         st.markdown(
             f"""
-            <div class='glass'>
-                <strong>固定配置（保持默认逻辑）</strong><br/>
+            <div class='glass config-card'>
+                <strong>固定配置</strong><br/>
                 IDD: {DEFAULT_IDD_PATH}<br/>
                 EPW: {DEFAULT_EPW_PATH}<br/>
                 日志目录: {DEFAULT_LOG_DIR}
@@ -1211,10 +1953,12 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
+        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+
         start_disabled = running or (page_state.get("runner_thread") is not None and page_state["runner_thread"].is_alive())
         if st.button("启动并行优化并实时可视化", type="primary", disabled=start_disabled):
             if not uploaded_idf or not uploaded_api:
-                st.error("请先上传 IDF 文件和 API Key 文件。")
+                _render_notice("请先上传 IDF 文件和 API Key 文件。", kind="error")
                 return
 
             os.makedirs(RUNTIME_DIR, exist_ok=True)
@@ -1229,7 +1973,8 @@ def main() -> None:
                 "api_key_path": api_key_path,
                 "epw_path": DEFAULT_EPW_PATH,
                 "log_dir": DEFAULT_LOG_DIR,
-                "max_iterations": int(max_iterations),
+                "max_iterations": int(optimization_rounds) + 1,
+                "optimization_rounds": int(optimization_rounds),
                 "num_workflows": int(num_workflows),
             }
             runtime_state = {"status": "starting", "started_at": None, "finished_at": None, "error": None}
@@ -1248,25 +1993,36 @@ def main() -> None:
 
     top1, top2, top3, top4 = st.columns(4)
     status_map = {"idle": "未运行", "starting": "准备中", "running": "运行中", "finished": "已完成", "error": "异常中断"}
-    top1.metric("当前状态", status_map.get(status, status))
-    top2.metric("开始时间", snapshot.get("started_at") or "-")
-    top3.metric("结束时间", snapshot.get("finished_at") or "-")
-    top4.metric("当前工作流数", str(snapshot.get("config", {}).get("num_workflows", 0)))
+    with top1:
+        _render_metric_card("当前状态", status_map.get(status, status))
+    with top2:
+        _render_metric_card("开始时间", str(snapshot.get("started_at") or "-"))
+    with top3:
+        _render_metric_card("结束时间", str(snapshot.get("finished_at") or "-"))
+    with top4:
+        _render_metric_card("当前工作流数", str(snapshot.get("config", {}).get("num_workflows", 0)))
 
     if snapshot.get("error"):
-        st.error(f"运行失败：{snapshot['error']}")
+        _render_notice(f"运行失败：{snapshot['error']}", kind="error")
 
     st.markdown("### 工作流总览")
     _render_workflow_overview(snapshot)
 
-    workflow_keys = sorted((snapshot.get("workflows") or {}).keys())
+    workflow_keys = _visible_workflow_ids(snapshot)
     if not workflow_keys:
-        st.info("点击上方按钮后，页面会实时显示每条工作流的推理过程、修改摘要、进度和能耗曲线。")
+        _render_notice("点击上方按钮后，页面会实时显示每条工作流的推理过程、修改摘要、进度和能耗曲线。")
         return
 
     view_options = list(workflow_keys)
     if status in {"finished", "error"}:
         view_options.append("summary")
+
+    if status in {"finished", "error"} and "summary" in view_options:
+        finish_marker = snapshot.get("finished_at") or status
+        if page_state.get("auto_summary_marker") != finish_marker:
+            page_state["selected_view"] = "summary"
+            page_state["auto_summary_marker"] = finish_marker
+
     if page_state.get("selected_view") not in view_options:
         page_state["selected_view"] = workflow_keys[0]
 
@@ -1283,8 +2039,8 @@ def main() -> None:
 
     if page_state.get("selected_view") == "summary":
         _render_summary_page(snapshot)
-        if running and (time.time() - float(page_state.get("last_ui_action_ts", 0.0) or 0.0) > 1.2):
-            time.sleep(0.8)
+        if running:
+            time.sleep(AUTO_REFRESH_SECONDS)
             st.rerun()
         return
 
@@ -1295,7 +2051,9 @@ def main() -> None:
     workflow_snapshot = (snapshot.get("workflows") or {}).get(selected_workflow, {}) or {}
 
     st.subheader(f"当前查看：{selected_workflow}")
-    st.progress(min(max(float(workflow_snapshot.get("progress", 0.0) or 0.0), 0.0), 1.0), text=f"第 {workflow_snapshot.get('current_iteration', 0)}/{workflow_snapshot.get('max_iterations', 0)} 轮")
+    round_text = f"第 {workflow_snapshot.get('current_iteration', 0)}/{workflow_snapshot.get('max_iterations', 0)} 轮"
+    st.markdown(f"<div class='progress-round-label'>{html.escape(round_text)}</div>", unsafe_allow_html=True)
+    st.progress(min(max(float(workflow_snapshot.get("progress", 0.0) or 0.0), 0.0), 1.0))
 
     _render_runtime_hint(status, workflow_snapshot)
 
@@ -1304,17 +2062,19 @@ def main() -> None:
     plan_metrics_history = workflow_snapshot.get("plan_metrics_history", []) or []
     round_stats_history = workflow_snapshot.get("round_stats_history", []) or []
     parameter_details_history = workflow_snapshot.get("parameter_details_history", []) or []
+    baseline_log_history = workflow_snapshot.get("baseline_log_history", []) or []
     history_iterations = sorted(
         {
             int(item.get("iteration", 0) or 0)
-            for item in reasoning_history + summary_history + plan_metrics_history + round_stats_history + parameter_details_history
-            if int(item.get("iteration", 0) or 0) > 0
+            for item in reasoning_history + summary_history + plan_metrics_history + round_stats_history + parameter_details_history + baseline_log_history
+            if int(item.get("iteration", 0) or 0) >= 0
         }
     )
 
     if not history_iterations:
-        history_iterations = sorted({int(item.get("iteration", 0) or 0) for item in workflow_snapshot.get("iteration_history", []) if int(item.get("iteration", 0) or 0) > 0})
+        history_iterations = sorted({int(item.get("iteration", 0) or 0) for item in workflow_snapshot.get("iteration_history", []) if int(item.get("iteration", 0) or 0) >= 0})
 
+    selected_iteration = 0
     if history_iterations:
         iteration_key = f"iter_pick_{selected_workflow}"
         if iteration_key not in st.session_state or int(st.session_state[iteration_key]) not in history_iterations:
@@ -1334,50 +2094,73 @@ def main() -> None:
         selected_plan_metrics = _pick_iteration_payload(plan_metrics_history, int(selected_iteration))
         selected_round_stats = _pick_iteration_payload(round_stats_history, int(selected_iteration))
         selected_parameter_details = _pick_iteration_payload(parameter_details_history, int(selected_iteration))
+        selected_baseline_log = _pick_iteration_payload(baseline_log_history, int(selected_iteration))
     else:
         selected_reasoning = workflow_snapshot.get("latest_reasoning")
         selected_summary = workflow_snapshot.get("latest_summary")
         selected_plan_metrics = workflow_snapshot.get("latest_plan_metrics")
         selected_round_stats = workflow_snapshot.get("latest_round_stats")
         selected_parameter_details = workflow_snapshot.get("latest_parameter_details")
+        selected_baseline_log = workflow_snapshot.get("baseline_log")
 
-    _render_text_panel("LLM推理过程", selected_reasoning, "等待当前工作流产出最终采用的 LLM 推理过程。", numbered=True)
-    _render_text_panel("修改摘要", selected_summary, "等待当前工作流产出成功执行后的修改摘要。")
-    metrics_left, metrics_right = st.columns(2)
-    with metrics_left:
-        _render_plan_metrics_panel(selected_plan_metrics)
-    with metrics_right:
-        _render_round_stats_panel(selected_round_stats)
-    _render_text_panel("参数修改详情（日志可视化）", selected_parameter_details, "等待输出参数修改详情。")
+    if int(selected_iteration or 0) == 0:
+        _render_baseline_panel({"baseline_log": selected_baseline_log})
+    else:
+        _render_text_panel("LLM推理过程", selected_reasoning, "等待当前工作流产出最终采用的 LLM 推理过程。", numbered=True)
+        _render_text_panel("修改摘要", selected_summary, "等待当前工作流产出成功执行后的修改摘要。")
+        metrics_left, metrics_right = st.columns(2)
+        with metrics_left:
+            _render_plan_metrics_panel(selected_plan_metrics)
+        with metrics_right:
+            _render_round_stats_panel(selected_round_stats)
 
     iteration_history = workflow_snapshot.get("iteration_history", []) or []
     dataframe = _build_metrics_dataframe(iteration_history)
 
-    st.markdown("### 实时可视化曲线（仅供冷/供暖）")
-    progressive_chart = _build_progressive_curve(dataframe, selected_workflow)
-    if progressive_chart is not None:
-        chart_col, _ = st.columns([5, 5])
-        with chart_col:
-            st.altair_chart(progressive_chart, width='content')
-    else:
-        st.info("当前还没有可绘制的制冷/供暖迭代数据。")
+    if status != "idle":
+        progressive_chart = _build_progressive_curve(dataframe, selected_workflow)
+        if progressive_chart is not None:
+            st.markdown("### 实时可视化曲线（仅供冷/供暖）")
+            st.markdown(
+                f"""
+                <div class='chart-shell-header'>
+                    <div></div>
+                    <div class='chart-shell-title'>{html.escape(selected_workflow)} 冷暖能耗迭代曲线</div>
+                    <div class='chart-shell-legend'>
+                        <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-cooling'></span>制冷能耗</span>
+                        <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-heating'></span>供暖能耗</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.altair_chart(progressive_chart, width='stretch')
+        elif running:
+            _render_notice("正在准备曲线图数据，生成后会自动显示完整图像。")
 
     st.markdown("### 各项能耗指标与节能变化")
     if dataframe.empty:
-        st.info("第一轮模拟完成后，这里会自动出现四个核心指标数据。")
+        _render_notice("第一轮模拟完成后，这里会自动出现四个核心指标数据。")
     else:
-        latest = dataframe.iloc[-1]
+        selected_rows = dataframe[dataframe["轮次"] == int(selected_iteration or 0)]
+        current_row = selected_rows.iloc[-1] if not selected_rows.empty else dataframe.iloc[-1]
+        best_iteration = _pick_best_iteration(workflow_snapshot)
         metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-        metric_1.metric("总建筑能耗(kWh)", f"{latest['总建筑能耗(kWh)']:.2f}", f"{latest['总建筑能耗节能幅度(%)']:+.2f}%")
-        metric_2.metric("EUI(kWh/m²)", f"{latest['EUI(kWh/m²)']:.2f}", f"{latest['EUI节能幅度(%)']:+.2f}%")
-        metric_3.metric("制冷能耗(kWh/m²)", f"{latest['制冷能耗(kWh/m²)']:.2f}", f"{latest['制冷节能幅度(%)']:+.2f}%")
-        metric_4.metric("供暖能耗(kWh/m²)", f"{latest['供暖能耗(kWh/m²)']:.2f}", f"{latest['供暖节能幅度(%)']:+.2f}%")
+        with metric_1:
+            _render_metric_card("总建筑能耗(kWh)", f"{current_row['总建筑能耗(kWh)']:.2f}", f"{current_row['总建筑能耗节能幅度(%)']:+.2f}%")
+        with metric_2:
+            _render_metric_card("EUI(kWh/m²)", f"{current_row['EUI(kWh/m²)']:.2f}", f"{current_row['EUI节能幅度(%)']:+.2f}%")
+        with metric_3:
+            _render_metric_card("制冷能耗(kWh/m²)", f"{current_row['制冷能耗(kWh/m²)']:.2f}", f"{current_row['制冷节能幅度(%)']:+.2f}%")
+        with metric_4:
+            _render_metric_card("供暖能耗(kWh/m²)", f"{current_row['供暖能耗(kWh/m²)']:.2f}", f"{current_row['供暖节能幅度(%)']:+.2f}%")
 
         display_df = dataframe.copy()
         display_df["总建筑能耗(含节能幅度)"] = display_df.apply(lambda row: f"{row['总建筑能耗(kWh)']:.2f} ({row['总建筑能耗节能幅度(%)']:+.2f}%)", axis=1)
         display_df["EUI(含节能幅度)"] = display_df.apply(lambda row: f"{row['EUI(kWh/m²)']:.2f} ({row['EUI节能幅度(%)']:+.2f}%)", axis=1)
         display_df["制冷能耗(含节能幅度)"] = display_df.apply(lambda row: f"{row['制冷能耗(kWh/m²)']:.2f} ({row['制冷节能幅度(%)']:+.2f}%)", axis=1)
         display_df["供暖能耗(含节能幅度)"] = display_df.apply(lambda row: f"{row['供暖能耗(kWh/m²)']:.2f} ({row['供暖节能幅度(%)']:+.2f}%)", axis=1)
+        display_df["最优迭代标识"] = display_df["轮次"].apply(lambda value: "✅" if int(value) == int(best_iteration) else "")
         display_df = display_df[
             [
                 "轮次",
@@ -1385,6 +2168,7 @@ def main() -> None:
                 "EUI(含节能幅度)",
                 "制冷能耗(含节能幅度)",
                 "供暖能耗(含节能幅度)",
+                "最优迭代标识",
             ]
         ]
         number_columns = [column for column in display_df.columns if column != "轮次"]
@@ -1392,11 +2176,12 @@ def main() -> None:
             for column in number_columns:
                 if pd.api.types.is_numeric_dtype(display_df[column]):
                     display_df[column] = display_df[column].round(4)
-        st.dataframe(display_df, width='stretch', hide_index=True)
+        display_df = _stringify_dataframe(display_df)
+        _render_html_table(display_df)
 
     _render_workflow_best_section(selected_workflow, workflow_snapshot)
 
-    if running and (time.time() - float(page_state.get("last_ui_action_ts", 0.0) or 0.0) > UI_ACTION_COOLDOWN_SECONDS):
+    if running:
         time.sleep(AUTO_REFRESH_SECONDS)
         st.rerun()
 
