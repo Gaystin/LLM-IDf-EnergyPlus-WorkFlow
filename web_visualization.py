@@ -35,6 +35,7 @@ DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_NUM_WORKFLOWS = 2
 AUTO_REFRESH_SECONDS = 1.0
 UI_ACTION_COOLDOWN_SECONDS = 3.0
+WORKFLOW_PALETTE = ["#1F77B4", "#E67E22", "#2A9D8F", "#C8553D", "#7A5CFA", "#6C8A2B"]
 
 
 def _real_to_display_iteration(real_iteration: int) -> int:
@@ -69,6 +70,15 @@ def _build_default_capture_state() -> dict[str, Any]:
         "parameter_detail_lines": [],
         "collecting_baseline_log": False,
         "baseline_log_lines": [],
+    }
+
+
+def _build_global_capture_state() -> dict[str, Any]:
+    return {
+        "summary_log": None,
+        "summary_log_lines": [],
+        "updated_at": None,
+        "collecting_summary_log": False,
     }
 
 
@@ -118,6 +128,7 @@ def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "i
             "optimization_rounds": optimization_rounds,
             "num_workflows": num_workflows,
         },
+        "global_summary_log": None,
         "workflows": workflows,
     }
 
@@ -168,6 +179,83 @@ def _read_snapshot(snapshot_path: str | None) -> dict[str, Any]:
         return _build_empty_snapshot()
     with open(snapshot_path, "r", encoding="utf-8") as file_obj:
         return json.load(file_obj)
+
+
+def _fallback_global_summary_log(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    if snapshot.get("global_summary_log"):
+        return snapshot.get("global_summary_log")
+
+    config = snapshot.get("config", {}) or {}
+    log_dir = str(config.get("log_dir", DEFAULT_LOG_DIR) or DEFAULT_LOG_DIR)
+    log_dir_path = os.path.join(CURRENT_DIR, log_dir)
+    if not os.path.isdir(log_dir_path):
+        return None
+
+    candidates = [name for name in os.listdir(log_dir_path) if name.lower().endswith(".log")]
+    if not candidates:
+        return None
+
+    latest_log = max(candidates, key=lambda name: os.path.getmtime(os.path.join(log_dir_path, name)))
+    latest_log_path = os.path.join(log_dir_path, latest_log)
+
+    try:
+        with open(latest_log_path, "r", encoding="utf-8", errors="ignore") as log_file:
+            lines = [line.rstrip("\n") for line in log_file]
+    except OSError:
+        return None
+
+    if not lines:
+        return None
+
+    end_index = None
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        if "【总】" in line and "【并行优化循环完成】" in line:
+            end_index = index
+            break
+
+    if end_index is None:
+        return None
+
+    start_index = None
+    for index in range(end_index, -1, -1):
+        line = lines[index]
+        if "【总】" in line and "【Token使用统计】" in line:
+            start_index = max(0, index - 1)
+            break
+
+    if start_index is None:
+        for index in range(end_index, -1, -1):
+            line = lines[index]
+            if "【总】" in line and "【全局耗时统计】" in line:
+                start_index = max(0, index - 1)
+                break
+
+    if start_index is None:
+        for index in range(end_index, -1, -1):
+            line = lines[index]
+            if "【总】" in line and ("并行流程总耗时" in line or "总Token消耗" in line):
+                start_index = max(0, index - 1)
+                break
+
+    if start_index is None:
+        return None
+
+    block_lines = lines[start_index : end_index + 1]
+    if not any("总Token消耗" in line for line in block_lines):
+        return None
+
+    updated_at = datetime.now().strftime("%H:%M:%S")
+    for line in reversed(block_lines):
+        timestamp_match = re.match(r"^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", line)
+        if timestamp_match:
+            updated_at = timestamp_match.group(1).split(" ", 1)[1]
+            break
+
+    return {
+        "updated_at": updated_at,
+        "text": _normalize_timestamp_log_lines("\n".join(block_lines)),
+    }
 
 
 def _clean_summary_lines(lines: list[str]) -> str:
@@ -393,6 +481,17 @@ def _compose_snapshot(
     if not optimizer:
         return snapshot
 
+    global_capture = capture_state.get("__global__", _build_global_capture_state())
+    global_payload = global_capture.get("summary_log")
+    global_lines = global_capture.get("summary_log_lines", []) or []
+    if global_payload and global_payload.get("text"):
+        snapshot["global_summary_log"] = global_payload
+    elif global_lines:
+        snapshot["global_summary_log"] = {
+            "updated_at": global_capture.get("updated_at") or datetime.now().strftime("%H:%M:%S"),
+            "text": _normalize_timestamp_log_lines("\n".join(global_lines)),
+        }
+
     for workflow_id in sorted(optimizer.workflows.keys()):
         workflow_data = optimizer.workflows.get(workflow_id, {}) or {}
         raw_history = workflow_data.get("iteration_history", []) or []
@@ -463,6 +562,27 @@ class WebCaptureHandler(logging.Handler):
             message = record.getMessage()
         except Exception:
             return
+
+        start_global_summary = ("【Token使用统计】" in message) or ("【全局耗时统计】" in message)
+        with self.capture_lock:
+            global_state = self.capture_state.setdefault("__global__", _build_global_capture_state())
+            collecting_global_summary = bool(global_state.get("collecting_summary_log"))
+            is_global_summary_line = collecting_global_summary or ("【总】" in message and start_global_summary)
+            if start_global_summary and not collecting_global_summary:
+                global_state["collecting_summary_log"] = True
+                global_state["summary_log_lines"] = []
+                is_global_summary_line = True
+
+            if is_global_summary_line and "【总】" in message:
+                global_state.setdefault("summary_log_lines", []).extend(_format_record_lines(record, message))
+                global_state["updated_at"] = datetime.now().strftime("%H:%M:%S")
+                global_state["summary_log"] = {
+                    "updated_at": global_state["updated_at"],
+                    "text": _normalize_timestamp_log_lines("\n".join(global_state.get("summary_log_lines", []))),
+                }
+                if "【并行优化循环完成】" in message:
+                    global_state["collecting_summary_log"] = False
+                return
 
         workflow_id = self._resolve_workflow_id(record, message)
         if not workflow_id:
@@ -670,6 +790,7 @@ def _run_optimizer_in_thread(snapshot_path: str, config: dict[str, Any], runtime
         f"workflow_{index + 1}": _build_default_capture_state()
         for index in range(int(config.get("num_workflows", 2) or 2))
     }
+    capture_state["__global__"] = _build_global_capture_state()
     capture_lock = threading.Lock()
     stop_event = threading.Event()
     optimizer = None
@@ -825,6 +946,97 @@ def _build_progressive_curve(dataframe: pd.DataFrame, workflow_id: str):
             labelColor="#253946",
             titleColor="#1A2E3A",
         )
+    )
+
+
+def _build_all_workflows_progressive_curve(workflows: dict[str, dict[str, Any]]):
+    rows = []
+    for workflow_id, workflow_snapshot in sorted((workflows or {}).items()):
+        dataframe = _build_metrics_dataframe(workflow_snapshot.get("iteration_history", []) or [])
+        if dataframe.empty:
+            continue
+        for _, row in dataframe.iterrows():
+            rows.append({"工作流": workflow_id, "轮次": int(row["轮次"]), "指标": "制冷能耗", "数值": float(row["制冷能耗(kWh/m²)"])})
+            rows.append({"工作流": workflow_id, "轮次": int(row["轮次"]), "指标": "供暖能耗", "数值": float(row["供暖能耗(kWh/m²)"])})
+
+    if not rows:
+        return None
+
+    curve_df = pd.DataFrame(rows)
+    rounds = sorted({int(value) for value in curve_df["轮次"].tolist()})
+    workflow_ids = sorted({str(value) for value in curve_df["工作流"].tolist()})
+    color_range = [WORKFLOW_PALETTE[index % len(WORKFLOW_PALETTE)] for index in range(len(workflow_ids))]
+
+    return (
+        alt.Chart(curve_df)
+        .mark_line(point=alt.OverlayMarkDef(size=95, filled=True), strokeWidth=2.8)
+        .encode(
+            x=alt.X(
+                "轮次:O",
+                title="迭代轮次",
+                sort=rounds,
+                axis=alt.Axis(labelAngle=0, labelFontSize=17, titleFontSize=22, labelPadding=8, titlePadding=16, titleFontWeight="bold"),
+            ),
+            y=alt.Y(
+                "数值:Q",
+                title="能耗 (kWh/m²)",
+                axis=alt.Axis(labelFontSize=17, titleFontSize=22, labelPadding=8, titlePadding=14, tickCount=6, titleFontWeight="bold"),
+            ),
+            color=alt.Color(
+                "工作流:N",
+                scale=alt.Scale(domain=workflow_ids, range=color_range),
+                legend=None,
+            ),
+            strokeDash=alt.StrokeDash(
+                "指标:N",
+                scale=alt.Scale(domain=["制冷能耗", "供暖能耗"], range=[[1, 0], [8, 4]]),
+                legend=None,
+            ),
+            tooltip=["工作流:N", "轮次:O", "指标:N", alt.Tooltip("数值:Q", format=".4f")],
+        )
+        .properties(
+            width=1080,
+            height=460,
+            padding={"left": 24, "right": 20, "top": 8, "bottom": 20},
+        )
+        .configure(background="#FCFCFA")
+        .configure_view(strokeWidth=1, stroke="#C8D3DE", fill="#FFFFFF")
+        .configure_axis(
+            grid=True,
+            gridColor="#D2DCE6",
+            domainColor="#516575",
+            tickColor="#516575",
+            labelColor="#253946",
+            titleColor="#1A2E3A",
+        )
+    )
+
+
+def _render_summary_curve_header(workflow_ids: list[str]) -> None:
+    workflow_items = []
+    for index, workflow_id in enumerate(workflow_ids):
+        color = WORKFLOW_PALETTE[index % len(WORKFLOW_PALETTE)]
+        workflow_items.append(
+            f"<span class='chart-shell-legend-item'><span class='chart-shell-legend-swatch' style='background:{color}'></span>{html.escape(workflow_id)}</span>"
+        )
+
+    st.markdown(
+        f"""
+        <div class='chart-shell-header'>
+            <div></div>
+            <div class='chart-shell-title'>并行工作流冷暖能耗迭代曲线</div>
+            <div class='chart-shell-legend chart-shell-legend-stack'>
+                <div class='chart-shell-legend-row'>
+                    {''.join(workflow_items)}
+                </div>
+                <div class='chart-shell-legend-row'>
+                    <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-cooling'></span>制冷能耗（实线）</span>
+                    <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-heating'></span>供暖能耗（虚线）</span>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
 
@@ -1339,11 +1551,30 @@ def _render_style() -> None:
             font-weight: 700;
             color: #203746;
         }
+        .chart-shell-legend-stack {
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 6px;
+        }
+        .chart-shell-legend-row {
+            display: flex;
+            gap: 14px;
+            align-items: center;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+        }
         .chart-shell-legend-item {
             display: inline-flex;
             align-items: center;
             gap: 7px;
             white-space: nowrap;
+        }
+        .chart-shell-legend-swatch {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border-radius: 4px;
+            border: 1px solid rgba(22, 51, 66, 0.18);
         }
         .chart-shell-legend-line {
             display: inline-block;
@@ -1664,7 +1895,10 @@ def _render_text_panel(
         st.markdown(f"<div class='glass'>{placeholder}</div>", unsafe_allow_html=True)
         return
 
-    caption = f"更新时间 {payload.get('updated_at', '-')} | 第{payload.get('iteration', 0)}轮"
+    if payload.get("iteration") is None:
+        caption = f"更新时间 {payload.get('updated_at', '-')}"
+    else:
+        caption = f"更新时间 {payload.get('updated_at', '-')} | 第{payload.get('iteration', 0)}轮"
     st.caption(caption)
     text = str(payload.get("text", ""))
     if numbered:
@@ -1763,6 +1997,22 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
     if not workflows:
         _render_notice("暂无可汇总数据。")
         return
+
+    summary_curve = _build_all_workflows_progressive_curve(workflows)
+    if summary_curve is not None:
+        st.markdown("### 并行工作流汇总可视化曲线")
+        _render_summary_curve_header(sorted(workflows.keys()))
+        st.altair_chart(summary_curve, width='stretch')
+    else:
+        _render_notice("正在准备并行汇总曲线数据，生成后会自动显示完整图像。")
+
+    summary_log_payload = _fallback_global_summary_log(snapshot)
+    _render_text_panel(
+        "汇总日志",
+        summary_log_payload,
+        "等待并行汇总日志输出。",
+        normalize_log_lines=True,
+    )
 
     rows = []
     for workflow_id, workflow_snapshot in sorted(workflows.items()):
