@@ -26,6 +26,7 @@ WORKFLOW_REGEX = re.compile(r"workflow_(\d+)", flags=re.IGNORECASE)
 ROUND_REGEX = re.compile(r"【第(\d+)轮/(\d+)】")
 REASONING_HEADER_REGEX = re.compile(r"【LLM推理过程\s*-\s*(.*?)】")
 PERCENT_REGEX = re.compile(r"([+-]?\d+(?:\.\d+)?)%")
+LOG_LINE_START_REGEX = re.compile(r"(?<!\n)(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s-\s[A-Z]+\s-\s)")
 
 DEFAULT_IDD_PATH = "Energy+.idd"
 DEFAULT_EPW_PATH = "weather.epw"
@@ -238,6 +239,15 @@ def _strip_log_prefix(line: str) -> str:
     return re.sub(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s-\s[A-Z]+\s-\s", "", str(line or "")).strip()
 
 
+def _normalize_timestamp_log_lines(text: str) -> str:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = LOG_LINE_START_REGEX.sub(r"\n\1", normalized)
+    return normalized.lstrip("\n")
+
+def _split_timestamp_log_lines(text: str) -> list[str]:
+    return _normalize_timestamp_log_lines(text).split("\n")
+
+
 def _format_record_lines(record: logging.LogRecord, message: str) -> list[str]:
     ts = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
     level = str(record.levelname or "INFO").upper()
@@ -262,7 +272,55 @@ def _clean_parameter_detail_lines(lines: list[str]) -> str:
 
     while cleaned and cleaned[-1] == "":
         cleaned.pop()
-    return "\n".join(cleaned)
+    return _normalize_timestamp_log_lines("\n".join(cleaned))
+
+
+def _prepare_parameter_details_for_view(text: str, keep_total_summary_block: bool) -> str:
+    filtered: list[str] = []
+    for line in _split_timestamp_log_lines(text):
+        raw = _strip_log_prefix(line)
+        if raw == "":
+            filtered.append("")
+            continue
+
+        is_total_block_line = (
+            raw.startswith("【总】")
+            or raw.startswith("【各工作流最优能耗对比】")
+            or raw.startswith("────────────────")
+        )
+        is_global_plain_line = (
+            bool(re.match(r"^workflow_\d+\s+\d+\s+", raw))
+            or "【🏆 全局最优方案】" in raw
+            or raw.startswith("最优IDF文件:")
+        )
+
+        if keep_total_summary_block:
+            # 汇总页保留【总】块，去掉未标记【总】的全局摘要噪声行。
+            if is_global_plain_line and not raw.startswith("【总】"):
+                continue
+        else:
+            # 工作流页去掉总览块，仅保留对象修改详情与最终曲线保存行。
+            if is_total_block_line or is_global_plain_line:
+                continue
+
+        filtered.append(line)
+
+    while filtered and filtered[-1] == "":
+        filtered.pop()
+    return _normalize_timestamp_log_lines("\n".join(filtered))
+
+
+def _render_timestamp_log_block(text: str) -> None:
+    line_html = []
+    for line in _split_timestamp_log_lines(text):
+        if line == "":
+            line_html.append("<div class='mono-log-line mono-log-line-blank'>&nbsp;</div>")
+        else:
+            line_html.append(f"<div class='mono-log-line'>{html.escape(line)}</div>")
+    st.markdown(
+        f"<div class='glass scroll-block mono-log-block'>{''.join(line_html)}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _extract_int_after_label(text: str, label: str) -> int | None:
@@ -271,7 +329,7 @@ def _extract_int_after_label(text: str, label: str) -> int | None:
     if not match:
         return None
     return int(match.group(1))
-
+    return _normalize_timestamp_log_lines("\n".join(cleaned))
 
 def _parse_plan_metrics_line(message: str) -> dict[str, Any]:
     unique_fields = _extract_int_after_label(message, "字段类别")
@@ -513,13 +571,11 @@ class WebCaptureHandler(logging.Handler):
             if workflow_state.get("collecting_parameter_details"):
                 workflow_state["parameter_detail_lines"].extend(formatted_lines)
                 raw_message = _strip_log_prefix(message)
-                stop_markers = [
-                    "【计时】",
-                    "【最终汇总报告",
-                    "【全局最佳",
-                    "启动",
-                ]
-                if any(raw_message.startswith(marker) for marker in stop_markers):
+                should_finalize = (
+                    "已保存单工作流能耗曲线" in raw_message
+                    or raw_message.startswith("启动")
+                )
+                if should_finalize:
                     detail_text = _clean_parameter_detail_lines(workflow_state.get("parameter_detail_lines", []))
                     if detail_text:
                         payload = {
@@ -1229,6 +1285,19 @@ def _render_style() -> None:
             line-height: 1.55;
             margin: 0;
         }
+        .mono-log-block {
+            font-size: 13px;
+            line-height: 1.55;
+            font-family: 'Consolas', 'Courier New', monospace;
+        }
+        .mono-log-line {
+            white-space: pre-wrap;
+            margin: 0;
+            padding: 0;
+        }
+        .mono-log-line-blank {
+            min-height: 0.95em;
+        }
         .metrics-bold-block {
             font-size: 22px !important;
             font-weight: 800 !important;
@@ -1583,7 +1652,13 @@ def _render_workflow_overview(snapshot: dict[str, Any]) -> None:
         st.markdown(f"<div class='workflow-chip-row'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
 
-def _render_text_panel(title: str, payload: dict[str, Any] | None, placeholder: str, numbered: bool = False) -> None:
+def _render_text_panel(
+    title: str,
+    payload: dict[str, Any] | None,
+    placeholder: str,
+    numbered: bool = False,
+    normalize_log_lines: bool = False,
+) -> None:
     st.markdown(f"### {title}")
     if not payload or not payload.get("text"):
         st.markdown(f"<div class='glass'>{placeholder}</div>", unsafe_allow_html=True)
@@ -1594,11 +1669,21 @@ def _render_text_panel(title: str, payload: dict[str, Any] | None, placeholder: 
     text = str(payload.get("text", ""))
     if numbered:
         text = _format_reasoning_lines(text)
+        content = html.escape(text)
+        st.markdown(f"<div class='glass scroll-block'><pre class='mono-block'>{content}</pre></div>", unsafe_allow_html=True)
+        return
+    if normalize_log_lines:
+        _render_timestamp_log_block(text)
+        return
     content = html.escape(text)
     st.markdown(f"<div class='glass scroll-block'><pre class='mono-block'>{content}</pre></div>", unsafe_allow_html=True)
 
 
-def _render_workflow_best_section(workflow_id: str, workflow_snapshot: dict[str, Any]) -> None:
+def _render_workflow_best_section(
+    workflow_id: str,
+    workflow_snapshot: dict[str, Any],
+    keep_total_summary_block: bool = False,
+) -> None:
     best_iteration = _pick_best_iteration(workflow_snapshot)
     if best_iteration <= 0:
         st.markdown("<div class='glass'>当前工作流尚未产生可比较的最优轮次。</div>", unsafe_allow_html=True)
@@ -1654,7 +1739,20 @@ def _render_workflow_best_section(workflow_id: str, workflow_snapshot: dict[str,
                 _pct_str(best_metrics.get('total_heating_kwh', 0), baseline_metrics.get('total_heating_kwh', 0)),
             )
 
-    _render_text_panel("本工作流最终参数修改详情", details_payload, "当前还没有抓取到本工作流最终参数修改详情。")
+    details_for_view = details_payload
+    if details_payload and details_payload.get("text"):
+        details_for_view = dict(details_payload)
+        details_for_view["text"] = _prepare_parameter_details_for_view(
+            str(details_payload.get("text", "")),
+            keep_total_summary_block=keep_total_summary_block,
+        )
+
+    _render_text_panel(
+        "本工作流最终参数修改详情",
+        details_for_view,
+        "当前还没有抓取到本工作流最终参数修改详情。",
+        normalize_log_lines=True,
+    )
 
 
 def _render_summary_page(snapshot: dict[str, Any]) -> None:
@@ -1730,7 +1828,7 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
     if global_best_workflow:
         st.markdown(f"<div class='best-workflow-banner'>全局最佳工作流：{global_best_workflow}</div>", unsafe_allow_html=True)
         workflow_snapshot = workflows.get(global_best_workflow, {})
-        _render_workflow_best_section(global_best_workflow, workflow_snapshot)
+        _render_workflow_best_section(global_best_workflow, workflow_snapshot, keep_total_summary_block=True)
     else:
         _render_notice("尚无法判断全局最佳工作流（可能仍在运行初期）。")
 
@@ -1822,9 +1920,8 @@ def _render_baseline_panel(workflow_snapshot: dict[str, Any]) -> None:
         st.markdown("<div class='glass'>等待基准模拟日志输出（initial_baseline）。</div>", unsafe_allow_html=True)
         return
 
-    content = html.escape(str(baseline_payload.get("text", "")))
     st.caption(f"更新时间 {baseline_payload.get('updated_at', '-')} | 第0轮")
-    st.markdown(f"<div class='glass scroll-block'><pre class='mono-block'>{content}</pre></div>", unsafe_allow_html=True)
+    _render_timestamp_log_block(str(baseline_payload.get("text", "")))
 
 
 def _pick_iteration_payload(history: list[dict[str, Any]], iteration: int) -> dict[str, Any] | None:
@@ -2104,7 +2201,12 @@ def main() -> None:
         _render_baseline_panel({"baseline_log": selected_baseline_log})
     else:
         _render_text_panel("LLM推理过程", selected_reasoning, "等待当前工作流产出最终采用的 LLM 推理过程。", numbered=True)
-        _render_text_panel("修改摘要", selected_summary, "等待当前工作流产出成功执行后的修改摘要。")
+        _render_text_panel(
+            "修改摘要",
+            selected_summary,
+            "等待当前工作流产出成功执行后的修改摘要。",
+            normalize_log_lines=True,
+        )
         metrics_left, metrics_right = st.columns(2)
         with metrics_left:
             _render_plan_metrics_panel(selected_plan_metrics)
@@ -2176,7 +2278,7 @@ def main() -> None:
         display_df = _stringify_dataframe(display_df)
         _render_html_table(display_df)
 
-    _render_workflow_best_section(selected_workflow, workflow_snapshot)
+    _render_workflow_best_section(selected_workflow, workflow_snapshot, keep_total_summary_block=False)
 
     if running:
         time.sleep(AUTO_REFRESH_SECONDS)
