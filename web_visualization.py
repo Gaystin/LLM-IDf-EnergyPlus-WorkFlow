@@ -908,22 +908,19 @@ def _render_style() -> None:
             line-height: 1.55;
         }
         html, body {
-            overflow: hidden !important;
             margin: 0 !important;
             padding: 0 !important;
         }
-        [data-testid="stAppViewContainer"] {
-            overflow: hidden !important;
-        }
-        section[data-testid="stMain"] {
-            overflow-y: scroll !important;
-            overflow-x: hidden !important;
-            height: 100vh !important;
-        }
         header[data-testid="stHeader"] {
+            display: none !important;
             background: transparent !important;
             border-bottom: none !important;
             box-shadow: none !important;
+        }
+        /* Keep helper iframe from intercepting clicks/wheel in any viewport region. */
+        [data-testid="stIFrame"] iframe,
+        iframe[title="st.iframe"] {
+            pointer-events: none !important;
         }
         div[data-testid="stToolbar"] {
             background: transparent !important;
