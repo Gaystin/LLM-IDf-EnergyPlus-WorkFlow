@@ -35,7 +35,12 @@ DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_NUM_WORKFLOWS = 2
 AUTO_REFRESH_SECONDS = 1.0
 UI_ACTION_COOLDOWN_SECONDS = 3.0
-WORKFLOW_PALETTE = ["#1F77B4", "#E67E22", "#2A9D8F", "#C8553D", "#7A5CFA", "#6C8A2B"]
+WORKFLOW_PALETTE = [
+    "#1F77B4", "#E67E22", "#2A9D8F", "#C8553D", "#7A5CFA",
+    "#6C8A2B", "#D62728", "#17BECF", "#9467BD", "#8C564B",
+    "#BCBD22", "#FF7F0E", "#4E79A7", "#F28E2B", "#59A14F",
+    "#E15759", "#76B7B2", "#EDC948", "#B07AA1", "#FF9DA7",
+]
 
 
 def _real_to_display_iteration(real_iteration: int) -> int:
@@ -221,21 +226,21 @@ def _fallback_global_summary_log(snapshot: dict[str, Any]) -> dict[str, Any] | N
     for index in range(end_index, -1, -1):
         line = lines[index]
         if "【总】" in line and "【Token使用统计】" in line:
-            start_index = max(0, index - 1)
+            start_index = index
             break
 
     if start_index is None:
         for index in range(end_index, -1, -1):
             line = lines[index]
             if "【总】" in line and "【全局耗时统计】" in line:
-                start_index = max(0, index - 1)
+                start_index = index
                 break
 
     if start_index is None:
         for index in range(end_index, -1, -1):
             line = lines[index]
             if "【总】" in line and ("并行流程总耗时" in line or "总Token消耗" in line):
-                start_index = max(0, index - 1)
+                start_index = index
                 break
 
     if start_index is None:
@@ -2051,7 +2056,7 @@ def _render_workflow_best_section(
 
 
 def _render_summary_page(snapshot: dict[str, Any]) -> None:
-    st.subheader("汇总")
+    st.subheader("当前查看：并行工作流汇总")
     all_workflows = snapshot.get("workflows") or {}
     visible_ids = _visible_workflow_ids(snapshot)
     workflows = {workflow_id: all_workflows.get(workflow_id, {}) for workflow_id in visible_ids}
@@ -2069,7 +2074,7 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
 
     summary_log_payload = _fallback_global_summary_log(snapshot)
     _render_text_panel(
-        "汇总日志",
+        "系统配置消耗量",
         summary_log_payload,
         "等待并行汇总日志输出。",
         normalize_log_lines=True,
@@ -2238,7 +2243,11 @@ def _render_baseline_panel(workflow_snapshot: dict[str, Any]) -> None:
         return
 
     st.caption(f"更新时间 {baseline_payload.get('updated_at', '-')} | 第0轮")
-    _render_timestamp_log_block(str(baseline_payload.get("text", "")))
+    baseline_text = str(baseline_payload.get("text", ""))
+    baseline_lines = _split_timestamp_log_lines(baseline_text)
+    if baseline_lines and _strip_log_prefix(baseline_lines[0]) == "":
+        baseline_text = _normalize_timestamp_log_lines("\n".join(baseline_lines[1:]))
+    _render_timestamp_log_block(baseline_text)
 
 
 def _pick_iteration_payload(history: list[dict[str, Any]], iteration: int) -> dict[str, Any] | None:
@@ -2337,7 +2346,6 @@ def main() -> None:
             num_workflows = st.number_input(
                 "并行工作流数量",
                 min_value=1,
-                max_value=10,
                 value=int(snapshot.get("config", {}).get("num_workflows", DEFAULT_NUM_WORKFLOWS) or DEFAULT_NUM_WORKFLOWS),
                 step=1,
                 key="cfg_num_workflows",
@@ -2346,7 +2354,6 @@ def main() -> None:
             optimization_rounds = st.number_input(
                 "优化轮次（不含第0轮基准）",
                 min_value=1,
-                max_value=30,
                 value=int(snapshot.get("config", {}).get("optimization_rounds", DEFAULT_MAX_ITERATIONS) or DEFAULT_MAX_ITERATIONS),
                 step=1,
                 key="cfg_optimization_rounds",
@@ -2447,6 +2454,7 @@ def main() -> None:
                 page_state["selected_view"] = view_name
                 page_state["selected_workflow"] = view_name if view_name != "summary" else page_state.get("selected_workflow", workflow_keys[0])
                 page_state["last_ui_action_ts"] = time.time()
+                st.rerun()
 
     if page_state.get("selected_view") == "summary":
         _render_summary_page(snapshot)
@@ -2536,7 +2544,7 @@ def main() -> None:
     if status != "idle":
         progressive_chart = _build_progressive_curve(dataframe, selected_workflow)
         if progressive_chart is not None:
-            st.markdown("### 实时可视化曲线（仅供冷/供暖）")
+            st.markdown("### 实时可视化曲线")
             st.markdown(
                 f"""
                 <div class='chart-shell-header'>
