@@ -420,6 +420,26 @@ def _prepare_parameter_details_for_view(text: str, keep_total_summary_block: boo
     return _normalize_timestamp_log_lines("\n".join(filtered))
 
 
+def _extract_parallel_curve_saved_line(summary_log_payload: dict[str, Any] | None) -> str | None:
+    if not summary_log_payload or not summary_log_payload.get("text"):
+        return None
+    for line in reversed(_split_timestamp_log_lines(str(summary_log_payload.get("text", "")))):
+        raw = _strip_log_prefix(line)
+        if "【总】" in raw and "已保存并行汇总能耗曲线:" in raw:
+            return line
+    return None
+
+
+def _replace_last_curve_saved_line(text: str, replacement_line: str | None) -> str:
+    lines = _split_timestamp_log_lines(text)
+    filtered = [line for line in lines if "已保存单工作流能耗曲线:" not in _strip_log_prefix(line)]
+    while filtered and filtered[-1] == "":
+        filtered.pop()
+    if replacement_line and replacement_line.strip():
+        filtered.append(replacement_line)
+    return _normalize_timestamp_log_lines("\n".join(filtered))
+
+
 def _render_timestamp_log_block(text: str) -> None:
     line_html = []
     for line in _split_timestamp_log_lines(text):
@@ -1938,15 +1958,18 @@ def _render_workflow_best_section(
     workflow_id: str,
     workflow_snapshot: dict[str, Any],
     keep_total_summary_block: bool = False,
+    details_title: str = "本工作流最终参数修改详情",
+    summary_log_payload: dict[str, Any] | None = None,
 ) -> None:
+    details_payload = workflow_snapshot.get("latest_parameter_details")
+    has_details = bool(details_payload and details_payload.get("text"))
     best_iteration = _pick_best_iteration(workflow_snapshot)
-    if best_iteration <= 0:
+    if best_iteration <= 0 and not has_details:
         st.markdown("<div class='glass'>当前工作流尚未产生可比较的最优轮次。</div>", unsafe_allow_html=True)
         return
 
     best_metrics = _best_metrics_from_history(workflow_snapshot) or {}
-    best_idf = _best_idf_from_history(workflow_snapshot, best_iteration)
-    details_payload = workflow_snapshot.get("latest_parameter_details")
+    best_idf = _best_idf_from_history(workflow_snapshot, best_iteration) if best_iteration > 0 else None
     history = workflow_snapshot.get("iteration_history", []) or []
     baseline_metrics = (history[0].get("metrics", {}) if history else {})
 
@@ -1957,15 +1980,26 @@ def _render_workflow_best_section(
         return f"{pct:+.2f}%"
 
     st.markdown("### 当前工作流最优结果")
-    st.markdown(
-        f"""
-        <div class='glass workflow-best-summary'>
-            <strong>{workflow_id} 最优轮次：</strong> 第 {best_iteration} 轮<br/>
-            <strong>最优IDF路径：</strong> {html.escape(str(best_idf or '-'))}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if best_iteration > 0:
+        st.markdown(
+            f"""
+            <div class='glass workflow-best-summary'>
+                <strong>{workflow_id} 最优轮次：</strong> 第 {best_iteration} 轮<br/>
+                <strong>最优IDF路径：</strong> {html.escape(str(best_idf or '-'))}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"""
+            <div class='glass workflow-best-summary'>
+                <strong>{workflow_id} 最优轮次：</strong> 计算中<br/>
+                <strong>最优IDF路径：</strong> -
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     if best_metrics:
         c1, c2, c3, c4 = st.columns(4)
@@ -1997,13 +2031,19 @@ def _render_workflow_best_section(
     details_for_view = details_payload
     if details_payload and details_payload.get("text"):
         details_for_view = dict(details_payload)
-        details_for_view["text"] = _prepare_parameter_details_for_view(
+        prepared_text = _prepare_parameter_details_for_view(
             str(details_payload.get("text", "")),
             keep_total_summary_block=keep_total_summary_block,
         )
+        if keep_total_summary_block:
+            prepared_text = _replace_last_curve_saved_line(
+                prepared_text,
+                _extract_parallel_curve_saved_line(summary_log_payload),
+            )
+        details_for_view["text"] = prepared_text
 
     _render_text_panel(
-        "本工作流最终参数修改详情",
+        details_title,
         details_for_view,
         "当前还没有抓取到本工作流最终参数修改详情。",
         normalize_log_lines=True,
@@ -2099,7 +2139,13 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
     if global_best_workflow:
         st.markdown(f"<div class='best-workflow-banner'>全局最佳工作流：{global_best_workflow}</div>", unsafe_allow_html=True)
         workflow_snapshot = workflows.get(global_best_workflow, {})
-        _render_workflow_best_section(global_best_workflow, workflow_snapshot, keep_total_summary_block=True)
+        _render_workflow_best_section(
+            global_best_workflow,
+            workflow_snapshot,
+            keep_total_summary_block=True,
+            details_title="并行工作流最佳优化参数详情",
+            summary_log_payload=summary_log_payload,
+        )
     else:
         _render_notice("尚无法判断全局最佳工作流（可能仍在运行初期）。")
 
