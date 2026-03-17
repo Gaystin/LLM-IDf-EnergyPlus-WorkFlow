@@ -190,6 +190,10 @@ def _fallback_global_summary_log(snapshot: dict[str, Any]) -> dict[str, Any] | N
     if snapshot.get("global_summary_log"):
         return snapshot.get("global_summary_log")
 
+    # Do not read old log files when no run has been started yet.
+    if str(snapshot.get("status", "idle") or "idle") == "idle":
+        return None
+
     config = snapshot.get("config", {}) or {}
     log_dir = str(config.get("log_dir", DEFAULT_LOG_DIR) or DEFAULT_LOG_DIR)
     log_dir_path = os.path.join(CURRENT_DIR, log_dir)
@@ -445,15 +449,21 @@ def _replace_last_curve_saved_line(text: str, replacement_line: str | None) -> s
     return _normalize_timestamp_log_lines("\n".join(filtered))
 
 
-def _render_timestamp_log_block(text: str) -> None:
+@st.cache_data(show_spinner=False, max_entries=256)
+def _build_timestamp_log_html(text: str) -> str:
     line_html = []
     for line in _split_timestamp_log_lines(text):
         if line == "":
             line_html.append("<div class='mono-log-line mono-log-line-blank'>&nbsp;</div>")
         else:
             line_html.append(f"<div class='mono-log-line'>{html.escape(line)}</div>")
+    return "".join(line_html)
+
+
+def _render_timestamp_log_block(text: str) -> None:
+    body_html = _build_timestamp_log_html(str(text or ""))
     st.markdown(
-        f"<div class='glass scroll-block mono-log-block'>{''.join(line_html)}</div>",
+        f"<div class='glass scroll-block mono-log-block'>{body_html}</div>",
         unsafe_allow_html=True,
     )
 
@@ -996,6 +1006,7 @@ def _build_progressive_curve(dataframe: pd.DataFrame, workflow_id: str):
     )
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
 def _build_all_workflows_progressive_curve(workflows: dict[str, dict[str, Any]]):
     rows = []
     for workflow_id, workflow_snapshot in sorted((workflows or {}).items()):
@@ -1221,6 +1232,28 @@ def _render_style() -> None:
             color: #2C3A3F;
             font-family: 'Times New Roman', 'Noto Sans SC', serif;
             line-height: 1.55;
+        }
+        /* Keep rerun updates visually stable: disable Streamlit stale-element dimming. */
+        .stale-element,
+        [data-testid="staleElement"] {
+            opacity: 1 !important;
+            filter: none !important;
+        }
+        .stApp [data-stale="true"],
+        .stApp [class*="stale"],
+        .stApp [class*="Stale"] {
+            opacity: 1 !important;
+            filter: none !important;
+        }
+        /* Disable mount/fade transitions that become obvious on heavy sections. */
+        .stApp [data-testid="stVerticalBlock"],
+        .stApp [data-testid="element-container"],
+        .stApp [data-testid="stMarkdownContainer"],
+        .stApp [data-testid="stDataFrame"],
+        .stApp [data-testid="stVegaLiteChart"],
+        .stApp [data-testid="stTable"] {
+            transition: none !important;
+            animation: none !important;
         }
         html, body {
             margin: 0 !important;
@@ -1968,6 +2001,14 @@ def _render_workflow_best_section(
 ) -> None:
     details_payload = workflow_snapshot.get("latest_parameter_details")
     has_details = bool(details_payload and details_payload.get("text"))
+    if not has_details:
+        details_history = workflow_snapshot.get("parameter_details_history", []) or []
+        for item in reversed(details_history):
+            if item and item.get("text"):
+                details_payload = item
+                has_details = True
+                break
+
     best_iteration = _pick_best_iteration(workflow_snapshot)
     if best_iteration <= 0 and not has_details:
         st.markdown("<div class='glass'>当前工作流尚未产生可比较的最优轮次。</div>", unsafe_allow_html=True)
@@ -2055,7 +2096,7 @@ def _render_workflow_best_section(
     )
 
 
-def _render_summary_page(snapshot: dict[str, Any]) -> None:
+def _render_summary_page(snapshot: dict[str, Any], running: bool = False) -> None:
     st.subheader("当前查看：并行工作流汇总")
     all_workflows = snapshot.get("workflows") or {}
     visible_ids = _visible_workflow_ids(snapshot)
@@ -2064,13 +2105,63 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
         _render_notice("暂无可汇总数据。")
         return
 
-    summary_curve = _build_all_workflows_progressive_curve(workflows)
+    # Fast path for initial/empty state: render only template placeholders and
+    # skip all chart/table preparation to keep the first summary-tab click instant.
+    has_any_history = any((wf.get("iteration_history") or []) for wf in workflows.values())
+    if not has_any_history:
+        st.markdown("### 并行工作流汇总可视化曲线")
+        _render_notice("尚未产生可汇总的迭代数据。启动后将自动显示曲线。")
+        _render_text_panel(
+            "系统配置消耗量",
+            None,
+            "等待并行汇总日志输出。",
+            normalize_log_lines=True,
+        )
+        st.markdown("### 各工作流最优轮次对比")
+        _render_notice("尚无可对比的最优轮次结果。")
+        return
+
+    # Only pass minimal numeric fields needed by the chart builder.
+    # Strips plan_description / idf_path / other large strings so the
+    # cache-key hash is near-instant on every refresh.
+    curve_input = {
+        wf_id: {"iteration_history": [
+            {
+                "iteration": item.get("iteration", 0),
+                "metrics": {
+                    "total_cooling_kwh": float((item.get("metrics") or {}).get("total_cooling_kwh", 0) or 0),
+                    "total_heating_kwh": float((item.get("metrics") or {}).get("total_heating_kwh", 0) or 0),
+                },
+            }
+            for item in wf.get("iteration_history", [])
+        ]}
+        for wf_id, wf in workflows.items()
+    }
+    summary_curve = _build_all_workflows_progressive_curve(curve_input)
     if summary_curve is not None:
         st.markdown("### 并行工作流汇总可视化曲线")
         _render_summary_curve_header(sorted(workflows.keys()))
         st.altair_chart(summary_curve, width='stretch')
     else:
         _render_notice("正在准备并行汇总曲线数据，生成后会自动显示完整图像。")
+
+    # During running, only the summary curve should update in real time.
+    # All comparison/result sections are shown only after all workflows finish.
+    if running:
+        _render_text_panel(
+            "系统配置消耗量",
+            None,
+            "运行中：该区域将在全部工作流完成后更新。",
+            normalize_log_lines=True,
+        )
+        st.markdown("### 各工作流最优轮次对比")
+        _render_notice("运行中：该区域将在全部工作流完成后生成。")
+        st.markdown("### 并行工作流最佳优化参数详情")
+        st.markdown(
+            "<div class='glass'>运行中：待所有工作流完成后显示全局最优工作流的最终参数修改详情。</div>",
+            unsafe_allow_html=True,
+        )
+        return
 
     summary_log_payload = _fallback_global_summary_log(snapshot)
     _render_text_panel(
@@ -2144,13 +2235,17 @@ def _render_summary_page(snapshot: dict[str, Any]) -> None:
     if global_best_workflow:
         st.markdown(f"<div class='best-workflow-banner'>全局最佳工作流：{global_best_workflow}</div>", unsafe_allow_html=True)
         workflow_snapshot = workflows.get(global_best_workflow, {})
-        _render_workflow_best_section(
-            global_best_workflow,
-            workflow_snapshot,
-            keep_total_summary_block=True,
-            details_title="并行工作流最佳优化参数详情",
-            summary_log_payload=summary_log_payload,
-        )
+        # Only show detailed best-workflow section when finished; during running
+        # it shows the same heavy content as individual workflow pages which is
+        # both confusing and slow to render on every auto-refresh.
+        if not running:
+            _render_workflow_best_section(
+                global_best_workflow,
+                workflow_snapshot,
+                keep_total_summary_block=True,
+                details_title="并行工作流最佳优化参数详情",
+                summary_log_payload=summary_log_payload,
+            )
     else:
         _render_notice("尚无法判断全局最佳工作流（可能仍在运行初期）。")
 
@@ -2302,6 +2397,18 @@ def _init_page_state() -> None:
         }
 
 
+def _on_view_nav_click(view_name: str, default_workflow: str) -> None:
+    page_state = st.session_state.get("web_ui_state")
+    if not isinstance(page_state, dict):
+        return
+    page_state["selected_view"] = view_name
+    if view_name != "summary":
+        page_state["selected_workflow"] = view_name
+    else:
+        page_state["selected_workflow"] = page_state.get("selected_workflow", default_workflow)
+    page_state["last_ui_action_ts"] = time.time()
+
+
 def main() -> None:
     st.set_page_config(page_title="EnergyPlus 并行工作流可视化", layout="wide")
     _init_page_state()
@@ -2431,11 +2538,9 @@ def main() -> None:
         _render_notice("点击上方按钮后，页面会实时显示每条工作流的推理过程、修改摘要、进度和能耗曲线。")
         return
 
-    view_options = list(workflow_keys)
-    if status in {"finished", "error"}:
-        view_options.append("summary")
+    view_options = list(workflow_keys) + ["summary"]
 
-    if status in {"finished", "error"} and "summary" in view_options:
+    if status in {"finished", "error"}:
         finish_marker = snapshot.get("finished_at") or status
         if page_state.get("auto_summary_marker") != finish_marker:
             page_state["selected_view"] = "summary"
@@ -2450,17 +2555,46 @@ def main() -> None:
         is_active = page_state.get("selected_view") == view_name
         button_label = f"▶ {label}" if is_active else label
         with nav_cols[idx]:
-            if st.button(button_label, key=f"view_nav_{view_name}", width="stretch"):
-                page_state["selected_view"] = view_name
-                page_state["selected_workflow"] = view_name if view_name != "summary" else page_state.get("selected_workflow", workflow_keys[0])
-                page_state["last_ui_action_ts"] = time.time()
-                st.rerun()
+            st.button(
+                button_label,
+                key=f"view_nav_{view_name}",
+                width="stretch",
+                on_click=_on_view_nav_click,
+                args=(view_name, workflow_keys[0]),
+            )
+
+    # ── 缓存预热 ────────────────────────────────────────────────────────────
+    # 每次刷新都以精简格式预先计算汇总图（仅数值字段，哈希极快），
+    # 确保用户首次点击 "汇总" 标签时直接命中缓存，零延迟。
+    _wf_map_prewarm = snapshot.get("workflows") or {}
+    has_prewarm_data = any((_wf_map_prewarm.get(_wf_id, {}).get("iteration_history") or []) for _wf_id in workflow_keys)
+    if has_prewarm_data:
+        _prewarm_curve_input = {
+            _wf_id: {"iteration_history": [
+                {
+                    "iteration": _it.get("iteration", 0),
+                    "metrics": {
+                        "total_cooling_kwh": float((_it.get("metrics") or {}).get("total_cooling_kwh", 0) or 0),
+                        "total_heating_kwh": float((_it.get("metrics") or {}).get("total_heating_kwh", 0) or 0),
+                    },
+                }
+                for _it in _wf_map_prewarm.get(_wf_id, {}).get("iteration_history", [])
+            ]}
+            for _wf_id in workflow_keys
+        }
+        _build_all_workflows_progressive_curve(_prewarm_curve_input)
+    # ────────────────────────────────────────────────────────────────────────
 
     if page_state.get("selected_view") == "summary":
-        _render_summary_page(snapshot)
+        _render_summary_page(snapshot, running=running)
         if running:
             time.sleep(AUTO_REFRESH_SECONDS)
             st.rerun()
+        return
+
+    # 仅当明确不是汇总页面时，才进入工作流页面逻辑
+    if page_state.get("selected_view") == "summary":
+        # 这是一个双重检查，防止任何情况下工作流代码被执行
         return
 
     selected_workflow = str(page_state.get("selected_view"))
@@ -2541,26 +2675,27 @@ def main() -> None:
     iteration_history = workflow_snapshot.get("iteration_history", []) or []
     dataframe = _build_metrics_dataframe(iteration_history)
 
-    if status != "idle":
-        progressive_chart = _build_progressive_curve(dataframe, selected_workflow)
-        if progressive_chart is not None:
-            st.markdown("### 实时可视化曲线")
-            st.markdown(
-                f"""
-                <div class='chart-shell-header'>
-                    <div></div>
-                    <div class='chart-shell-title'>{html.escape(selected_workflow)} 冷暖能耗迭代曲线</div>
-                    <div class='chart-shell-legend'>
-                        <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-cooling'></span>制冷能耗</span>
-                        <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-heating'></span>供暖能耗</span>
-                    </div>
+    st.markdown("### 实时可视化曲线")
+    progressive_chart = _build_progressive_curve(dataframe, selected_workflow)
+    if progressive_chart is not None:
+        st.markdown(
+            f"""
+            <div class='chart-shell-header'>
+                <div></div>
+                <div class='chart-shell-title'>{html.escape(selected_workflow)} 冷暖能耗迭代曲线</div>
+                <div class='chart-shell-legend'>
+                    <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-cooling'></span>制冷能耗</span>
+                    <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-heating'></span>供暖能耗</span>
                 </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.altair_chart(progressive_chart, width='stretch')
-        elif running:
-            _render_notice("正在准备曲线图数据，生成后会自动显示完整图像。")
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.altair_chart(progressive_chart, width='stretch')
+    elif running:
+        _render_notice("正在准备曲线图数据，生成后会自动显示完整图像。")
+    else:
+        _render_notice("尚未开始运行，启动后将在此显示实时曲线。")
 
     st.markdown("### 各项能耗指标与节能变化")
     if dataframe.empty:
