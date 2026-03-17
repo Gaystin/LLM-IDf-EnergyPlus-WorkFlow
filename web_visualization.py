@@ -291,16 +291,38 @@ def _clean_summary_lines(lines: list[str]) -> str:
 
 
 def _format_reasoning_lines(text: str) -> str:
-    raw_lines = [line.strip() for line in str(text or "").splitlines()]
+    normalized_text = str(text or "")
+    # Some responses contain escaped newlines as literal \n characters.
+    normalized_text = normalized_text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    normalized_text = normalized_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized_text:
+        return ""
+
+    marker_matches = list(re.finditer(r"(?<!\d)(\d+[\.、\)）])", normalized_text))
+    if len(marker_matches) >= 2:
+        segmented_items = []
+        for index, match in enumerate(marker_matches):
+            start = match.start()
+            end = marker_matches[index + 1].start() if index + 1 < len(marker_matches) else len(normalized_text)
+            segment = normalized_text[start:end].strip()
+            segment = re.sub(r"\s+", " ", segment)
+            if segment:
+                segmented_items.append(segment)
+        if segmented_items:
+            return "\n".join(segmented_items)
+
+    raw_lines = [line.strip() for line in normalized_text.splitlines() if line.strip()]
     items = []
     for line in raw_lines:
-        if not line:
+        if re.match(r"^\d+[\.、\)）]\s*", line):
+            line = re.sub(r"\s+", " ", line)
+            items.append(line)
             continue
-        normalized = re.sub(r"^\d+[\.|、|\)]\s*", "", line)
-        items.append(normalized)
-    if not items:
-        return ""
-    return "\n".join([f"{index}. {line}" for index, line in enumerate(items, start=1)])
+        content = re.sub(r"^\d+[\.、\)）]\s*", "", line).strip()
+        if content:
+            items.append(f"{len(items) + 1}. {content}")
+
+    return "\n".join(items)
 
 
 def _upsert_iteration_payload(history: list[dict[str, Any]], payload: dict[str, Any]) -> None:
@@ -1903,8 +1925,7 @@ def _render_text_panel(
     text = str(payload.get("text", ""))
     if numbered:
         text = _format_reasoning_lines(text)
-        content = html.escape(text)
-        st.markdown(f"<div class='glass scroll-block'><pre class='mono-block'>{content}</pre></div>", unsafe_allow_html=True)
+        _render_timestamp_log_block(text)
         return
     if normalize_log_lines:
         _render_timestamp_log_block(text)
