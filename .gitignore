@@ -1,6 +1,7 @@
 /api_key.txt
 /copilot垃圾
 /debug
+/debug1
 /debug2
 /debug3
 /default.idf
@@ -27,3 +28,4 @@
 /基准.log
 /分成多个python文件的代码
 /.web_runtime
+/debug_web
