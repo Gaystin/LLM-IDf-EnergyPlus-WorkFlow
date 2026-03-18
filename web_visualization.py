@@ -2105,6 +2105,25 @@ def _render_summary_page(snapshot: dict[str, Any], running: bool = False) -> Non
         _render_notice("暂无可汇总数据。")
         return
 
+    # 运行中时汇总页保持初始化静态视图，避免与单工作流页面内容交替渲染。
+    if running:
+        st.markdown("### 并行工作流汇总可视化曲线")
+        _render_notice("运行中：汇总页已锁定为初始化视图，待全部工作流完成后统一更新。")
+        _render_text_panel(
+            "系统配置消耗量",
+            None,
+            "运行中：汇总结果区域暂不更新。",
+            normalize_log_lines=True,
+        )
+        st.markdown("### 各工作流最优轮次对比")
+        _render_notice("运行中：该区域暂不更新。")
+        st.markdown("### 并行工作流最佳优化参数详情")
+        st.markdown(
+            "<div class='glass'>运行中：该区域暂不更新，全部工作流完成后统一显示最终结果。</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
     # Fast path for initial/empty state: render only template placeholders and
     # skip all chart/table preparation to keep the first summary-tab click instant.
     has_any_history = any((wf.get("iteration_history") or []) for wf in workflows.values())
@@ -2144,24 +2163,6 @@ def _render_summary_page(snapshot: dict[str, Any], running: bool = False) -> Non
         st.altair_chart(summary_curve, width='stretch')
     else:
         _render_notice("正在准备并行汇总曲线数据，生成后会自动显示完整图像。")
-
-    # During running, only the summary curve should update in real time.
-    # All comparison/result sections are shown only after all workflows finish.
-    if running:
-        _render_text_panel(
-            "系统配置消耗量",
-            None,
-            "运行中：该区域将在全部工作流完成后更新。",
-            normalize_log_lines=True,
-        )
-        st.markdown("### 各工作流最优轮次对比")
-        _render_notice("运行中：该区域将在全部工作流完成后生成。")
-        st.markdown("### 并行工作流最佳优化参数详情")
-        st.markdown(
-            "<div class='glass'>运行中：待所有工作流完成后显示全局最优工作流的最终参数修改详情。</div>",
-            unsafe_allow_html=True,
-        )
-        return
 
     summary_log_payload = _fallback_global_summary_log(snapshot)
     _render_text_panel(
@@ -2394,6 +2395,8 @@ def _init_page_state() -> None:
             "uploaded_api": None,
             "last_ui_action_ts": 0.0,
             "auto_summary_marker": None,
+            "summary_live_marker": None,
+            "summary_last_rerun_ts": 0.0,
         }
 
 
@@ -2409,6 +2412,55 @@ def _on_view_nav_click(view_name: str, default_workflow: str) -> None:
     page_state["last_ui_action_ts"] = time.time()
 
 
+def _install_summary_finish_watcher(snapshot_path: str | None, selected_view: str, running: bool) -> None:
+    """When user stays on summary, refresh only when snapshot changes.
+
+    - While running/starting: rerun only if snapshot updated_at changed, so top overview
+      can keep progressing without forcing constant reruns.
+    - When finished/error: trigger one final rerun to render complete summary content.
+    """
+    if not snapshot_path or selected_view != "summary" or not running:
+        return
+
+    fragment_api = getattr(st, "fragment", None)
+    if not callable(fragment_api):
+        return
+
+    interval = max(float(AUTO_REFRESH_SECONDS), 0.5)
+
+    @fragment_api(run_every=f"{interval}s")
+    def _summary_finish_poller() -> None:
+        latest_snapshot = _read_snapshot(snapshot_path)
+        latest_status = str(latest_snapshot.get("status", "idle") or "idle")
+        state = st.session_state.get("web_ui_state")
+        if not isinstance(state, dict):
+            return
+
+        if latest_status in {"running", "starting"}:
+            live_marker = latest_snapshot.get("updated_at") or latest_status
+            if state.get("summary_live_marker") != live_marker:
+                state["summary_live_marker"] = live_marker
+                now_ts = time.time()
+                last_rerun_ts = state.get("summary_last_rerun_ts", 0.0) or 0.0
+                if now_ts - last_rerun_ts >= 2.0:
+                    state["summary_last_rerun_ts"] = now_ts
+                    st.rerun()
+                    return
+            st.markdown("<div style='display:none'></div>", unsafe_allow_html=True)
+            return
+
+        if latest_status in {"finished", "error"}:
+            finish_marker = latest_snapshot.get("finished_at") or latest_status
+            if state.get("auto_summary_marker") == finish_marker:
+                return
+
+            state["selected_view"] = "summary"
+            state["auto_summary_marker"] = finish_marker
+            st.rerun()
+
+    _summary_finish_poller()
+
+
 def main() -> None:
     st.set_page_config(page_title="EnergyPlus 并行工作流可视化", layout="wide")
     _init_page_state()
@@ -2419,6 +2471,11 @@ def main() -> None:
     snapshot = _read_snapshot(page_state.get("snapshot_path"))
     status = snapshot.get("status", "idle")
     running = status in {"running", "starting"}
+    _install_summary_finish_watcher(
+        snapshot_path=page_state.get("snapshot_path"),
+        selected_view=str(page_state.get("selected_view", "workflow_1")),
+        running=running,
+    )
 
     st.title("EnergyPlus 并行工作流可视化Web界面")
     st.caption("Version 1.0 | Powered by Streamlit | By OpenAI")
@@ -2587,9 +2644,6 @@ def main() -> None:
 
     if page_state.get("selected_view") == "summary":
         _render_summary_page(snapshot, running=running)
-        if running:
-            time.sleep(AUTO_REFRESH_SECONDS)
-            st.rerun()
         return
 
     # 仅当明确不是汇总页面时，才进入工作流页面逻辑
