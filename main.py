@@ -24,7 +24,7 @@ from knowledge_base import EnergyPlusKnowledgeBase
 class EnergyPlusOptimizer:
     """EnergyPlus 5轮并行工作流迭代自动优化系统"""
     
-    def __init__(self, idf_path, idd_path, api_key_path, epw_path="weather.epw", log_dir="optimization_logs_并行2", num_workflows=2):
+    def __init__(self, idf_path, idd_path, api_key_path, epw_path="weather.epw", log_dir="optimization_logs_并行2", num_workflows=1):
         self.idf_path = idf_path
         self.idd_path = idd_path
         self.epw_path = epw_path
@@ -93,6 +93,14 @@ class EnergyPlusOptimizer:
         self.workflows = {}  # 存储各工作流的独立数据
         self.workflows_lock = Lock()  # 保护共享资源的锁
         self.logger.info(f"初始化{num_workflows}条并行工作流")
+
+        # 早停配置：每条工作流独立判定是否收敛
+        self.early_stop_enabled = True
+        self.early_stop_target_total_saving_pct = 40.0      # 达到目标节能率可提前停止
+        self.early_stop_min_iterations = 4                  # 至少完成基准+3轮后再判定
+        self.early_stop_convergence_patience = 2            # 连续N次增益极小判定收敛
+        self.early_stop_min_delta_pct = 0.15                # 节能率变化阈值（百分点）
+        self.max_iterations_cap = 10                        # 自动模式下的最大安全上限
         
         # 初始化各工作流的数据结构
         for i in range(num_workflows):
@@ -3291,14 +3299,70 @@ modifications数组应包含至少{min_modifications}-{max_modifications}条修�
                 f"({_safe_pct(heating_saved_vs_prev, prev_metrics['total_heating_kwh']):+.2f}%)"
             )
     
-    def run_optimization_loop(self, max_iterations=5):
+    def _should_early_stop_workflow(self, workflow_id):
+        """判断单条工作流是否应提前停止（达到目标或节能幅度收敛）。"""
+        if not self.early_stop_enabled:
+            return False, ""
+
+        with self.workflows_lock:
+            wf = self.workflows.get(workflow_id, {})
+            iteration_history = list(wf.get('iteration_history', []) or [])
+
+        if len(iteration_history) < max(2, int(self.early_stop_min_iterations)):
+            return False, ""
+
+        baseline = iteration_history[0].get('metrics', {}) if iteration_history else {}
+        latest = iteration_history[-1].get('metrics', {}) if iteration_history else {}
+
+        try:
+            baseline_total = float(baseline.get('total_site_energy_kwh', 0) or 0)
+            latest_total = float(latest.get('total_site_energy_kwh', 0) or 0)
+        except Exception:
+            return False, ""
+
+        if baseline_total <= 0:
+            return False, ""
+
+        latest_saving_pct = (baseline_total - latest_total) / baseline_total * 100.0
+        if latest_saving_pct >= float(self.early_stop_target_total_saving_pct):
+            return True, f"已达到目标节能率 {latest_saving_pct:.2f}% (阈值 {self.early_stop_target_total_saving_pct:.2f}%)"
+
+        saving_series = []
+        for item in iteration_history[1:]:
+            m = item.get('metrics', {})
+            try:
+                curr_total = float(m.get('total_site_energy_kwh', 0) or 0)
+            except Exception:
+                continue
+            saving_series.append((baseline_total - curr_total) / baseline_total * 100.0)
+
+        patience = max(1, int(self.early_stop_convergence_patience))
+        if len(saving_series) < patience + 1:
+            return False, ""
+
+        recent = saving_series[-(patience + 1):]
+        deltas = [recent[i] - recent[i - 1] for i in range(1, len(recent))]
+        threshold = float(self.early_stop_min_delta_pct)
+        if deltas and all(abs(d) <= threshold for d in deltas):
+            return True, f"节能幅度收敛：最近{patience}轮节能率变化均≤{threshold:.2f}个百分点"
+
+        return False, ""
+
+    def run_optimization_loop(self, max_iterations=None):
         """运行并行工作流优化循环 - 5条工作流同时进行
         
         直接复制原有的单工作流逻辑 5 遍并行执行，不改变任何 prompt、代码逻辑、字段修改规则等。
         """
+        if max_iterations is None:
+            max_iterations = int(self.max_iterations_cap)
+
         self.logger.info(f"\n{'█'*80}")
         self.logger.info(f"启动{max_iterations}轮迭代优化 (并行{self.num_workflows}条工作流)")
         self.logger.info("执行模型说明：工作流在线程池并行推进；日志会按完成先后交错显示，不代表串行执行")
+        self.logger.info(
+            f"早停策略：目标节能率≥{self.early_stop_target_total_saving_pct:.2f}% 或最近"
+            f"{self.early_stop_convergence_patience}轮节能率变化≤{self.early_stop_min_delta_pct:.2f}个百分点"
+        )
         self.logger.info(f"{'█'*80}\n")
         
         parallel_start = perf_counter()
@@ -3438,6 +3502,11 @@ modifications数组应包含至少{min_modifications}-{max_modifications}条修�
                     self.workflows[workflow_id]['best_iteration'] = self.best_iteration
                     self.workflows[workflow_id]['field_modification_history'] = dict(self.field_modification_history)
                     self.workflows[workflow_id]['last_round_fields'] = set(self.last_round_fields)
+
+                should_stop, stop_reason = self._should_early_stop_workflow(workflow_id)
+                if should_stop:
+                    self.logger.info(f"【早停】第{iteration}轮后停止该工作流：{stop_reason}")
+                    break
             
         except Exception as e:
             self.logger.error(f"优化循环异常: {e}", exc_info=True)
@@ -3877,6 +3946,8 @@ modifications数组应包含至少{min_modifications}-{max_modifications}条修�
         输出内容：
         1) 每个工作流单独图：供冷实线、供暖虚线
         2) 所有工作流汇总图：不同工作流使用不同颜色，供冷实线、供暖虚线
+        3) 每个工作流单独图：总建筑能耗曲线
+        4) 所有工作流汇总图：总建筑能耗曲线（颜色区分工作流）
         """
         try:
             import matplotlib.pyplot as plt
@@ -3916,6 +3987,7 @@ modifications数组应包含至少{min_modifications}-{max_modifications}条修�
                 x = [item.get('iteration', idx + 1) for idx, item in enumerate(history)]
                 cooling = [item['metrics']['total_cooling_kwh'] for item in history]
                 heating = [item['metrics']['total_heating_kwh'] for item in history]
+                total_site = [item['metrics']['total_site_energy_kwh'] for item in history]
 
                 fig, ax = plt.subplots(figsize=(10, 6))
                 ax.plot(x, cooling, color='tab:blue', linestyle='-', marker='o', linewidth=2,
@@ -3934,14 +4006,33 @@ modifications数组应包含至少{min_modifications}-{max_modifications}条修�
                 plt.close(fig)
 
                 self.logger.info(f"[{workflow_id}] 已保存单工作流能耗曲线: {workflow_plot_path}")
-                valid_workflows.append((workflow_id, x, cooling, heating))
+
+                # 单工作流总建筑能耗曲线
+                fig_total, ax_total = plt.subplots(figsize=(10, 6))
+                ax_total.plot(x, total_site, color='tab:green', linestyle='-', marker='o', linewidth=2,
+                              label='Total Site Energy')
+                ax_total.set_title(f"{workflow_id} Total Site Energy Curve")
+                ax_total.set_xlabel("Iteration")
+                ax_total.set_ylabel("Energy (kWh)")
+                ax_total.grid(True, alpha=0.3)
+                ax_total.legend()
+
+                workflow_total_plot_path = os.path.join(
+                    plot_dir,
+                    f"{workflow_id}_total_site_energy_curve_{timestamp}.png"
+                )
+                fig_total.savefig(workflow_total_plot_path, bbox_inches='tight', dpi=150)
+                plt.close(fig_total)
+
+                self.logger.info(f"[{workflow_id}] 已保存单工作流总建筑能耗曲线: {workflow_total_plot_path}")
+                valid_workflows.append((workflow_id, x, cooling, heating, total_site))
 
             # ---------- 2) 所有工作流汇总曲线 ----------
             if valid_workflows:
                 fig, ax = plt.subplots(figsize=(12, 7))
                 cmap = plt.get_cmap('tab10')
 
-                for idx, (workflow_id, x, cooling, heating) in enumerate(valid_workflows):
+                for idx, (workflow_id, x, cooling, heating, total_site) in enumerate(valid_workflows):
                     color = cmap(idx % 10)
                     # 供冷：实线；供暖：虚线；同一workflow同色
                     ax.plot(x, cooling, color=color, linestyle='-', marker='o', linewidth=2,
@@ -3960,6 +4051,35 @@ modifications数组应包含至少{min_modifications}-{max_modifications}条修�
                 plt.close(fig)
 
                 self.logger.info(f"已保存并行汇总能耗曲线: {summary_plot_path}")
+
+                # ---------- 3) 所有工作流汇总总建筑能耗曲线 ----------
+                fig_total_sum, ax_total_sum = plt.subplots(figsize=(12, 7))
+                for idx, (workflow_id, x, cooling, heating, total_site) in enumerate(valid_workflows):
+                    color = cmap(idx % 10)
+                    ax_total_sum.plot(
+                        x,
+                        total_site,
+                        color=color,
+                        linestyle='-',
+                        marker='o',
+                        linewidth=2,
+                        label=f"{workflow_id} Total Site"
+                    )
+
+                ax_total_sum.set_title("All Workflows Total Site Energy Curves")
+                ax_total_sum.set_xlabel("Iteration")
+                ax_total_sum.set_ylabel("Energy (kWh)")
+                ax_total_sum.grid(True, alpha=0.3)
+                ax_total_sum.legend(ncol=2, fontsize=9)
+
+                total_summary_plot_path = os.path.join(
+                    plot_dir,
+                    f"all_workflows_total_site_energy_curve_{timestamp}.png"
+                )
+                fig_total_sum.savefig(total_summary_plot_path, bbox_inches='tight', dpi=150)
+                plt.close(fig_total_sum)
+
+                self.logger.info(f"已保存并行汇总总建筑能耗曲线: {total_summary_plot_path}")
             else:
                 self.logger.warning("无有效工作流历史，未生成汇总能耗曲线")
 
@@ -4290,8 +4410,8 @@ if __name__ == "__main__":
             epw_path=EPW_PATH
         )
         
-        # 运行5轮迭代优化
-        optimizer.run_optimization_loop(max_iterations=5)
+        # 启动自动迭代（由早停机制决定每条工作流何时结束）
+        optimizer.run_optimization_loop()
         
     except Exception as e:
         print(f"✗ 优化过程异常: {e}")
