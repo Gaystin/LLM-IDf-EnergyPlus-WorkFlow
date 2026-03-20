@@ -29,19 +29,63 @@ PERCENT_REGEX = re.compile(r"([+-]?\d+(?:\.\d+)?)%")
 LOG_LINE_START_REGEX = re.compile(r"(?<!\n)(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s-\s[A-Z]+\s-\s)")
 
 DEFAULT_IDD_PATH = "Energy+.idd"
-DEFAULT_EPW_PATH = "weather.epw"
+DEFAULT_EPW_PATH = os.path.join("weather", "Beijing.epw")
 DEFAULT_LOG_DIR = "optimization_logs_并行2_web"
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_EARLY_STOP_TARGET_SAVING_PCT = 60.0
 DEFAULT_NUM_WORKFLOWS = 2
 AUTO_REFRESH_SECONDS = 1.0
 UI_ACTION_COOLDOWN_SECONDS = 3.0
+WEATHER_DIR = os.path.join(CURRENT_DIR, "weather")
+CITY_ZH_MAP = {
+    "beijing": "北京",
+    "changsha": "长沙",
+    "chengdu": "成都",
+    "chongqing": "重庆",
+    "guangzhou": "广州",
+    "hangzhou": "杭州",
+    "harbin": "哈尔滨",
+    "hefei": "合肥",
+    "kunming": "昆明",
+    "lhasa": "拉萨",
+    "nanchang": "南昌",
+    "shanghai": "上海",
+    "shenzhen": "深圳",
+    "tianjin": "天津",
+    "urumqi": "乌鲁木齐",
+    "wuhan": "武汉",
+}
 WORKFLOW_PALETTE = [
     "#1F77B4", "#E67E22", "#2A9D8F", "#C8553D", "#7A5CFA",
     "#6C8A2B", "#D62728", "#17BECF", "#9467BD", "#8C564B",
     "#BCBD22", "#FF7F0E", "#4E79A7", "#F28E2B", "#59A14F",
     "#E15759", "#76B7B2", "#EDC948", "#B07AA1", "#FF9DA7",
 ]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _list_weather_city_options() -> list[dict[str, str]]:
+    options: list[dict[str, str]] = []
+    if os.path.isdir(WEATHER_DIR):
+        for filename in sorted(os.listdir(WEATHER_DIR)):
+            if not filename.lower().endswith(".epw"):
+                continue
+            stem = os.path.splitext(filename)[0]
+            city_key = stem.strip().lower()
+            city_zh = CITY_ZH_MAP.get(city_key)
+            if not city_zh:
+                # 兜底：未命中字典时，仍展示文件名，避免不可选。
+                city_zh = stem
+            options.append(
+                {
+                    "label": f"{city_zh} ({stem})",
+                    "path": os.path.join(WEATHER_DIR, filename),
+                }
+            )
+
+    if not options:
+        options.append({"label": "默认天气文件", "path": DEFAULT_EPW_PATH})
+    return options
 
 
 def _real_to_display_iteration(real_iteration: int) -> int:
@@ -2057,6 +2101,53 @@ def _render_style() -> None:
                 grid-template-columns: repeat(2, 1fr);
             }
         }
+        /* Popover trigger button: default black background + white text */
+        [data-testid="stPopover"] button,
+        [data-testid="stPopover"] button * {
+            background: #111111 !important;
+            border-color: #111111 !important;
+            color: #FFFFFF !important;
+            -webkit-text-fill-color: #FFFFFF !important;
+        }
+        [data-testid="stPopover"] button:hover,
+        [data-testid="stPopover"] button:hover * {
+            background: #1a1a1a !important;
+            border-color: #1a1a1a !important;
+            color: #FFFFFF !important;
+            -webkit-text-fill-color: #FFFFFF !important;
+        }
+        [data-testid="stPopover"] button:active,
+        [data-testid="stPopover"] button:focus,
+        [data-testid="stPopover"] button:focus-visible,
+        [data-testid="stPopover"] button:active *,
+        [data-testid="stPopover"] button:focus *,
+        [data-testid="stPopover"] button:focus-visible * {
+            background: #0d0d0d !important;
+            border-color: #0d0d0d !important;
+            color: #FFFFFF !important;
+            -webkit-text-fill-color: #FFFFFF !important;
+        }
+        /* Popover panel: make "选择城市" and radio texts white */
+        [data-testid="stPopoverContent"] [data-testid="stWidgetLabel"],
+        [data-testid="stPopoverContent"] [data-testid="stWidgetLabel"] *,
+        [data-testid="stPopoverContent"] label,
+        [data-testid="stPopoverContent"] label *,
+        [data-testid="stPopoverContent"] [role="radiogroup"] *,
+        [data-testid="stPopoverContent"] [role="radio"] * {
+            color: #FFFFFF !important;
+            -webkit-text-fill-color: #FFFFFF !important;
+        }
+        [data-baseweb="popover"] [data-testid="stWidgetLabel"],
+        [data-baseweb="popover"] [data-testid="stWidgetLabel"] *,
+        [data-baseweb="popover"] .stRadio [data-testid="stWidgetLabel"],
+        [data-baseweb="popover"] .stRadio [data-testid="stWidgetLabel"] *,
+        [data-baseweb="popover"] fieldset legend,
+        [data-baseweb="popover"] fieldset legend *,
+        [data-baseweb="popover"] label,
+        [data-baseweb="popover"] label * {
+            color: #FFFFFF !important;
+            -webkit-text-fill-color: #FFFFFF !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -2705,11 +2796,39 @@ def main() -> None:
 
     with st.expander("运行配置与说明", expanded=(status == "idle")):
         _render_notice("第0轮为基准模拟（不做优化）；运行采用早停机制，实际优化轮次会根据目标节能率和收敛情况自动决定。")
+        weather_options = _list_weather_city_options()
+        weather_label_map = {item["path"]: item["label"] for item in weather_options}
+        weather_paths = [item["path"] for item in weather_options]
+        default_epw_path = str(snapshot.get("config", {}).get("epw_path", weather_paths[0]) or weather_paths[0])
+        if default_epw_path not in weather_label_map:
+            default_epw_path = weather_paths[0]
+        if st.session_state.get("cfg_epw_path") not in weather_label_map:
+            st.session_state["cfg_epw_path"] = default_epw_path
+
         col_left, col_right = st.columns(2)
         with col_left:
             uploaded_idf = st.file_uploader("上传 IDF 模型文件", type=["idf"], key="idf_uploader", help="必填。上传后将自动复制到运行目录，不改动原始算法逻辑。")
         with col_right:
             uploaded_api = st.file_uploader("上传 API Key 文本文件", type=["txt"], key="api_uploader", help="必填。内容应为可用密钥，等价于原来的 api_key.txt。")
+
+        st.markdown("### 气象城市配置")
+        if hasattr(st, "popover"):
+            with st.popover("选择城市气象数据", use_container_width=False):
+                st.radio(
+                    "选择城市",
+                    options=weather_paths,
+                    format_func=lambda path: weather_label_map.get(path, path),
+                    key="cfg_epw_path",
+                )
+        else:
+            st.selectbox(
+                "选择城市气象数据",
+                options=weather_paths,
+                format_func=lambda path: weather_label_map.get(path, path),
+                key="cfg_epw_path",
+            )
+        selected_epw_path = str(st.session_state.get("cfg_epw_path", default_epw_path) or default_epw_path)
+        st.caption(f"当前城市气象：{weather_label_map.get(selected_epw_path, selected_epw_path)}")
 
         col_cfg_1, col_cfg_2, col_cfg_3 = st.columns(3)
         with col_cfg_1:
@@ -2744,7 +2863,7 @@ def main() -> None:
             <div class='glass config-card'>
                 <strong>固定配置</strong><br/>
                 IDD: {DEFAULT_IDD_PATH}<br/>
-                EPW: {DEFAULT_EPW_PATH}<br/>
+                EPW: {html.escape(selected_epw_path)}<br/>
                 日志目录: {DEFAULT_LOG_DIR}
             </div>
             """,
@@ -2769,7 +2888,7 @@ def main() -> None:
                 "idf_path": idf_path,
                 "idd_path": DEFAULT_IDD_PATH,
                 "api_key_path": api_key_path,
-                "epw_path": DEFAULT_EPW_PATH,
+                "epw_path": selected_epw_path,
                 "log_dir": DEFAULT_LOG_DIR,
                 "max_iterations": int(max_iterations_cap) + 1,
                 "optimization_rounds": int(max_iterations_cap),
