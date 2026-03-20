@@ -68,6 +68,7 @@ def _build_default_capture_state() -> dict[str, Any]:
         "parameter_details_history": [],
         "baseline_log": None,
         "baseline_log_history": [],
+        "early_stopped": False,
         "latest_status": "等待启动",
         "status_updated_at": None,
         "collecting_summary": False,
@@ -115,6 +116,7 @@ def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "i
             "parameter_details_history": [],
             "baseline_log": None,
             "baseline_log_history": [],
+            "early_stopped": False,
             "latest_status": "等待启动",
             "status_updated_at": None,
             "iteration_history": [],
@@ -584,6 +586,7 @@ def _compose_snapshot(
             "parameter_details_history": capture.get("parameter_details_history", []),
             "baseline_log": capture.get("baseline_log"),
             "baseline_log_history": capture.get("baseline_log_history", []),
+            "early_stopped": bool(capture.get("early_stopped", False)),
             "latest_status": capture.get("latest_status", "等待日志输出"),
             "status_updated_at": capture.get("status_updated_at"),
             "iteration_history": history,
@@ -655,6 +658,8 @@ class WebCaptureHandler(logging.Handler):
 
         with self.capture_lock:
             workflow_state = self.capture_state.setdefault(workflow_id, _build_default_capture_state())
+            if "早停" in message:
+                workflow_state["early_stopped"] = True
             workflow_state["latest_status"] = _short_status(message)
             workflow_state["status_updated_at"] = datetime.now().strftime("%H:%M:%S")
             formatted_lines = _format_record_lines(record, message)
@@ -2125,16 +2130,17 @@ def _render_workflow_overview(snapshot: dict[str, Any]) -> None:
         max_iterations = int(workflow.get("max_iterations", 0) or 0)
         progress_pct = int((float(workflow.get("progress", 0.0) or 0.0)) * 100)
         latest_status = str(workflow.get("latest_status", "") or "")
+        early_stopped = bool(workflow.get("early_stopped", False))
 
         status_label = "未运行"
         badge_class = "badge-idle"
 
-        if "早停" in latest_status:
-            status_label = "已早停"
-            badge_class = "badge-stopped"
-        elif snapshot_status == "finished":
+        if snapshot_status == "finished":
             status_label = "已完成"
             badge_class = "badge-finished"
+        elif early_stopped or ("早停" in latest_status):
+            status_label = "已早停"
+            badge_class = "badge-stopped"
         elif any(keyword in latest_status for keyword in complete_keywords) or progress_pct >= 100:
             status_label = "已完成"
             badge_class = "badge-finished"
