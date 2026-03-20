@@ -32,6 +32,7 @@ DEFAULT_IDD_PATH = "Energy+.idd"
 DEFAULT_EPW_PATH = "weather.epw"
 DEFAULT_LOG_DIR = "optimization_logs_并行2_web"
 DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_EARLY_STOP_TARGET_SAVING_PCT = 60.0
 DEFAULT_NUM_WORKFLOWS = 2
 AUTO_REFRESH_SECONDS = 1.0
 UI_ACTION_COOLDOWN_SECONDS = 3.0
@@ -91,6 +92,11 @@ def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "i
     config = config or {}
     max_iterations = int(config.get("max_iterations", 5) or 5)
     optimization_rounds = int(config.get("optimization_rounds", _real_to_display_max_iterations(max_iterations)) or _real_to_display_max_iterations(max_iterations))
+    max_iterations_cap = int(config.get("max_iterations_cap", optimization_rounds) or optimization_rounds)
+    early_stop_target_total_saving_pct = float(
+        config.get("early_stop_target_total_saving_pct", DEFAULT_EARLY_STOP_TARGET_SAVING_PCT)
+        or DEFAULT_EARLY_STOP_TARGET_SAVING_PCT
+    )
     num_workflows = int(config.get("num_workflows", 2) or 2)
     workflows = {
         f"workflow_{index + 1}": {
@@ -131,6 +137,8 @@ def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "i
             "log_dir": config.get("log_dir", DEFAULT_LOG_DIR),
             "max_iterations": max_iterations,
             "optimization_rounds": optimization_rounds,
+            "max_iterations_cap": max_iterations_cap,
+            "early_stop_target_total_saving_pct": early_stop_target_total_saving_pct,
             "num_workflows": num_workflows,
         },
         "global_summary_log": None,
@@ -879,6 +887,11 @@ def _run_optimizer_in_thread(snapshot_path: str, config: dict[str, Any], runtime
         )
         snapshot_thread.start()
 
+        optimizer.max_iterations_cap = int(config.get("max_iterations_cap", config.get("optimization_rounds", DEFAULT_MAX_ITERATIONS)) or DEFAULT_MAX_ITERATIONS)
+        optimizer.early_stop_target_total_saving_pct = float(
+            config.get("early_stop_target_total_saving_pct", DEFAULT_EARLY_STOP_TARGET_SAVING_PCT)
+            or DEFAULT_EARLY_STOP_TARGET_SAVING_PCT
+        )
         optimizer.run_optimization_loop(max_iterations=int(config["max_iterations"]))
         runtime_state["status"] = "finished"
         runtime_state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -961,6 +974,7 @@ def _build_progressive_curve(dataframe: pd.DataFrame, workflow_id: str):
             "指标": ["制冷能耗"] * len(dataframe) + ["供暖能耗"] * len(dataframe),
         }
     )
+
     rounds = sorted({int(value) for value in dataframe["轮次"].tolist()})
     return (
         alt.Chart(melted)
@@ -991,6 +1005,52 @@ def _build_progressive_curve(dataframe: pd.DataFrame, workflow_id: str):
         .properties(
             width=1080,
             height=460,
+            padding={"left": 24, "right": 20, "top": 8, "bottom": 20},
+        )
+        .configure(background="#FCFCFA")
+        .configure_view(strokeWidth=1, stroke="#C8D3DE", fill="#FFFFFF")
+        .configure_axis(
+            grid=True,
+            gridColor="#D2DCE6",
+            domainColor="#516575",
+            tickColor="#516575",
+            labelColor="#253946",
+            titleColor="#1A2E3A",
+        )
+    )
+
+
+def _build_total_energy_curve(dataframe: pd.DataFrame, workflow_id: str):
+    if dataframe.empty:
+        return None
+
+    rounds = sorted({int(value) for value in dataframe["轮次"].tolist()})
+    curve_df = pd.DataFrame(
+        {
+            "轮次": list(dataframe["轮次"]),
+            "总建筑能耗(kWh)": list(dataframe["总建筑能耗(kWh)"]),
+        }
+    )
+    return (
+        alt.Chart(curve_df)
+        .mark_line(point=alt.OverlayMarkDef(size=120, filled=True), strokeWidth=3.2, color="#2A9D8F")
+        .encode(
+            x=alt.X(
+                "轮次:O",
+                title="迭代轮次",
+                sort=rounds,
+                axis=alt.Axis(labelAngle=0, labelFontSize=17, titleFontSize=22, labelPadding=8, titlePadding=16, titleFontWeight="bold"),
+            ),
+            y=alt.Y(
+                "总建筑能耗(kWh):Q",
+                title="总建筑能耗 (kWh)",
+                axis=alt.Axis(labelFontSize=17, titleFontSize=22, labelPadding=8, titlePadding=14, tickCount=6, titleFontWeight="bold"),
+            ),
+            tooltip=["轮次:O", alt.Tooltip("总建筑能耗(kWh):Q", format=".4f")],
+        )
+        .properties(
+            width=1080,
+            height=420,
             padding={"left": 24, "right": 20, "top": 8, "bottom": 20},
         )
         .configure(background="#FCFCFA")
@@ -1070,6 +1130,70 @@ def _build_all_workflows_progressive_curve(workflows: dict[str, dict[str, Any]])
     )
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
+def _build_all_workflows_total_energy_curve(workflows: dict[str, dict[str, Any]]):
+    rows = []
+    for workflow_id, workflow_snapshot in sorted((workflows or {}).items()):
+        dataframe = _build_metrics_dataframe(workflow_snapshot.get("iteration_history", []) or [])
+        if dataframe.empty:
+            continue
+        for _, row in dataframe.iterrows():
+            rows.append(
+                {
+                    "工作流": workflow_id,
+                    "轮次": int(row["轮次"]),
+                    "总建筑能耗(kWh)": float(row["总建筑能耗(kWh)"]),
+                }
+            )
+
+    if not rows:
+        return None
+
+    curve_df = pd.DataFrame(rows)
+    rounds = sorted({int(value) for value in curve_df["轮次"].tolist()})
+    workflow_ids = sorted({str(value) for value in curve_df["工作流"].tolist()})
+    color_range = [WORKFLOW_PALETTE[index % len(WORKFLOW_PALETTE)] for index in range(len(workflow_ids))]
+
+    return (
+        alt.Chart(curve_df)
+        .mark_line(point=alt.OverlayMarkDef(size=95, filled=True), strokeWidth=2.8)
+        .encode(
+            x=alt.X(
+                "轮次:O",
+                title="迭代轮次",
+                sort=rounds,
+                axis=alt.Axis(labelAngle=0, labelFontSize=17, titleFontSize=22, labelPadding=8, titlePadding=16, titleFontWeight="bold"),
+            ),
+            y=alt.Y(
+                "总建筑能耗(kWh):Q",
+                title="总建筑能耗 (kWh)",
+                axis=alt.Axis(labelFontSize=17, titleFontSize=22, labelPadding=8, titlePadding=14, tickCount=6, titleFontWeight="bold"),
+            ),
+            color=alt.Color(
+                "工作流:N",
+                scale=alt.Scale(domain=workflow_ids, range=color_range),
+                legend=None,
+            ),
+            tooltip=["工作流:N", "轮次:O", alt.Tooltip("总建筑能耗(kWh):Q", format=".4f")],
+        )
+        .properties(
+            width=1080,
+            height=420,
+            padding={"left": 24, "right": 20, "top": 8, "bottom": 20},
+        )
+        .configure(background="#FCFCFA")
+        .configure_view(strokeWidth=1, stroke="#C8D3DE", fill="#FFFFFF")
+        .configure_axis(
+            grid=True,
+            gridColor="#D2DCE6",
+            domainColor="#516575",
+            tickColor="#516575",
+            labelColor="#253946",
+            titleColor="#1A2E3A",
+        )
+    )
+
+
 def _render_summary_curve_header(workflow_ids: list[str]) -> None:
     workflow_items = []
     for index, workflow_id in enumerate(workflow_ids):
@@ -1091,6 +1215,28 @@ def _render_summary_curve_header(workflow_ids: list[str]) -> None:
                     <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-cooling'></span>制冷能耗（实线）</span>
                     <span class='chart-shell-legend-item'><span class='chart-shell-legend-line chart-shell-legend-heating'></span>供暖能耗（虚线）</span>
                 </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_summary_total_energy_curve_header(workflow_ids: list[str]) -> None:
+    workflow_items = []
+    for index, workflow_id in enumerate(workflow_ids):
+        color = WORKFLOW_PALETTE[index % len(WORKFLOW_PALETTE)]
+        workflow_items.append(
+            f"<span class='chart-shell-legend-item'><span class='chart-shell-legend-swatch' style='background:{color}'></span>{html.escape(workflow_id)}</span>"
+        )
+
+    st.markdown(
+        f"""
+        <div class='chart-shell-header'>
+            <div></div>
+            <div class='chart-shell-title'>并行工作流总建筑能耗迭代曲线</div>
+            <div class='chart-shell-legend'>
+                {''.join(workflow_items)}
             </div>
         </div>
         """,
@@ -1438,6 +1584,14 @@ def _render_style() -> None:
             border-color: #6A8D92;
             color: #1E3D47;
         }
+        .stButton button:disabled,
+        .stButton button:disabled *,
+        div[data-testid="stButton"] button:disabled,
+        div[data-testid="stButton"] button:disabled * {
+            color: #111111 !important;
+            -webkit-text-fill-color: #111111 !important;
+            opacity: 1 !important;
+        }
         .stButton button[kind="primary"] {
             background: linear-gradient(135deg, #2D6A8E, #3E8CB5);
             color: #FFFFFF;
@@ -1571,6 +1725,19 @@ def _render_style() -> None:
             font-weight: 700;
             margin-bottom: 6px;
         }
+        .workflow-status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 700;
+            color: #ffffff;
+            margin-left: 8px;
+        }
+        .workflow-status-badge.badge-stopped { background: #ff7a45; }
+        .workflow-status-badge.badge-running { background: #0b84ff; }
+        .workflow-status-badge.badge-finished { background: #2ea44f; }
+        .workflow-status-badge.badge-idle { background: #95a5a6; }
         .mono-block {
             white-space: pre-wrap;
             font-size: 13px;
@@ -1949,13 +2116,38 @@ def _render_number_input_focus_fix() -> None:
 def _render_workflow_overview(snapshot: dict[str, Any]) -> None:
     cards = []
     workflows = snapshot.get("workflows") or {}
+    snapshot_status = str(snapshot.get("status", "idle") or "idle")
+    is_running = snapshot_status in {"running", "starting"}
+    complete_keywords = ("优化完成", "并行优化循环完成", "优化完成汇总")
     for workflow_id in _visible_workflow_ids(snapshot):
         workflow = workflows.get(workflow_id, {})
         current_iteration = int(workflow.get("current_iteration", 0) or 0)
         max_iterations = int(workflow.get("max_iterations", 0) or 0)
         progress_pct = int((float(workflow.get("progress", 0.0) or 0.0)) * 100)
+        latest_status = str(workflow.get("latest_status", "") or "")
+
+        status_label = "未运行"
+        badge_class = "badge-idle"
+
+        if "早停" in latest_status:
+            status_label = "已早停"
+            badge_class = "badge-stopped"
+        elif snapshot_status == "finished":
+            status_label = "已完成"
+            badge_class = "badge-finished"
+        elif any(keyword in latest_status for keyword in complete_keywords) or progress_pct >= 100:
+            status_label = "已完成"
+            badge_class = "badge-finished"
+        elif is_running:
+            status_label = "运行中"
+            badge_class = "badge-running"
+
         cards.append(
-            f"<div class='workflow-chip'><strong>{workflow_id}</strong>"
+            f"<div class='workflow-chip'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+            f"<strong>{workflow_id}</strong>"
+            f"<span class='workflow-status-badge {badge_class}'>{html.escape(status_label)}</span>"
+            f"</div>"
             f"<div>进度：第 {current_iteration}/{max_iterations} 轮</div>"
             f"<div>完成度：{progress_pct}%</div></div>"
         )
@@ -2163,6 +2355,14 @@ def _render_summary_page(snapshot: dict[str, Any], running: bool = False) -> Non
         st.altair_chart(summary_curve, width='stretch')
     else:
         _render_notice("正在准备并行汇总曲线数据，生成后会自动显示完整图像。")
+
+    summary_total_energy_curve = _build_all_workflows_total_energy_curve(workflows)
+    if summary_total_energy_curve is not None:
+        st.markdown("### 并行工作流总建筑能耗可视化曲线")
+        _render_summary_total_energy_curve_header(sorted(workflows.keys()))
+        st.altair_chart(summary_total_energy_curve, width='stretch')
+    else:
+        _render_notice("正在准备并行总建筑能耗曲线数据，生成后会自动显示完整图像。")
 
     summary_log_payload = _fallback_global_summary_log(snapshot)
     _render_text_panel(
@@ -2376,7 +2576,7 @@ def _render_runtime_hint(status: str, workflow_snapshot: dict[str, Any]) -> None
     max_iterations = int(workflow_snapshot.get("max_iterations", DEFAULT_MAX_ITERATIONS) or DEFAULT_MAX_ITERATIONS)
     latest_status = str(workflow_snapshot.get("latest_status", "正在处理中...") or "正在处理中...")
     status_time = workflow_snapshot.get("status_updated_at")
-    prefix = f"第 {current_iteration}/{max_iterations} 轮"
+    prefix = f"第 {current_iteration} 轮（最大 {max_iterations} 轮，早停自动结束）"
     if status_time:
         _render_notice(f"{prefix} | {latest_status} | 更新时间 {status_time}")
     else:
@@ -2498,14 +2698,14 @@ def main() -> None:
     )
 
     with st.expander("运行配置与说明", expanded=(status == "idle")):
-        _render_notice("第0轮为基准模拟（不做优化）；设置的轮次为优化轮次。例如填写5，将执行 1次基准模拟 + 5次优化。")
+        _render_notice("第0轮为基准模拟（不做优化）；运行采用早停机制，实际优化轮次会根据目标节能率和收敛情况自动决定。")
         col_left, col_right = st.columns(2)
         with col_left:
             uploaded_idf = st.file_uploader("上传 IDF 模型文件", type=["idf"], key="idf_uploader", help="必填。上传后将自动复制到运行目录，不改动原始算法逻辑。")
         with col_right:
             uploaded_api = st.file_uploader("上传 API Key 文本文件", type=["txt"], key="api_uploader", help="必填。内容应为可用密钥，等价于原来的 api_key.txt。")
 
-        col_cfg_1, col_cfg_2 = st.columns(2)
+        col_cfg_1, col_cfg_2, col_cfg_3 = st.columns(3)
         with col_cfg_1:
             num_workflows = st.number_input(
                 "并行工作流数量",
@@ -2515,12 +2715,22 @@ def main() -> None:
                 key="cfg_num_workflows",
             )
         with col_cfg_2:
-            optimization_rounds = st.number_input(
-                "优化轮次（不含第0轮基准）",
+            max_iterations_cap = st.number_input(
+                "最大优化迭代轮次",
                 min_value=1,
-                value=int(snapshot.get("config", {}).get("optimization_rounds", DEFAULT_MAX_ITERATIONS) or DEFAULT_MAX_ITERATIONS),
+                value=int(snapshot.get("config", {}).get("max_iterations_cap", snapshot.get("config", {}).get("optimization_rounds", DEFAULT_MAX_ITERATIONS)) or DEFAULT_MAX_ITERATIONS),
                 step=1,
-                key="cfg_optimization_rounds",
+                key="cfg_max_iterations_cap",
+            )
+        with col_cfg_3:
+            early_stop_target_total_saving_pct = st.number_input(
+                "最大节能幅度目标(%)",
+                min_value=0.1,
+                max_value=99.9,
+                value=float(snapshot.get("config", {}).get("early_stop_target_total_saving_pct", DEFAULT_EARLY_STOP_TARGET_SAVING_PCT) or DEFAULT_EARLY_STOP_TARGET_SAVING_PCT),
+                step=0.5,
+                format="%.1f",
+                key="cfg_early_stop_target_total_saving_pct",
             )
 
         st.markdown(
@@ -2555,8 +2765,10 @@ def main() -> None:
                 "api_key_path": api_key_path,
                 "epw_path": DEFAULT_EPW_PATH,
                 "log_dir": DEFAULT_LOG_DIR,
-                "max_iterations": int(optimization_rounds) + 1,
-                "optimization_rounds": int(optimization_rounds),
+                "max_iterations": int(max_iterations_cap) + 1,
+                "optimization_rounds": int(max_iterations_cap),
+                "max_iterations_cap": int(max_iterations_cap),
+                "early_stop_target_total_saving_pct": float(early_stop_target_total_saving_pct),
                 "num_workflows": int(num_workflows),
             }
             runtime_state = {"status": "starting", "started_at": None, "finished_at": None, "error": None}
@@ -2658,7 +2870,7 @@ def main() -> None:
     workflow_snapshot = (snapshot.get("workflows") or {}).get(selected_workflow, {}) or {}
 
     st.subheader(f"当前查看：{selected_workflow}")
-    round_text = f"第 {workflow_snapshot.get('current_iteration', 0)}/{workflow_snapshot.get('max_iterations', 0)} 轮"
+    round_text = f"第 {workflow_snapshot.get('current_iteration', 0)} 轮（最大 {workflow_snapshot.get('max_iterations', 0)} 轮）"
     st.markdown(f"<div class='progress-round-label'>{html.escape(round_text)}</div>", unsafe_allow_html=True)
     st.progress(min(max(float(workflow_snapshot.get("progress", 0.0) or 0.0), 0.0), 1.0))
 
@@ -2750,6 +2962,27 @@ def main() -> None:
         _render_notice("正在准备曲线图数据，生成后会自动显示完整图像。")
     else:
         _render_notice("尚未开始运行，启动后将在此显示实时曲线。")
+
+    st.markdown("### 总建筑能耗变化曲线")
+    total_energy_chart = _build_total_energy_curve(dataframe, selected_workflow)
+    if total_energy_chart is not None:
+        st.markdown(
+            f"""
+            <div class='chart-shell-header'>
+                <div></div>
+                <div class='chart-shell-title'>{html.escape(selected_workflow)} 总建筑能耗迭代曲线</div>
+                <div class='chart-shell-legend'>
+                    <span class='chart-shell-legend-item'><span class='chart-shell-legend-line' style='border-top: 3px solid #2A9D8F;'></span>总建筑能耗</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.altair_chart(total_energy_chart, width='stretch')
+    elif running:
+        _render_notice("正在准备总建筑能耗曲线数据，生成后会自动显示完整图像。")
+    else:
+        _render_notice("尚未开始运行，启动后将在此显示总建筑能耗曲线。")
 
     st.markdown("### 各项能耗指标与节能变化")
     if dataframe.empty:

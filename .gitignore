@@ -29,3 +29,5 @@
 /分成多个python文件的代码
 /.web_runtime
 /debug_web
+/main无早停.py
+/web无早停.py

@@ -100,7 +100,7 @@ class EnergyPlusOptimizer:
         self.early_stop_min_iterations = 4                  # 至少完成基准+3轮后再判定
         self.early_stop_convergence_patience = 2            # 连续N次增益极小判定收敛
         self.early_stop_min_delta_pct = 2                   # 节能率变化阈值（百分点）
-        self.max_iterations_cap = 15                        # 自动模式下的最大安全上限
+        self.max_iterations_cap = 20                        # 自动模式下的最大安全上限
         
         # 初始化各工作流的数据结构
         for i in range(num_workflows):
