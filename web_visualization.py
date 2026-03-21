@@ -166,6 +166,8 @@ def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "i
             "iteration_history": [],
             "best_metrics": None,
             "best_iteration": 0,
+            "suggestion_object_frequency": {},
+            "suggestion_field_frequency": {},
         }
         for index in range(num_workflows)
     }
@@ -450,11 +452,27 @@ def _clean_parameter_detail_lines(lines: list[str]) -> str:
 
 def _prepare_parameter_details_for_view(text: str, keep_total_summary_block: bool) -> str:
     filtered: list[str] = []
+    in_suggestion_frequency_block = False
     for line in _split_timestamp_log_lines(text):
         raw = _strip_log_prefix(line)
         if raw == "":
+            if in_suggestion_frequency_block:
+                in_suggestion_frequency_block = False
             filtered.append("")
             continue
+
+        # 建议频率已在独立区域展示，这里去重，避免结束阶段重复渲染导致卡顿。
+        if (
+            "【优化建议对象出现频率（仅最终执行建议）】" in raw
+            or "【优化建议字段出现频率（仅最终执行建议）】" in raw
+        ):
+            in_suggestion_frequency_block = True
+            continue
+        if in_suggestion_frequency_block:
+            if raw.startswith("【"):
+                in_suggestion_frequency_block = False
+            else:
+                continue
 
         is_total_block_line = (
             raw.startswith("【总】")
@@ -636,6 +654,16 @@ def _compose_snapshot(
             "iteration_history": history,
             "best_metrics": workflow_data.get("best_metrics"),
             "best_iteration": _real_to_display_iteration(int(workflow_data.get("best_iteration", 0) or 0)),
+            "suggestion_object_frequency": {
+                str(k): int(v)
+                for k, v in (workflow_data.get("suggestion_object_frequency", {}) or {}).items()
+                if int(v or 0) > 0
+            },
+            "suggestion_field_frequency": {
+                str(k): int(v)
+                for k, v in (workflow_data.get("suggestion_field_frequency", {}) or {}).items()
+                if int(v or 0) > 0
+            },
         }
 
         if not snapshot["workflows"][workflow_id].get("latest_parameter_details"):
@@ -2377,12 +2405,52 @@ def _render_workflow_best_section(
             )
         details_for_view["text"] = prepared_text
 
-    _render_text_panel(
-        details_title,
-        details_for_view,
-        "当前还没有抓取到本工作流最终参数修改详情。",
-        normalize_log_lines=True,
-    )
+    # 频率统计与参数详情部分：隔离在独立的容器中防止自动刷新时重复渲染。
+    with st.container():
+        if not keep_total_summary_block:
+            object_freq = {
+                str(k): int(v)
+                for k, v in (workflow_snapshot.get("suggestion_object_frequency", {}) or {}).items()
+                if int(v or 0) > 0
+            }
+            field_freq = {
+                str(k): int(v)
+                for k, v in (workflow_snapshot.get("suggestion_field_frequency", {}) or {}).items()
+                if int(v or 0) > 0
+            }
+
+            if object_freq or field_freq:
+                st.markdown("### 本工作流优化建议对象/字段出现频率")
+                st.markdown("#### 对象出现频率")
+                if object_freq:
+                    object_df = pd.DataFrame(
+                        [
+                            {"对象": key, "出现次数": count}
+                            for key, count in sorted(object_freq.items(), key=lambda x: (-x[1], x[0]))
+                        ]
+                    )
+                    _render_html_table(_stringify_dataframe(object_df))
+                else:
+                    st.markdown("<div class='glass'>暂无对象频率记录。</div>", unsafe_allow_html=True)
+
+                st.markdown("#### 字段出现频率")
+                if field_freq:
+                    field_df = pd.DataFrame(
+                        [
+                            {"字段": key, "出现次数": count}
+                            for key, count in sorted(field_freq.items(), key=lambda x: (-x[1], x[0]))
+                        ]
+                    )
+                    _render_html_table(_stringify_dataframe(field_df))
+                else:
+                    st.markdown("<div class='glass'>暂无字段频率记录。</div>", unsafe_allow_html=True)
+
+        _render_text_panel(
+            details_title,
+            details_for_view,
+            "当前还没有抓取到本工作流最终参数修改详情。",
+            normalize_log_lines=True,
+        )
 
 
 def _render_summary_page(snapshot: dict[str, Any], running: bool = False) -> None:
@@ -2719,43 +2787,36 @@ def _install_summary_finish_watcher(snapshot_path: str | None, selected_view: st
     if not snapshot_path or selected_view != "summary" or not running:
         return
 
-    fragment_api = getattr(st, "fragment", None)
-    if not callable(fragment_api):
+    # 不再使用 st.fragment(run_every=...)，避免全量 rerun 后旧 fragment 定时回调报错：
+    # "The fragment with id ... does not exist anymore"。
+    latest_snapshot = _read_snapshot(snapshot_path)
+    latest_status = str(latest_snapshot.get("status", "idle") or "idle")
+    state = st.session_state.get("web_ui_state")
+    if not isinstance(state, dict):
         return
 
-    interval = max(float(AUTO_REFRESH_SECONDS), 0.5)
+    if latest_status in {"running", "starting"}:
+        live_marker = latest_snapshot.get("updated_at") or latest_status
+        if state.get("summary_live_marker") != live_marker:
+            state["summary_live_marker"] = live_marker
 
-    @fragment_api(run_every=f"{interval}s")
-    def _summary_finish_poller() -> None:
-        latest_snapshot = _read_snapshot(snapshot_path)
-        latest_status = str(latest_snapshot.get("status", "idle") or "idle")
-        state = st.session_state.get("web_ui_state")
-        if not isinstance(state, dict):
-            return
-
-        if latest_status in {"running", "starting"}:
-            live_marker = latest_snapshot.get("updated_at") or latest_status
-            if state.get("summary_live_marker") != live_marker:
-                state["summary_live_marker"] = live_marker
-                now_ts = time.time()
-                last_rerun_ts = state.get("summary_last_rerun_ts", 0.0) or 0.0
-                if now_ts - last_rerun_ts >= 2.0:
-                    state["summary_last_rerun_ts"] = now_ts
-                    st.rerun()
-                    return
-            st.markdown("<div style='display:none'></div>", unsafe_allow_html=True)
-            return
-
-        if latest_status in {"finished", "error"}:
-            finish_marker = latest_snapshot.get("finished_at") or latest_status
-            if state.get("auto_summary_marker") == finish_marker:
-                return
-
-            state["selected_view"] = "summary"
-            state["auto_summary_marker"] = finish_marker
+        now_ts = time.time()
+        last_rerun_ts = state.get("summary_last_rerun_ts", 0.0) or 0.0
+        interval = max(float(AUTO_REFRESH_SECONDS), 0.8)
+        if now_ts - last_rerun_ts >= interval:
+            state["summary_last_rerun_ts"] = now_ts
+            time.sleep(0.05)
             st.rerun()
+        return
 
-    _summary_finish_poller()
+    if latest_status in {"finished", "error"}:
+        finish_marker = latest_snapshot.get("finished_at") or latest_status
+        if state.get("auto_summary_marker") == finish_marker:
+            return
+
+        state["selected_view"] = "summary"
+        state["auto_summary_marker"] = finish_marker
+        st.rerun()
 
 
 def main() -> None:
