@@ -112,11 +112,11 @@ class EnergyPlusOptimizer:
 
         # 早停配置：每条工作流独立判定是否收敛
         self.early_stop_enabled = True
-        self.early_stop_target_total_saving_pct = 60.0      # 达到目标节能率可提前停止
+        self.early_stop_target_total_saving_pct = 100.0      # 达到目标节能率可提前停止
         self.early_stop_min_iterations = 4                  # 至少完成基准+3轮后再判定
         self.early_stop_convergence_patience = 2            # 连续N次增益极小判定收敛
         self.early_stop_min_delta_pct = 2                   # 节能率变化阈值（百分点）
-        self.max_iterations_cap = 20                        # 自动模式下的最大安全上限
+        self.max_iterations_cap = 30                        # 自动模式下的最大安全上限
         
         # 初始化各工作流的数据结构
         for i in range(num_workflows):
@@ -130,6 +130,8 @@ class EnergyPlusOptimizer:
                 'last_round_fields': set(),
                 'suggestion_object_frequency': {},
                 'suggestion_field_frequency': {},
+                'suggestion_object_frequency_by_iteration': {},
+                'suggestion_field_frequency_by_iteration': {},
                 'workflow_total_duration_sec': 0.0,
                 'llm_total_duration_sec': 0.0,
                 'sim_total_duration_sec': 0.0,
@@ -2203,10 +2205,29 @@ modifications数组应包含至少{min_modifications}-{max_modifications}条修�
 
             obj_freq = wf.get('suggestion_object_frequency')
             field_freq = wf.get('suggestion_field_frequency')
+            obj_freq_by_iter = wf.get('suggestion_object_frequency_by_iteration')
+            field_freq_by_iter = wf.get('suggestion_field_frequency_by_iteration')
             if not isinstance(obj_freq, dict):
                 obj_freq = {}
             if not isinstance(field_freq, dict):
                 field_freq = {}
+            if not isinstance(obj_freq_by_iter, dict):
+                obj_freq_by_iter = {}
+            if not isinstance(field_freq_by_iter, dict):
+                field_freq_by_iter = {}
+
+            iteration_no = getattr(self._log_context, 'iteration', None)
+            try:
+                iteration_no = int(iteration_no) if iteration_no is not None else None
+            except Exception:
+                iteration_no = None
+
+            if iteration_no is not None:
+                iter_key = str(iteration_no)
+                if iter_key not in obj_freq_by_iter or not isinstance(obj_freq_by_iter.get(iter_key), dict):
+                    obj_freq_by_iter[iter_key] = {}
+                if iter_key not in field_freq_by_iter or not isinstance(field_freq_by_iter.get(iter_key), dict):
+                    field_freq_by_iter[iter_key] = {}
 
             for mod in modifications:
                 if not isinstance(mod, dict):
@@ -2216,6 +2237,9 @@ modifications数组应包含至少{min_modifications}-{max_modifications}条修�
                     continue
                 obj_key = obj_type.upper()
                 obj_freq[obj_key] = int(obj_freq.get(obj_key, 0)) + 1
+                if iteration_no is not None:
+                    iter_key = str(iteration_no)
+                    obj_freq_by_iter[iter_key][obj_key] = int(obj_freq_by_iter[iter_key].get(obj_key, 0)) + 1
 
                 fields = mod.get('fields', {})
                 if not isinstance(fields, dict):
@@ -2223,9 +2247,14 @@ modifications数组应包含至少{min_modifications}-{max_modifications}条修�
                 for field_name in fields.keys():
                     field_key = f"{obj_key}.{str(field_name).strip().upper()}"
                     field_freq[field_key] = int(field_freq.get(field_key, 0)) + 1
+                    if iteration_no is not None:
+                        iter_key = str(iteration_no)
+                        field_freq_by_iter[iter_key][field_key] = int(field_freq_by_iter[iter_key].get(field_key, 0)) + 1
 
             wf['suggestion_object_frequency'] = obj_freq
             wf['suggestion_field_frequency'] = field_freq
+            wf['suggestion_object_frequency_by_iteration'] = obj_freq_by_iter
+            wf['suggestion_field_frequency_by_iteration'] = field_freq_by_iter
     
     def _get_field_usage_summary(self, max_high_freq=10, max_low_freq=10):
         """生成字段使用频率摘要，用于LLM prompt"""
@@ -4570,6 +4599,9 @@ def _collect_run_export_rows(city, run_tag, optimizer, run_status="success", err
         'early_stop': [],
         'object_freq': [],
         'field_freq': [],
+        'iteration_object_freq': [],
+        'iteration_field_freq': [],
+        'run_frequency_combined': [],
     }
 
     if optimizer is None:
@@ -4741,6 +4773,98 @@ def _collect_run_export_rows(city, run_tag, optimizer, run_status="success", err
                 'frequency': int(count or 0),
             })
 
+        obj_freq_by_iter = wf.get('suggestion_object_frequency_by_iteration', {}) or {}
+        for iter_key, iter_map in sorted(obj_freq_by_iter.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 10**9):
+            if not isinstance(iter_map, dict):
+                continue
+            for obj_key, count in sorted(iter_map.items(), key=lambda x: (-x[1], x[0])):
+                rows['iteration_object_freq'].append({
+                    'city': city,
+                    'run_tag': run_tag,
+                    'workflow_id': workflow_id,
+                    'run_status': run_status,
+                    'error_message': str(error_message or ''),
+                    'iteration': int(iter_key) if str(iter_key).isdigit() else iter_key,
+                    'object_type': obj_key,
+                    'frequency': int(count or 0),
+                })
+
+        field_freq_by_iter = wf.get('suggestion_field_frequency_by_iteration', {}) or {}
+        for iter_key, iter_map in sorted(field_freq_by_iter.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 10**9):
+            if not isinstance(iter_map, dict):
+                continue
+            for field_key, count in sorted(iter_map.items(), key=lambda x: (-x[1], x[0])):
+                rows['iteration_field_freq'].append({
+                    'city': city,
+                    'run_tag': run_tag,
+                    'workflow_id': workflow_id,
+                    'run_status': run_status,
+                    'error_message': str(error_message or ''),
+                    'iteration': int(iter_key) if str(iter_key).isdigit() else iter_key,
+                    'object_field': field_key,
+                    'frequency': int(count or 0),
+                })
+
+        # 单次执行频率合并视图：同一sheet同时包含“按轮次”和“全轮次总和”
+        for obj_key, count in sorted(obj_freq.items(), key=lambda x: (-x[1], x[0])):
+            rows['run_frequency_combined'].append({
+                'city': city,
+                'run_tag': run_tag,
+                'workflow_id': workflow_id,
+                'run_status': run_status,
+                'error_message': str(error_message or ''),
+                'entity_type': 'object',
+                'scope': 'all_iterations',
+                'iteration': '',
+                'name': obj_key,
+                'frequency': int(count or 0),
+            })
+        for field_key, count in sorted(field_freq.items(), key=lambda x: (-x[1], x[0])):
+            rows['run_frequency_combined'].append({
+                'city': city,
+                'run_tag': run_tag,
+                'workflow_id': workflow_id,
+                'run_status': run_status,
+                'error_message': str(error_message or ''),
+                'entity_type': 'field',
+                'scope': 'all_iterations',
+                'iteration': '',
+                'name': field_key,
+                'frequency': int(count or 0),
+            })
+        for iter_key, iter_map in sorted(obj_freq_by_iter.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 10**9):
+            if not isinstance(iter_map, dict):
+                continue
+            for obj_key, count in sorted(iter_map.items(), key=lambda x: (-x[1], x[0])):
+                rows['run_frequency_combined'].append({
+                    'city': city,
+                    'run_tag': run_tag,
+                    'workflow_id': workflow_id,
+                    'run_status': run_status,
+                    'error_message': str(error_message or ''),
+                    'entity_type': 'object',
+                    'scope': 'by_iteration',
+                    'iteration': int(iter_key) if str(iter_key).isdigit() else iter_key,
+                    'name': obj_key,
+                    'frequency': int(count or 0),
+                })
+        for iter_key, iter_map in sorted(field_freq_by_iter.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 10**9):
+            if not isinstance(iter_map, dict):
+                continue
+            for field_key, count in sorted(iter_map.items(), key=lambda x: (-x[1], x[0])):
+                rows['run_frequency_combined'].append({
+                    'city': city,
+                    'run_tag': run_tag,
+                    'workflow_id': workflow_id,
+                    'run_status': run_status,
+                    'error_message': str(error_message or ''),
+                    'entity_type': 'field',
+                    'scope': 'by_iteration',
+                    'iteration': int(iter_key) if str(iter_key).isdigit() else iter_key,
+                    'name': field_key,
+                    'frequency': int(count or 0),
+                })
+
     return rows
 
 
@@ -4763,6 +4887,9 @@ def _export_city_xlsx(city_root, city, city_rows):
     early_rows = city_rows.get('early_stop', [])
     object_rows = city_rows.get('object_freq', [])
     field_rows = city_rows.get('field_freq', [])
+    iteration_object_rows = city_rows.get('iteration_object_freq', [])
+    iteration_field_rows = city_rows.get('iteration_field_freq', [])
+    run_frequency_combined_rows = city_rows.get('run_frequency_combined', [])
 
     wb = Workbook()
     default_sheet = wb.active
@@ -4791,12 +4918,21 @@ def _export_city_xlsx(city_root, city, city_rows):
     ]
     object_headers = ['city', 'run_tag', 'workflow_id', 'run_status', 'error_message', 'object_type', 'frequency']
     field_headers = ['city', 'run_tag', 'workflow_id', 'run_status', 'error_message', 'object_field', 'frequency']
+    iteration_object_headers = ['city', 'run_tag', 'workflow_id', 'run_status', 'error_message', 'iteration', 'object_type', 'frequency']
+    iteration_field_headers = ['city', 'run_tag', 'workflow_id', 'run_status', 'error_message', 'iteration', 'object_field', 'frequency']
+    run_frequency_combined_headers = [
+        'city', 'run_tag', 'workflow_id', 'run_status', 'error_message',
+        'entity_type', 'scope', 'iteration', 'name', 'frequency'
+    ]
 
     _write_rows_to_sheet(wb, 'run_summary', summary_rows, summary_headers)
     _write_rows_to_sheet(wb, 'round_details', detail_rows, detail_headers)
     _write_rows_to_sheet(wb, 'early_stop', early_rows, early_headers)
     _write_rows_to_sheet(wb, 'object_frequency', object_rows, object_headers)
     _write_rows_to_sheet(wb, 'field_frequency', field_rows, field_headers)
+    _write_rows_to_sheet(wb, 'iteration_object_frequency', iteration_object_rows, iteration_object_headers)
+    _write_rows_to_sheet(wb, 'iteration_field_frequency', iteration_field_rows, iteration_field_headers)
+    _write_rows_to_sheet(wb, 'run_frequency_breakdown', run_frequency_combined_rows, run_frequency_combined_headers)
 
     # 城市层聚合统计
     city_agg_rows = []
@@ -4821,6 +4957,28 @@ def _export_city_xlsx(city_root, city, city_rows):
     ]
     _write_rows_to_sheet(wb, 'city_aggregate', city_agg_rows, city_agg_headers)
 
+    # 10次执行（城市内所有run）频率汇总：对象与字段分别统计
+    city_freq_counter = defaultdict(int)
+    for row in object_rows:
+        key = f"object||{row.get('object_type', '')}"
+        city_freq_counter[key] += int(row.get('frequency', 0) or 0)
+    for row in field_rows:
+        key = f"field||{row.get('object_field', '')}"
+        city_freq_counter[key] += int(row.get('frequency', 0) or 0)
+
+    city_freq_rows = []
+    for combined_key, freq in sorted(city_freq_counter.items(), key=lambda x: (-x[1], x[0])):
+        entity_type, name = combined_key.split('||', 1)
+        city_freq_rows.append({
+            'city': city,
+            'entity_type': entity_type,
+            'name': name,
+            'total_frequency': int(freq or 0),
+        })
+
+    city_freq_headers = ['city', 'entity_type', 'name', 'total_frequency']
+    _write_rows_to_sheet(wb, 'city_10runs_frequency', city_freq_rows, city_freq_headers)
+
     output_path = os.path.join(city_root, f"{city}_统计汇总.xlsx")
     wb.save(output_path)
     return output_path
@@ -4834,7 +4992,7 @@ if __name__ == "__main__":
     WEATHER_DIR = "weather"
 
     # 仅运行指定四个城市，避免API费用过高
-    TARGET_CITIES = ["Beijing", "Guangzhou", "Shanghai", "Wuhan"]
+    TARGET_CITIES = ["Guangzhou", "Shanghai", "Wuhan"]
     RUNS_PER_CITY = 10
 
     # 所有城市结果统一收敛到该目录下
@@ -4865,6 +5023,9 @@ if __name__ == "__main__":
                 'early_stop': [],
                 'object_freq': [],
                 'field_freq': [],
+                'iteration_object_freq': [],
+                'iteration_field_freq': [],
+                'run_frequency_combined': [],
             }
 
             print("\n" + "=" * 100)
