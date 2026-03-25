@@ -112,11 +112,11 @@ class EnergyPlusOptimizer:
 
         # 早停配置：每条工作流独立判定是否收敛
         self.early_stop_enabled = True
-        self.early_stop_target_total_saving_pct = 100.0      # 达到目标节能率可提前停止
+        self.early_stop_target_total_saving_pct = 100.0     # 达到目标节能率可提前停止
         self.early_stop_min_iterations = 4                  # 至少完成基准+3轮后再判定
         self.early_stop_convergence_patience = 2            # 连续N次增益极小判定收敛
         self.early_stop_min_delta_pct = 2                   # 节能率变化阈值（百分点）
-        self.max_iterations_cap = 3                         # 自动模式下的最大安全上限
+        self.max_iterations_cap = 40                        # 自动模式下的最大安全上限
         
         # 初始化各工作流的数据结构
         for i in range(num_workflows):
@@ -4615,8 +4615,8 @@ if __name__ == "__main__":
     WEATHER_DIR = "weather"
 
     # 仅运行指定四个城市，避免API费用过高
-    TARGET_CITIES = ["Wuhan"]
-    RUNS_PER_CITY = 1
+    TARGET_CITIES = ["Harbin","Chengdu","Kunming"]
+    RUNS_PER_CITY = 10
 
     # 所有城市结果统一收敛到该目录下
     ROOT_OUTPUT_DIR = "各城市迭代结果"
