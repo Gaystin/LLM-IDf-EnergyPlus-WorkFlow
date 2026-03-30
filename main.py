@@ -4408,6 +4408,70 @@ def _write_rows_to_sheet(workbook, sheet_name, rows, headers):
         ws.append([row.get(col, "") for col in headers])
 
 
+def _build_run_round_metric_rows(detail_rows):
+    """从round_details提取按run/轮次的四指标数据（含第0轮基准）。"""
+    rows = []
+    for row in detail_rows or []:
+        rows.append({
+            'run_tag': row.get('run_tag', ''),
+            'workflow_id': row.get('workflow_id', ''),
+            'iteration': row.get('iteration', ''),
+            'total_site_energy_kwh': row.get('total_site_energy_kwh', ''),
+            'eui_kwh_per_m2': row.get('eui_kwh_per_m2', ''),
+            'total_cooling_kwh': row.get('total_cooling_kwh', ''),
+            'total_heating_kwh': row.get('total_heating_kwh', ''),
+            'run_status': row.get('run_status', ''),
+            'error_message': row.get('error_message', ''),
+        })
+
+    def _sort_key(item):
+        run_tag = str(item.get('run_tag', ''))
+        workflow_id = str(item.get('workflow_id', ''))
+        try:
+            iteration = int(item.get('iteration', 0) or 0)
+        except Exception:
+            iteration = 0
+        return (run_tag, workflow_id, iteration)
+
+    return sorted(rows, key=_sort_key)
+
+
+def _export_all_cities_run_round_metrics_xlsx(root_output_dir, city_metric_rows_map):
+    """导出跨城市汇总xlsx：每个城市一个sheet，内容为run-iteration四指标。"""
+    try:
+        from openpyxl import Workbook
+    except Exception as e:
+        raise RuntimeError(f"导出跨城市汇总xlsx失败，缺少openpyxl依赖: {e}")
+
+    wb = Workbook()
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+    headers = [
+        'run_tag', 'workflow_id', 'iteration',
+        'total_site_energy_kwh', 'eui_kwh_per_m2',
+        'total_cooling_kwh', 'total_heating_kwh',
+        'run_status', 'error_message'
+    ]
+
+    used_sheet_names = set()
+    for city, rows in sorted((city_metric_rows_map or {}).items(), key=lambda x: str(x[0])):
+        base_name = str(city or 'city').strip() or 'city'
+        sanitized = re.sub(r'[\\/*?:\[\]]', '_', base_name)[:31] or 'city'
+        sheet_name = sanitized
+        suffix = 1
+        while sheet_name in used_sheet_names:
+            tail = f"_{suffix}"
+            sheet_name = f"{sanitized[:31-len(tail)]}{tail}"
+            suffix += 1
+        used_sheet_names.add(sheet_name)
+        _write_rows_to_sheet(wb, sheet_name, rows, headers)
+
+    output_path = os.path.join(root_output_dir, "各城市_各run各轮四指标汇总.xlsx")
+    wb.save(output_path)
+    return output_path
+
+
 def _export_city_xlsx(city_root, city, city_rows):
     """导出城市级xlsx：汇总、轮次明细、早停、对象频率、字段频率。"""
     try:
@@ -4423,6 +4487,7 @@ def _export_city_xlsx(city_root, city, city_rows):
     iteration_object_rows = city_rows.get('iteration_object_freq', [])
     iteration_field_rows = city_rows.get('iteration_field_freq', [])
     run_frequency_combined_rows = city_rows.get('run_frequency_combined', [])
+    run_round_metric_rows = _build_run_round_metric_rows(detail_rows)
 
     wb = Workbook()
     default_sheet = wb.active
@@ -4457,6 +4522,12 @@ def _export_city_xlsx(city_root, city, city_rows):
         'city', 'run_tag', 'workflow_id', 'run_status', 'error_message',
         'entity_type', 'scope', 'iteration', 'name', 'frequency'
     ]
+    run_round_metric_headers = [
+        'run_tag', 'workflow_id', 'iteration',
+        'total_site_energy_kwh', 'eui_kwh_per_m2',
+        'total_cooling_kwh', 'total_heating_kwh',
+        'run_status', 'error_message'
+    ]
 
     _write_rows_to_sheet(wb, 'run_summary', summary_rows, summary_headers)
     _write_rows_to_sheet(wb, 'round_details', detail_rows, detail_headers)
@@ -4466,6 +4537,7 @@ def _export_city_xlsx(city_root, city, city_rows):
     _write_rows_to_sheet(wb, 'iteration_object_frequency', iteration_object_rows, iteration_object_headers)
     _write_rows_to_sheet(wb, 'iteration_field_frequency', iteration_field_rows, iteration_field_headers)
     _write_rows_to_sheet(wb, 'run_frequency_breakdown', run_frequency_combined_rows, run_frequency_combined_headers)
+    _write_rows_to_sheet(wb, 'run_round_metrics', run_round_metric_rows, run_round_metric_headers)
 
     # 城市层聚合统计
     city_agg_rows = []
@@ -4525,8 +4597,8 @@ if __name__ == "__main__":
     WEATHER_DIR = "weather"
 
     # 运行7个目标城市
-    TARGET_CITIES = ["Beijing"]
-    RUNS_PER_CITY = 1
+    TARGET_CITIES = ["Beijing","Wuhan","Guangzhou","Shanghai","Chengdu","Harbin","Kunming"]
+    RUNS_PER_CITY = 10
 
     # 所有城市结果统一收敛到该目录下
     ROOT_OUTPUT_DIR = "各城市迭代结果"
@@ -4546,6 +4618,7 @@ if __name__ == "__main__":
 
         total_runs = len(city_epw_map) * RUNS_PER_CITY
         completed_runs = 0
+        city_metric_rows_map = {}
 
         for city, epw_path in city_epw_map.items():
             city_root = os.path.join(ROOT_OUTPUT_DIR, city)
@@ -4624,8 +4697,19 @@ if __name__ == "__main__":
             try:
                 xlsx_path = _export_city_xlsx(city_root, city, city_rows)
                 print(f"✓ [{city}] 统计表导出完成: {xlsx_path}")
+                city_metric_rows_map[city] = _build_run_round_metric_rows(city_rows.get('round_details', []))
             except Exception as export_err:
                 print(f"✗ [{city}] 统计表导出失败: {export_err}")
+
+        # 额外导出跨城市汇总xlsx：每个城市一个sheet，记录各run各轮四指标
+        try:
+            all_city_xlsx_path = _export_all_cities_run_round_metrics_xlsx(
+                ROOT_OUTPUT_DIR,
+                city_metric_rows_map,
+            )
+            print(f"✓ 跨城市四指标汇总导出完成: {all_city_xlsx_path}")
+        except Exception as export_err:
+            print(f"✗ 跨城市四指标汇总导出失败: {export_err}")
 
         print("\n" + "=" * 100)
         print(f"全部批量任务结束，共执行 {completed_runs}/{total_runs} 次")
