@@ -20,6 +20,8 @@ from collections import defaultdict
 from eppy.modeleditor import IDF
 from openai import OpenAI
 from knowledge_base import EnergyPlusKnowledgeBase
+from llm_iteration_agent import LLMIterationEfficiencyAgent
+from climate_adaptation_agent import ClimateAdaptationAgent
 
 # 强制使用无界面绘图后端，避免Tkinter在多线程退出时触发Tcl_AsyncDelete崩溃
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -37,11 +39,13 @@ class EnergyPlusOptimizer:
         log_dir="optimization_logs_并行",
         optimization_dir="optimization_results_并行",
         plot_dir="optimization_plot_并行",
-        num_workflows=1
+        num_workflows=1,
+        city_name=None
     ):
         self.idf_path = idf_path
         self.idd_path = idd_path
         self.epw_path = epw_path
+        self.city_name = city_name
         self.log_dir = log_dir
         self.optimization_dir = optimization_dir
         self.plot_dir = plot_dir
@@ -110,13 +114,18 @@ class EnergyPlusOptimizer:
         self.workflows_lock = Lock()  # 保护共享资源的锁
         self.logger.info(f"初始化{num_workflows}条并行工作流")
 
-        # 早停配置：每条工作流独立判定是否收敛
+        # 早停配置：以“尽快达到目标节能率”为主
         self.early_stop_enabled = True
-        self.early_stop_target_total_saving_pct = 100.0     # 达到目标节能率可提前停止
-        self.early_stop_min_iterations = 4                  # 至少完成基准+3轮后再判定
+        self.early_stop_target_total_saving_pct = 50.0      # 达到目标节能率可提前停止
+        self.early_stop_min_iterations = 2                  # 至少完成基准+1轮后再判定
+        self.early_stop_convergence_enabled = False         # 仅以达到目标节能率作为早停触发条件
         self.early_stop_convergence_patience = 2            # 连续N次增益极小判定收敛
         self.early_stop_min_delta_pct = 2                   # 节能率变化阈值（百分点）
         self.max_iterations_cap = 40                        # 自动模式下的最大安全上限
+        self.iteration_efficiency_agent = LLMIterationEfficiencyAgent(
+            target_saving_pct=self.early_stop_target_total_saving_pct
+        )
+        self.climate_adaptation_agent = ClimateAdaptationAgent()
         
         # 初始化各工作流的数据结构
         for i in range(num_workflows):
@@ -127,6 +136,8 @@ class EnergyPlusOptimizer:
                 'iteration_history': [],
                 'current_idf_path': idf_path,
                 'field_modification_history': {},
+                'field_effectiveness': {},
+                'object_effectiveness': {},
                 'last_round_fields': set(),
                 'suggestion_object_frequency': {},
                 'suggestion_field_frequency': {},
@@ -189,105 +200,6 @@ class EnergyPlusOptimizer:
             }
         }
 
-        # 工程约束规则（参考 ASHRAE 常用范围 + 项目知识库范围）
-        # 用于防止多轮迭代后参数漂移到不合理区间。
-        self.engineering_constraint_rules = {
-            ("ZONEINFILTRATION:DESIGNFLOWRATE", "AIR_CHANGES_PER_HOUR"): {
-                "min": 0.1,
-                "max": 3.0,
-                "max_step_ratio": 0.30,
-            },
-            ("ZONEINFILTRATION:DESIGNFLOWRATE", "FLOW_RATE_PER_EXTERIOR_SURFACE_AREA"): {
-                "min": 1e-5,
-                "max": 0.01,
-                "max_step_ratio": 0.30,
-            },
-            ("ZONEINFILTRATION:DESIGNFLOWRATE", "FLOW_RATE_PER_FLOOR_AREA"): {
-                "min": 1e-6,
-                "max": 0.005,
-                "max_step_ratio": 0.30,
-            },
-            ("DESIGNSPECIFICATION:OUTDOORAIR", "OUTDOOR_AIR_FLOW_PER_PERSON"): {
-                "min": 0.005,
-                "max": 0.015,
-                "max_step_ratio": 0.20,
-            },
-            ("DESIGNSPECIFICATION:OUTDOORAIR", "OUTDOOR_AIR_FLOW_PER_ZONE_FLOOR_AREA"): {
-                "min": 0.0,
-                "max": 0.002,
-                "max_step_ratio": 0.25,
-            },
-            ("PEOPLE", "PEOPLE_PER_FLOOR_AREA"): {
-                "min": 0.02,
-                "max": 0.20,
-                "max_step_ratio": 0.25,
-            },
-            ("LIGHTS", "WATTS_PER_FLOOR_AREA"): {
-                "min": 3.0,
-                "max": 25.0,
-                "max_step_ratio": 0.30,
-            },
-            ("ELECTRICEQUIPMENT", "WATTS_PER_FLOOR_AREA"): {
-                "min": 3.0,
-                "max": 40.0,
-                "max_step_ratio": 0.30,
-            },
-            ("SIZING:ZONE", "ZONE_COOLING_DESIGN_SUPPLY_AIR_TEMPERATURE"): {
-                "min": 12.0,
-                "max": 18.0,
-                "max_step_abs": 1.5,
-            },
-            ("SIZING:ZONE", "ZONE_HEATING_DESIGN_SUPPLY_AIR_TEMPERATURE"): {
-                "min": 35.0,
-                "max": 55.0,
-                "max_step_abs": 2.0,
-            },
-            ("ZONEHVAC:IDEALLOADSAIRSYSTEM", "MINIMUM_COOLING_SUPPLY_AIR_TEMPERATURE"): {
-                "min": 12.0,
-                "max": 20.0,
-                "max_step_abs": 1.5,
-            },
-            ("ZONEHVAC:IDEALLOADSAIRSYSTEM", "MAXIMUM_HEATING_SUPPLY_AIR_TEMPERATURE"): {
-                "min": 35.0,
-                "max": 60.0,
-                "max_step_abs": 2.0,
-            },
-            ("ZONEHVAC:IDEALLOADSAIRSYSTEM", "SENSIBLE_HEAT_RECOVERY_EFFECTIVENESS"): {
-                "min": 0.0,
-                "max": 1.0,
-                "max_step_abs": 0.12,
-            },
-            ("ZONEHVAC:IDEALLOADSAIRSYSTEM", "LATENT_HEAT_RECOVERY_EFFECTIVENESS"): {
-                "min": 0.0,
-                "max": 1.0,
-                "max_step_abs": 0.12,
-            },
-            ("WINDOWMATERIAL:SIMPLEGLAZINGSYSTEM", "SOLAR_HEAT_GAIN_COEFFICIENT"): {
-                "min": 0.15,
-                "max": 0.90,
-                "max_step_abs": 0.08,
-            },
-            ("WINDOWMATERIAL:SIMPLEGLAZINGSYSTEM", "UFACTOR"): {
-                "min": 0.5,
-                "max": 7.0,
-                "max_step_ratio": 0.30,
-            },
-            ("MATERIAL", "CONDUCTIVITY"): {
-                "min": 0.01,
-                "max": 5.0,
-                "max_step_ratio": 0.35,
-            },
-            ("MATERIAL:NOMASS", "THERMAL_RESISTANCE"): {
-                "min": 0.05,
-                "max": 10.0,
-                "max_step_ratio": 0.35,
-            },
-        }
-
-        # 兜底规则：任何数值字段默认单步变化不超过 ±40%
-        self.default_engineering_constraint = {
-            "max_step_ratio": 0.40,
-        }
     
     def _setup_logging(self):
         """初始化日志系统"""
@@ -834,7 +746,7 @@ class EnergyPlusOptimizer:
         关键改进：基于历史修改频率，动态生成优化方向关键词，
         确保知识库能匹配到多样化的对象（人员、遮阳、新风等）
         """
-        if iteration == 1:
+        if iteration == 0:
             status_note = "初始基准模拟"
         else:
             status_note = f"第{iteration}轮迭代优化"
@@ -847,6 +759,9 @@ class EnergyPlusOptimizer:
             f"- 冷却能耗 {metrics['total_cooling_kwh']} kWh/m²\n"
             f"- 供暖能耗 {metrics['total_heating_kwh']} kWh/m²\n"
             f"\n【核心优化目标】必须同时降低总能耗、供暖能耗、制冷能耗三者，不允许其中任何一项上升。"
+            f"\n【本阶段达标目标】在修改幅度保持工程合理的前提下，优先用尽量少的迭代轮次，尽快达到总能耗节能率≥{self.early_stop_target_total_saving_pct:.1f}%。"
+            f"\n【迭代效率要求】每轮优先选择预期节能贡献更高的对象/字段组合，减少低收益尝试。"
+            f"\n【收敛行为要求】避免在目标阈值附近来回震荡；若上一轮出现反优化，本轮必须明确纠偏并提升总节能率。"
         )
 
         # 反馈上一轮效果，避免重复沿错误方向调整
@@ -877,6 +792,11 @@ class EnergyPlusOptimizer:
                     f"\n⚠️ 上一轮存在问题：{', '.join(problems)}。\n"
                     f"本轮必须针对性修正：\n"
                 )
+                if delta_total > 0:
+                    request += (
+                        "  - 上一轮总能耗上升，说明策略失效；本轮请优先替换为历史验证更有效的对象/字段组合，"
+                        "避免重复低收益尝试。\n"
+                    )
                 
                 # ========== 关键改进：供暖和制冷的平衡优化 ==========
                 # 检查是否制冷和供暖都在上升（最棘手的情况）
@@ -914,6 +834,53 @@ class EnergyPlusOptimizer:
             optimization_directions = self._get_dynamic_optimization_directions(iteration)
         
         request += f"\n{optimization_directions}"
+
+        # 达标冲刺意识：接近50%时减少低收益探索，优先跨越目标阈值
+        try:
+            if self.iteration_history:
+                baseline_metrics = self.iteration_history[0].get('metrics', {})
+                baseline_total = float(baseline_metrics.get('total_site_energy_kwh', 0.0) or 0.0)
+                current_total = float(metrics.get('total_site_energy_kwh', 0.0) or 0.0)
+                if baseline_total > 0:
+                    current_saving_pct = (baseline_total - current_total) / baseline_total * 100.0
+                    remaining_pct = max(0.0, float(self.early_stop_target_total_saving_pct) - current_saving_pct)
+                    if 0.0 < remaining_pct <= 5.0:
+                        request += (
+                            f"\n【达标冲刺模式】当前距离{self.early_stop_target_total_saving_pct:.1f}%目标仅剩{remaining_pct:.2f}个百分点。"
+                            f"在保持工程约束和三项指标同步优化前提下，请优先沿已验证有效方向微调，"
+                            f"减少低收益探索，尽快跨越目标阈值。"
+                        )
+        except Exception:
+            pass
+
+        # 气候适应智能体：提供城市气候分区/条件线索，供LLM自主判断，不做字段硬编码
+        try:
+            climate_directive = self.climate_adaptation_agent.build_directive(
+                epw_path=self.epw_path,
+                city_name=self.city_name,
+            )
+            if climate_directive:
+                request += f"\n\n{climate_directive}"
+        except Exception as e:
+            self.logger.debug(f"生成气候适应上下文失败，跳过该增强: {e}")
+
+        # 迭代效率智能体：把历史表现转成下一轮策略提示，辅助LLM以更少轮次达标
+        try:
+            field_effectiveness = {}
+            with self.workflows_lock:
+                current_wf = self.workflows.get(getattr(self, 'current_workflow_id', None), {})
+                if isinstance(current_wf, dict):
+                    field_effectiveness = dict(current_wf.get('field_effectiveness', {}) or {})
+
+            efficiency_directive = self.iteration_efficiency_agent.build_directive(
+                iteration_history=list(self.iteration_history or []),
+                field_modification_history=dict(self.field_modification_history or {}),
+                field_effectiveness=field_effectiveness,
+            )
+            if efficiency_directive:
+                request += f"\n\n{efficiency_directive}"
+        except Exception as e:
+            self.logger.debug(f"生成迭代效率提示失败，跳过该增强: {e}")
         
         request += f"\n请根据物理原理，推荐可执行的IDF参数修改方案（允许某些字段增大、另一些字段减小）。"
         
@@ -964,7 +931,7 @@ class EnergyPlusOptimizer:
             },
         ]
 
-        # 基于历史实际修改字段统计“方向使用频率”，优先推荐低频方向。
+        # 统计方向使用频率，仅做信息展示，不作为限制条件。
         usage_scores = {atom["name"]: 0 for atom in direction_atoms}
         for field_key, count in (self.field_modification_history or {}).items():
             key_upper = str(field_key).upper()
@@ -974,9 +941,8 @@ class EnergyPlusOptimizer:
 
         # 冲突场景下仅“弱偏好”balanced方向，不做硬禁止，保持灵活组合。
         def _rank(atom):
-            usage = usage_scores.get(atom["name"], 0)
             balanced_penalty = 0 if (not has_heating_cooling_conflict or "balanced" in atom.get("tags", [])) else 1
-            return (balanced_penalty, usage, atom["name"])
+            return (balanced_penalty, atom["name"])
 
         sorted_atoms = sorted(direction_atoms, key=_rank)
         focus_count = min(4, len(sorted_atoms))
@@ -993,14 +959,8 @@ class EnergyPlusOptimizer:
         directions_text += "- 说明：以下方向仅作引导，不做对象-字段死绑定；请基于候选对象字段自由排列组合。\n"
         for atom in focus_atoms:
             usage = usage_scores.get(atom["name"], 0)
-            usage_tag = "低频优先" if usage == 0 else f"历史使用{usage}次"
             sample_tokens = "、".join(atom["keywords"][:4])
-            directions_text += f"  • {atom['name']}（{usage_tag}，关键词示例：{sample_tokens}）：{atom['description']}\n"
-
-        if usage_scores:
-            most_used_name, most_used_count = max(usage_scores.items(), key=lambda x: x[1])
-            if most_used_count >= 3:
-                directions_text += f"\n⚠️ 历史上“{most_used_name}”使用较多（{most_used_count}次），本轮可适当扩展到其他方向。"
+            directions_text += f"  • {atom['name']}（历史使用{usage}次，关键词示例：{sample_tokens}）：{atom['description']}\n"
 
         return directions_text
 
@@ -1063,11 +1023,9 @@ class EnergyPlusOptimizer:
         max_modifications = min(6, max(4, candidates_count if candidates_count > 0 else 6))
         min_modifications = max(4, min(5, max_modifications))
 
-        # 每个工作流“第一轮优化建议（含其全部重试）”不启用低频/高频约束
-        has_iteration_history = len(getattr(self, 'iteration_history', []) or []) > 1
-        has_field_history = bool(getattr(self, 'field_modification_history', {})) or bool(getattr(self, 'last_round_fields', set()))
-        enable_novelty_constraints = has_iteration_history and has_field_history
-        base_novelty_directive = self._build_novelty_directive(None) if enable_novelty_constraints else ""
+        # 不启用“低频补充/反重复”约束，仅保留覆盖度与可执行性要求
+        enable_novelty_constraints = False
+        base_novelty_directive = ""
         system_prompt = self.knowledge_base.build_system_prompt()
         field_usage_summary = self._get_field_usage_summary()
         user_prompt = self.knowledge_base.build_user_prompt(
@@ -1089,18 +1047,7 @@ class EnergyPlusOptimizer:
 
             max_repair_attempts = max(2, min(3, len(kb_context.get('candidates', [])) // 3 if isinstance(kb_context, dict) else 2))
 
-            has_history_for_novelty = bool(getattr(self, 'field_modification_history', {})) or bool(getattr(self, 'last_round_fields', set()))
-
-            # 每个工作流首轮优化（含重试）不做低频补充，避免把探索阶段过早约束
-            if enable_novelty_constraints and has_history_for_novelty:
-                initial_augmented_plan = self._force_plan_diversity(
-                    plan,
-                    kb_context,
-                    target_min_categories=min_categories,
-                    enforce_novelty=True
-                )
-                if initial_augmented_plan:
-                    plan = initial_augmented_plan
+            # 不做“低频补充/反重复”增强，避免形成功能性限制
 
             category_count = self._count_plan_categories(plan)
             category_attempt = 0
@@ -1118,21 +1065,16 @@ class EnergyPlusOptimizer:
                     include_reason=False,
                     stage_suffix=f"第{category_attempt}次纠偏前失败候选（类别覆盖）"
                 )
-                novelty_directive = self._build_novelty_directive(plan) if enable_novelty_constraints else ""
-                anti_repeat_directive = self._build_retry_anti_repeat_directive(plan)
                 repair_prompt = user_prompt + f"""
 
 【纠偏重生成（必须遵守）】
 你上一版仅覆盖{category_count}个优化方面，未达到要求。
 请重新生成JSON，并满足：
 1) modifications 至少覆盖{min_categories}个不同对象类别（优化方面）
-2) {('必须优先使用“过去较少出现或未出现”的对象+字段组合，减少与上一轮重复' if enable_novelty_constraints else '优先扩大对象与字段组合的覆盖，不必受低频/高频历史约束')}
-3) 禁止重复沿用本轮已经过度重复的对象字段组合
+2) 优先扩大对象与字段组合覆盖，并优先选择预期收益更高的组合
+3) 优先扩大对象和字段覆盖，避免无效重复尝试
 4) 若提到“阈值/上下限/限制/最大/最小”，可修改IdealLoads阈值字段；否则优先修改Sizing:Zone设计温度字段
 5) 不得修改特殊关键字字段（autosize/autocalculate等）
-
-{novelty_directive}
-{anti_repeat_directive}
 """
                 repaired_plan = self._request_plan_from_llm(system_prompt, repair_prompt, temperature=min(0.35, 0.12 + 0.06 * category_attempt))
                 if repaired_plan:
@@ -1141,7 +1083,7 @@ class EnergyPlusOptimizer:
                         repaired_plan,
                         kb_context,
                         target_min_categories=min_categories,
-                        enforce_novelty=True
+                        enforce_novelty=False
                     ) if enable_novelty_constraints else None
                     candidate_plan = repaired_augmented_plan if repaired_augmented_plan else repaired_plan
                     repaired_count = self._count_plan_categories(candidate_plan)
@@ -1171,7 +1113,7 @@ class EnergyPlusOptimizer:
                     plan,
                     kb_context,
                     target_min_categories=min_categories,
-                    enforce_novelty=True
+                    enforce_novelty=False
                 )
                 if forced_category_plan:
                     forced_category_count = self._count_plan_categories(forced_category_plan)
@@ -1199,8 +1141,6 @@ class EnergyPlusOptimizer:
                     include_reason=False,
                     stage_suffix="第1次纠偏前失败候选（温度映射）"
                 )
-                novelty_directive = self._build_novelty_directive(plan) if enable_novelty_constraints else ""
-                anti_repeat_directive = self._build_retry_anti_repeat_directive(plan)
                 temp_repair_prompt = user_prompt + f"""
 
 【温度映射纠偏（必须遵守）】
@@ -1212,10 +1152,7 @@ class EnergyPlusOptimizer:
 2) 此时应优先修改 Sizing:Zone 的
    Zone_Cooling_Design_Supply_Air_Temperature / Zone_Heating_Design_Supply_Air_Temperature。
 3) 如果文本出现阈值语义，允许修改 IdealLoads 阈值字段；并鼓励同时保留设计温度优化。
-4) {('必须优先采用历史低频/未出现字段，避免重复上一轮字段。' if enable_novelty_constraints else '可自由组合对象字段，优先保证物理合理与可执行。')}
-
-{novelty_directive}
-{anti_repeat_directive}
+4) 可自由组合对象字段，优先保证物理合理与可执行。
 请重新生成严格JSON。
 """
                 temp_repaired_plan = self._request_plan_from_llm(system_prompt, temp_repair_prompt, temperature=0.18)
@@ -1256,22 +1193,17 @@ class EnergyPlusOptimizer:
                     include_reason=False,
                     stage_suffix=f"第{diversity_attempt}次纠偏前失败候选（字段多样性）"
                 )
-                novelty_directive = self._build_novelty_directive(plan) if enable_novelty_constraints else ""
-                anti_repeat_directive = self._build_retry_anti_repeat_directive(plan)
                 diversity_repair_prompt = user_prompt + f"""
 
 【字段多样性纠偏（必须遵守）】
 {diversity_issue}
 
 要求：
-1) 避免过度集中于少数高频字段，应优先选择历史中出现次数更少的对象字段
-2) 与上一轮重复字段比例必须<=50%，尽量使用上轮未出现字段
+1) 避免过度集中于少数字段，保持对象与字段覆盖度
+2) 在保证可执行和物理合理前提下，优先选择预期节能贡献更高的字段组合
 3) 至少覆盖多个对象类别（建议>=3）
-4) 参考【历史字段修改频率统计】，优先使用低频或未出现字段，避免高频字段
-5) 不得复用当前这版中已判定重复过高的对象字段组合
-
-{novelty_directive}
-{anti_repeat_directive}
+4) 参考【历史字段修改频率统计】，用于观察分布，不作为硬性选择限制
+5) 对象与字段组合应体现清晰的收益导向，避免低收益试探
 请重新生成包含更多样化字段的JSON方案。
 """
                 diversity_repaired_plan = self._request_plan_from_llm(system_prompt, diversity_repair_prompt, temperature=min(0.4, 0.16 + 0.08 * diversity_attempt))
@@ -1281,7 +1213,7 @@ class EnergyPlusOptimizer:
                         diversity_repaired_plan,
                         kb_context,
                         target_min_categories=min_categories,
-                        enforce_novelty=True
+                        enforce_novelty=False
                     ) if enable_novelty_constraints else None
                     candidate_plan = repaired_augmented_plan if repaired_augmented_plan else diversity_repaired_plan
                     repaired_is_diverse, repaired_issue = self._check_field_diversity(candidate_plan)
@@ -1315,7 +1247,7 @@ class EnergyPlusOptimizer:
                     plan,
                     kb_context,
                     target_min_categories=min_categories,
-                    enforce_novelty=True
+                    enforce_novelty=False
                 ) if enable_novelty_constraints else None
                 if diversity_forced_plan:
                     forced_is_diverse, forced_issue = self._check_field_diversity(diversity_forced_plan)
@@ -1367,10 +1299,6 @@ class EnergyPlusOptimizer:
             if isinstance(kb_context, dict):
                 candidates = kb_context.get('candidates', []) or []
 
-            field_history = {
-                str(k).upper(): int(v)
-                for k, v in self.field_modification_history.items()
-            } if hasattr(self, 'field_modification_history') else {}
             last_round_fields = set(getattr(self, 'last_round_fields', set()) or set())
 
             # 收集可补充候选（仅数值且非特殊关键字）
@@ -1391,17 +1319,13 @@ class EnergyPlusOptimizer:
                     if field_key in used_fields:
                         continue
 
-                    freq = field_history.get(field_key, 0)
                     is_new_object = 0 if obj_type in origin_categories else 1
-                    is_unseen_field = 1 if field_key not in field_history else 0
                     not_in_last_round = 1 if field_key not in last_round_fields else 0
 
-                    # 按“历史出现少 + 本轮未用 + 上轮未用 + 新对象类别”综合排序
+                    # 按“优先补齐对象类别 + 本轮未用 + 稳定字典序”排序，不做低频/高频偏置
                     sort_key = (
-                        -is_unseen_field,
-                        -not_in_last_round,
                         -is_new_object,
-                        freq,
+                        -not_in_last_round,
                         obj_type,
                         field_name.upper()
                     )
@@ -1412,33 +1336,15 @@ class EnergyPlusOptimizer:
             target_new_categories = max(0, int(target_min_categories) - len(origin_categories))
             max_additions = max(2, min(10, target_new_categories + 4))
 
-            # 若与上一轮重复率偏高，动态增加补充项以提升通过概率
-            if enforce_novelty and last_round_fields and origin_fields:
-                overlap_count = len(origin_fields & last_round_fields)
-                # 目标：overlap / total <= 0.5 => total >= 2 * overlap
-                need_total = overlap_count * 2
-                need_extra = max(0, need_total - len(origin_fields))
-                if need_extra > 0:
-                    max_additions = min(12, max(max_additions, need_extra + 1))
-
-            # 灵活策略：以低频/未出现字段为主，但允许少量历史字段保留稳定性
-            novelty_quota = max(1, int(max_additions * 0.7))
-            novelty_added = 0
+            # 仅根据覆盖度控制补充数量，不做“低频补充”要求
+            if last_round_fields and origin_fields:
+                max_additions = min(12, max(max_additions, 4))
 
             added_count = 0
             covered_categories = set(origin_categories)
             for _, target_type, field_name, field_key in supplement_pool:
                 if added_count >= max_additions:
                     break
-
-                # enforce_novelty=True 时，优先跳过上轮字段；若池子太小则后续自然会补到
-                if (
-                    enforce_novelty
-                    and field_key in last_round_fields
-                    and len(supplement_pool) > max_additions
-                    and novelty_added < novelty_quota
-                ):
-                    continue
 
                 expr = self._build_balanced_expression_for_field(target_type, field_name)
                 forced_plan['modifications'].append({
@@ -1451,8 +1357,6 @@ class EnergyPlusOptimizer:
                 used_fields.add(field_key)
                 covered_categories.add(target_type)
                 added_count += 1
-                if field_key not in last_round_fields:
-                    novelty_added += 1
 
                 if len(covered_categories) >= int(target_min_categories) and added_count >= 2:
                     break
@@ -1468,13 +1372,13 @@ class EnergyPlusOptimizer:
 
             if len(covered_categories) > len(origin_categories):
                 self.logger.info(
-                    f"自动多样性重排：补充了{added_count}项字段（低频优先，含少量稳定字段）；对象类别覆盖由{len(origin_categories)}提升到{len(covered_categories)}"
+                    f"自动多样性重排：补充了{added_count}项字段（覆盖度优先）；对象类别覆盖由{len(origin_categories)}提升到{len(covered_categories)}"
                 )
                 if len(origin_categories) == 0:
                     self.logger.info("说明：原方案缺少有效对象类别（通常是modifications为空或字段无效），重排后已补入可执行对象类别")
             else:
                 self.logger.info(
-                    f"自动多样性重排：补充了{added_count}项字段（低频优先，含少量稳定字段）；对象类别保持{len(covered_categories)}（本次主要用于降低字段重复）"
+                    f"自动多样性重排：补充了{added_count}项字段（覆盖度优先）；对象类别保持{len(covered_categories)}"
                 )
             return self._deduplicate_plan_modifications(forced_plan, context_tag="自动多样性重排")
         
@@ -1881,6 +1785,49 @@ class EnergyPlusOptimizer:
         # 更新上一轮字段列表（供下一轮对比）
         self.last_round_fields = current_round_fields
 
+    def _update_effectiveness_history(self, workflow_id, delta_total_saved_kwh):
+        """记录本轮字段/对象的实际节能效果（相对上一轮）。"""
+        if not workflow_id or workflow_id not in self.workflows:
+            return
+
+        try:
+            delta = float(delta_total_saved_kwh)
+        except Exception:
+            return
+
+        round_fields = set(self.last_round_fields or set())
+        if not round_fields:
+            return
+
+        with self.workflows_lock:
+            wf = self.workflows.get(workflow_id)
+            if not wf:
+                return
+
+            field_eff = wf.get('field_effectiveness')
+            if not isinstance(field_eff, dict):
+                field_eff = {}
+
+            object_eff = wf.get('object_effectiveness')
+            if not isinstance(object_eff, dict):
+                object_eff = {}
+
+            for field_key in round_fields:
+                fk = str(field_key).upper().strip()
+                rec = field_eff.get(fk, {'uses': 0, 'total_delta_kwh': 0.0})
+                rec['uses'] = int(rec.get('uses', 0)) + 1
+                rec['total_delta_kwh'] = float(rec.get('total_delta_kwh', 0.0)) + delta
+                field_eff[fk] = rec
+
+                obj_type = fk.split('.', 1)[0] if '.' in fk else fk
+                orec = object_eff.get(obj_type, {'uses': 0, 'total_delta_kwh': 0.0})
+                orec['uses'] = int(orec.get('uses', 0)) + 1
+                orec['total_delta_kwh'] = float(orec.get('total_delta_kwh', 0.0)) + delta
+                object_eff[obj_type] = orec
+
+            wf['field_effectiveness'] = field_eff
+            wf['object_effectiveness'] = object_eff
+
     def _update_suggestion_frequency_for_workflow(self, workflow_id, plan):
         """统计每轮最终执行建议中的对象/字段出现频率（按工作流独立记录）。"""
         if not workflow_id or workflow_id not in self.workflows:
@@ -2152,69 +2099,6 @@ class EnergyPlusOptimizer:
 
         if corrected > 0:
             self.logger.info(f"[物理约束修正汇总] 共修正 {corrected} 项潜在反优化增大修改")
-
-        return target_updates
-
-    def _enforce_engineering_constraints(self, target_updates):
-        """按工程范围与单步变化约束修正参数，防止偏颇更新。"""
-        if not target_updates:
-            return target_updates
-
-        def _to_float(v):
-            try:
-                return float(v)
-            except Exception:
-                return None
-
-        def _clamp(v, lo, hi):
-            return max(lo, min(hi, v))
-
-        corrected = 0
-        for upd in target_updates:
-            obj_u = str(upd.get('type', '')).upper()
-            field_u = str(upd.get('field', '')).upper()
-            rule = self.engineering_constraint_rules.get((obj_u, field_u), self.default_engineering_constraint)
-
-            old_num = _to_float(upd.get('old_value'))
-            new_num = _to_float(upd.get('value'))
-            if old_num is None or new_num is None:
-                continue
-
-            original_new = new_num
-
-            # 1) 绝对上下限约束
-            min_v = rule.get('min', None)
-            max_v = rule.get('max', None)
-            if min_v is not None and max_v is not None:
-                new_num = _clamp(new_num, float(min_v), float(max_v))
-
-            # 2) 单步相对变化约束
-            max_step_ratio = rule.get('max_step_ratio', None)
-            if max_step_ratio is not None and old_num != 0:
-                max_abs_delta = abs(old_num) * float(max_step_ratio)
-                delta = new_num - old_num
-                if abs(delta) > max_abs_delta:
-                    new_num = old_num + (max_abs_delta if delta > 0 else -max_abs_delta)
-
-            # 3) 单步绝对变化约束（温度等）
-            max_step_abs = rule.get('max_step_abs', None)
-            if max_step_abs is not None:
-                delta = new_num - old_num
-                if abs(delta) > float(max_step_abs):
-                    new_num = old_num + (float(max_step_abs) if delta > 0 else -float(max_step_abs))
-
-            if abs(new_num - original_new) > 1e-12:
-                upd['value'] = round(new_num, 6)
-                upd['coefficient'] = (upd['value'] / old_num) if old_num != 0 else None
-                upd['expression'] = f"{upd.get('expression', '')} | auto_engineering_constraint".strip()
-                corrected += 1
-                self.logger.info(
-                    f"  [工程约束修正] {upd.get('type')} ({upd.get('name')}): {upd.get('field')} "
-                    f"{original_new} -> {upd['value']}"
-                )
-
-        if corrected > 0:
-            self.logger.info(f"[工程约束修正汇总] 共修正 {corrected} 项偏颇修改")
 
         return target_updates
 
@@ -2690,9 +2574,6 @@ class EnergyPlusOptimizer:
         # ========== 【关键】先执行物理方向强约束，防止关键负荷参数被增大 ==========
         target_updates = self._enforce_no_reverse_energy_updates(target_updates)
 
-        # ========== 工程约束：限制上下界与单步变化，防止参数漂移到不合理区间 ==========
-        target_updates = self._enforce_engineering_constraints(target_updates)
-
         # ========== 再过滤相关参数反向修改 ==========
         target_updates = self._filter_conflicting_parameter_modifications(target_updates)
 
@@ -2979,7 +2860,7 @@ class EnergyPlusOptimizer:
             f"({_safe_pct(heating_saved_vs_baseline, baseline_metrics['total_heating_kwh']):+.2f}%)"
         )
 
-        if iteration > 1 and len(self.iteration_history) >= 2:
+        if iteration > 0 and len(self.iteration_history) >= 2:
             prev_metrics = self.iteration_history[-2]['metrics']
 
             total_saved_vs_prev = prev_metrics['total_site_energy_kwh'] - metrics['total_site_energy_kwh']
@@ -3042,6 +2923,9 @@ class EnergyPlusOptimizer:
                 continue
             saving_series.append((baseline_total - curr_total) / baseline_total * 100.0)
 
+        if not bool(getattr(self, 'early_stop_convergence_enabled', True)):
+            return False, ""
+
         patience = max(1, int(self.early_stop_convergence_patience))
         if len(saving_series) < patience + 1:
             return False, ""
@@ -3066,10 +2950,16 @@ class EnergyPlusOptimizer:
         self.logger.info(f"\n{'█'*80}")
         self.logger.info(f"启动{max_iterations}轮迭代优化 (并行{self.num_workflows}条工作流)")
         self.logger.info("执行模型说明：工作流在线程池并行推进；日志会按完成先后交错显示，不代表串行执行")
-        self.logger.info(
-            f"早停策略：目标节能率≥{self.early_stop_target_total_saving_pct:.2f}% 或最近"
-            f"{self.early_stop_convergence_patience}轮节能率变化≤{self.early_stop_min_delta_pct:.2f}个百分点"
-        )
+        if bool(getattr(self, 'early_stop_convergence_enabled', True)):
+            self.logger.info(
+                f"早停策略：目标节能率≥{self.early_stop_target_total_saving_pct:.2f}% 或最近"
+                f"{self.early_stop_convergence_patience}轮节能率变化≤{self.early_stop_min_delta_pct:.2f}个百分点"
+            )
+        else:
+            self.logger.info(
+                f"早停策略：仅当目标节能率达到≥{self.early_stop_target_total_saving_pct:.2f}%时停止，"
+                f"用于评估达到目标所需最小迭代轮次"
+            )
         self.logger.info(f"{'█'*80}\n")
         
         parallel_start = perf_counter()
@@ -3110,10 +3000,10 @@ class EnergyPlusOptimizer:
         try:
             self._log_context.workflow_id = workflow_id
             self.logger.info(f"\n{'█'*80}")
-            self.logger.info(f"启动{max_iterations}轮迭代优化")
+            self.logger.info(f"启动{max_iterations}轮迭代优化（第0轮为基准模拟）")
             self.logger.info(f"{'█'*80}\n")
 
-            for iteration in range(1, max_iterations + 1):
+            for iteration in range(0, max_iterations + 1):
                 self.logger.info(f"\n{'═'*80}")
                 self.logger.info(f"【第{iteration}轮/{max_iterations}】")
                 self.logger.info(f"{'═'*80}\n")
@@ -3129,7 +3019,7 @@ class EnergyPlusOptimizer:
                     self.field_modification_history = dict(self.workflows[workflow_id].get('field_modification_history', {}))
                     self.last_round_fields = set(self.workflows[workflow_id].get('last_round_fields', set()))
 
-                if iteration == 1:
+                if iteration == 0:
                     sim_idf = current_idf_path
                     iter_name = "initial_baseline"
                 else:
@@ -3188,7 +3078,7 @@ class EnergyPlusOptimizer:
                     break
 
                 # 仅在新IDF模拟与提取都成功后，才把它确认为工作流当前IDF
-                if iteration > 1 and 'candidate_modified_idf' in locals() and candidate_modified_idf and os.path.exists(candidate_modified_idf):
+                if iteration > 0 and 'candidate_modified_idf' in locals() and candidate_modified_idf and os.path.exists(candidate_modified_idf):
                     with self.workflows_lock:
                         self.workflows[workflow_id]['current_idf_path'] = candidate_modified_idf
 
@@ -3197,7 +3087,7 @@ class EnergyPlusOptimizer:
                         'iteration': iteration,
                         'metrics': metrics,
                         'idf_path': sim_idf,
-                        'plan_description': '基准模拟' if iteration == 1 else '优化方案',
+                        'plan_description': '基准模拟' if iteration == 0 else '优化方案',
                         'is_early_stop_trigger_iteration': False,
                         'early_stop_reason': ''
                     })
@@ -3208,11 +3098,25 @@ class EnergyPlusOptimizer:
                 self._print_iteration_savings(metrics, iteration)
                 self.update_best_metrics(metrics, iteration)
 
+                delta_saved_for_effectiveness = None
                 with self.workflows_lock:
                     self.workflows[workflow_id]['best_metrics'] = self.best_metrics
                     self.workflows[workflow_id]['best_iteration'] = self.best_iteration
                     self.workflows[workflow_id]['field_modification_history'] = dict(self.field_modification_history)
                     self.workflows[workflow_id]['last_round_fields'] = set(self.last_round_fields)
+
+                    # 记录本轮相对上一轮的实际收益，供后续LLM学习有效字段
+                    if iteration > 0 and len(self.workflows[workflow_id]['iteration_history']) >= 2:
+                        prev_metrics = self.workflows[workflow_id]['iteration_history'][-2].get('metrics', {})
+                        try:
+                            prev_total = float(prev_metrics.get('total_site_energy_kwh', 0.0) or 0.0)
+                            curr_total = float(metrics.get('total_site_energy_kwh', 0.0) or 0.0)
+                            delta_saved_for_effectiveness = prev_total - curr_total
+                        except Exception:
+                            delta_saved_for_effectiveness = 0.0
+
+                if delta_saved_for_effectiveness is not None:
+                    self._update_effectiveness_history(workflow_id, delta_saved_for_effectiveness)
 
                 should_stop, stop_reason = self._should_early_stop_workflow(workflow_id)
                 if should_stop:
@@ -3315,7 +3219,7 @@ class EnergyPlusOptimizer:
                             for item in iteration_history:
                                 iteration = item.get('iteration')
                                 m = item.get('metrics', {})
-                                if iteration == 1:
+                                if iteration == 0:
                                     status = '基准'
                                 elif iteration == workflow_data.get('best_iteration'):
                                     status = '最优 ✓'
@@ -3355,10 +3259,15 @@ class EnergyPlusOptimizer:
 
                             best_iter = workflow_data.get('best_iteration', 0)
                             best_idf_path = None
-                            if best_iter and iteration_history and 1 <= best_iter <= len(iteration_history):
-                                best_idf_path = iteration_history[best_iter - 1].get('idf_path')
+                            if best_iter is not None and iteration_history and 0 <= best_iter < len(iteration_history):
+                                best_idf_path = iteration_history[best_iter].get('idf_path')
 
-                            best_from_line = f"最优方案来自: 第{best_iter}轮优化" if best_iter else "最优方案来自: N/A"
+                            if best_iter is None:
+                                best_from_line = "最优方案来自: N/A"
+                            elif best_iter == 0:
+                                best_from_line = "最优方案来自: 第0轮基准模拟"
+                            else:
+                                best_from_line = f"最优方案来自: 第{best_iter}轮优化"
                             idf_line = f"对应IDF: {best_idf_path or 'N/A'}"
                             self.logger.info("")
                             self.logger.info(best_from_line)
@@ -3413,7 +3322,8 @@ class EnergyPlusOptimizer:
                                     wlogger.info("  LLM各次耗时明细:")
                                 for idx, rec in enumerate(llm_records, start=1):
                                     extra = rec.get('extra', {}) or {}
-                                    iter_text = f"第{extra.get('iteration')}轮" if extra.get('iteration') else "未知轮次"
+                                    iter_no = extra.get('iteration')
+                                    iter_text = f"第{iter_no}轮" if iter_no is not None else "未知轮次"
                                     global_idx = extra.get('global_call_index', '?')
                                     temp_val = extra.get('temperature', '?')
                                     detail = (
@@ -3447,8 +3357,8 @@ class EnergyPlusOptimizer:
 
                         try:
                             best_iter = workflow_data.get('best_iteration', 0)
-                            if best_iter and iteration_history and 1 <= best_iter <= len(iteration_history):
-                                best_idf = iteration_history[best_iter - 1].get('idf_path')
+                            if best_iter is not None and iteration_history and 0 <= best_iter < len(iteration_history):
+                                best_idf = iteration_history[best_iter].get('idf_path')
                                 lines = self._format_optimal_parameters(self.idf_path, best_idf)
                                 for l in lines:
                                     self.logger.info(l)
@@ -3464,8 +3374,8 @@ class EnergyPlusOptimizer:
                         self.logger.info(f"\n[{workflow_id}] 无有效最优结果")
                         try:
                             best_iter = workflow_data.get('best_iteration', 0)
-                            if best_iter and iteration_history and 1 <= best_iter <= len(iteration_history):
-                                best_idf = iteration_history[best_iter - 1].get('idf_path')
+                            if best_iter is not None and iteration_history and 0 <= best_iter < len(iteration_history):
+                                best_idf = iteration_history[best_iter].get('idf_path')
                                 lines = self._format_optimal_parameters(self.idf_path, best_idf)
                                 for l in lines:
                                     self.logger.info(l)
@@ -3609,8 +3519,8 @@ class EnergyPlusOptimizer:
                     # 保存最优IDF路径 - 检查索引是否合法
                     iteration_history = all_workflows[global_best_workflow]['iteration_history']
                     best_iteration = all_workflows[global_best_workflow]['best_iteration']
-                    if best_iteration > 0 and best_iteration <= len(iteration_history):
-                        best_idf_path = iteration_history[best_iteration - 1]['idf_path']
+                    if best_iteration is not None and 0 <= best_iteration < len(iteration_history):
+                        best_idf_path = iteration_history[best_iteration]['idf_path']
                         self.logger.info(f"最优IDF文件: {best_idf_path}")
                     else:
                         self.logger.warning(f"⚠️ 无效的最优轮次索引: {best_iteration}")
@@ -3622,8 +3532,8 @@ class EnergyPlusOptimizer:
                     if global_best and global_best_workflow:
                         gh_iteration_history = all_workflows[global_best_workflow].get('iteration_history', [])
                         gh_best_iter = all_workflows[global_best_workflow].get('best_iteration', 0)
-                        if gh_best_iter and gh_iteration_history and 1 <= gh_best_iter <= len(gh_iteration_history):
-                            gh_best_idf = gh_iteration_history[gh_best_iter - 1].get('idf_path')
+                        if gh_best_iter is not None and gh_iteration_history and 0 <= gh_best_iter < len(gh_iteration_history):
+                            gh_best_idf = gh_iteration_history[gh_best_iter].get('idf_path')
                             gh_lines = self._format_optimal_parameters(self.idf_path, gh_best_idf)
                             # 写到汇总日志（无需额外前缀，因为已在全局上下文）
                             for ln in gh_lines:
@@ -4193,7 +4103,7 @@ def _extract_iteration_from_label(call_label):
     """从 simulation call_label 解析迭代轮次。"""
     label = str(call_label or "").strip().lower()
     if label == "initial_baseline":
-        return 1
+        return 0
     match = re.search(r"iteration_(\d+)", label)
     if match:
         try:
@@ -4614,9 +4524,9 @@ if __name__ == "__main__":
     API_KEY_PATH = "api_key.txt"
     WEATHER_DIR = "weather"
 
-    # 仅运行指定四个城市，避免API费用过高
-    TARGET_CITIES = ["Harbin","Chengdu","Kunming"]
-    RUNS_PER_CITY = 10
+    # 运行7个目标城市
+    TARGET_CITIES = ["Beijing"]
+    RUNS_PER_CITY = 1
 
     # 所有城市结果统一收敛到该目录下
     ROOT_OUTPUT_DIR = "各城市迭代结果"
@@ -4678,6 +4588,7 @@ if __name__ == "__main__":
                         idd_path=IDD_PATH,
                         api_key_path=API_KEY_PATH,
                         epw_path=epw_path,
+                        city_name=city,
                         log_dir=log_dir,
                         optimization_dir=optimization_dir,
                         plot_dir=plot_dir

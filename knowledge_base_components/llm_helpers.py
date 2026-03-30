@@ -28,12 +28,12 @@ def build_novelty_directive(
     rejected_plan_keys: Set[str] = None,
     max_items: int = 10,
 ) -> str:
-    """构建给LLM的低频/未出现字段约束。"""
-    lines = ["【低频与新颖性硬约束（必须遵守）】"]
+    """构建给LLM的字段分布信息提示（非硬约束）。"""
+    lines = ["【字段分布信息（仅供参考，非硬约束）】"]
 
     last_round = sorted(list(last_round_fields or set()))
     if last_round:
-        lines.append("1) 以下为上一轮已使用字段，除非必要请避免复用：")
+        lines.append("1) 以下为上一轮已使用字段：")
         for key in last_round[:max_items]:
             lines.append(f"   - {key}")
 
@@ -41,18 +41,18 @@ def build_novelty_directive(
         sorted_freq = sorted(field_modification_history.items(), key=lambda x: x[1], reverse=True)
         high_freq = [str(k).upper() for k, _ in sorted_freq[:max_items]]
         if high_freq:
-            lines.append("2) 以下为历史高频字段，本轮应尽量避免：")
+            lines.append("2) 以下为历史高频字段（信息展示）：")
             for key in high_freq:
                 lines.append(f"   - {key}")
 
     rejected_keys = sorted(list(rejected_plan_keys or set()))
     if rejected_keys:
-        lines.append("3) 以下为当前被判定不合格方案涉及字段，重生成时应优先避免原样重复（可保留少量已验证字段）：")
+        lines.append("3) 以下为当前被判定不合格方案涉及字段（信息展示）：")
         for key in rejected_keys[:max_items]:
             lines.append(f"   - {key}")
 
-    lines.append("4) 请优先从候选中选择历史低频或未出现字段，并尽量与上一轮至少50%不同。")
-    lines.append("5) 若可行字段不足，可保留少量高价值历史字段，同时扩大对象类型覆盖，避免机械重复。")
+    lines.append("4) 请选择物理合理、可执行且收益更高的字段组合。")
+    lines.append("5) 建议保持对象类型覆盖度，避免单一方向反复试探。")
     return "\n".join(lines)
 
 
@@ -61,23 +61,23 @@ def build_retry_anti_repeat_directive(
     rejected_plan_keys: Set[str] = None,
     max_items: int = 12,
 ) -> str:
-    """构建重试反重复约束。"""
-    lines = ["【重试反重复约束（必须遵守）】"]
+    """构建重试信息提示（非硬约束）。"""
+    lines = ["【重试信息提示（仅供参考，非硬约束）】"]
 
     previous_fields = sorted(list(last_round_fields or set()))
     if previous_fields:
-        lines.append("1) 以下是上一轮已实际修改字段，本轮与其重合比例必须<=50%，禁止原样照搬：")
+        lines.append("1) 以下是上一轮已实际修改字段：")
         for key in previous_fields[:max_items]:
             lines.append(f"   - {key}")
 
     rejected_fields = sorted(list(rejected_plan_keys or set()))
     if rejected_fields:
-        lines.append("2) 以下是刚刚被判失败的字段集合，下一次重试不得与其完全相同：")
+        lines.append("2) 以下是刚刚被判失败的字段集合（信息展示）：")
         for key in rejected_fields[:max_items]:
             lines.append(f"   - {key}")
 
-    lines.append("3) 若仍选择上述部分字段，必须同时加入足够多的新字段，使总重合比例降到50%以下。")
-    lines.append("4) 不要只改措辞；reasoning 和 modifications 都必须体现新的字段组合。")
+    lines.append("3) 请优先保证修改可执行、物理合理、且预期节能收益更高。")
+    lines.append("4) reasoning 和 modifications 应保持一致。")
     return "\n".join(lines)
 
 
@@ -102,12 +102,12 @@ def get_field_usage_summary(
     summary = "【历史字段修改频率统计】\n"
 
     if high_freq_fields:
-        summary += "⚠️ 高频修改字段（已被过度使用，本轮应避免或减少使用）：\n"
+        summary += "⚠️ 高频修改字段（统计信息）：\n"
         for field, count in high_freq_fields:
             summary += f"  - {field}: 已使用 {count} 次\n"
 
     if low_freq_fields:
-        summary += "\n✅ 低频修改字段（推荐优先使用，增加优化多样性）：\n"
+        summary += "\n✅ 低频修改字段（统计信息）：\n"
         for field, count in low_freq_fields:
             summary += f"  - {field}: 仅使用 {count} 次\n"
 
@@ -195,15 +195,8 @@ def check_field_diversity(
             field_key = f"{obj_type}.{str(field_name).upper()}"
             current_fields.add(field_key)
 
-    if last_round_fields and len(current_fields) > 0:
-        overlap_fields = current_fields & set(last_round_fields)
-        overlap_ratio = len(overlap_fields) / len(current_fields)
-        if overlap_ratio > 0.5:
-            return False, (
-                f"本轮方案与上一轮重复率过高（{overlap_ratio:.1%}），"
-                f"{len(overlap_fields)}/{len(current_fields)}个字段与上一轮相同。"
-                "要求不同轮次至少50%字段不同，请选择新的优化方向。"
-            )
+    # 不再对“与上一轮重复率”设置硬限制。
+    # 保留多样性检查入口，便于后续扩展其它丰富度规则。
 
     if field_modification_history:
         sorted_fields = sorted(
