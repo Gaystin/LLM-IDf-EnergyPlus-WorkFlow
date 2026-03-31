@@ -4597,7 +4597,7 @@ if __name__ == "__main__":
     WEATHER_DIR = "weather"
 
     # 运行7个目标城市
-    TARGET_CITIES = ["Beijing","Wuhan","Guangzhou","Shanghai","Chengdu","Harbin","Kunming"]
+    TARGET_CITIES = ["Chengdu"]
     RUNS_PER_CITY = 10
 
     # 所有城市结果统一收敛到该目录下
