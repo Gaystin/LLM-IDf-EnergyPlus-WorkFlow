@@ -1,6 +1,5 @@
 import argparse
 import os
-import re
 import textwrap
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -90,6 +89,12 @@ def _wrap_label(label: str, width: int = 18) -> str:
     return "\n".join(textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=False))
 
 
+def _display_item_label(item_col: str) -> str:
+    if item_col == "object_type":
+        return "object"
+    return str(item_col)
+
+
 def _blue_red_cmap() -> mcolors.Colormap:
     # High values -> red, low values -> blue.
     # Use warm red and softened blue with a gentle neutral transition.
@@ -100,13 +105,6 @@ def _blue_red_cmap() -> mcolors.Colormap:
         "#E47C6B",  # warm red
     ]
     return mcolors.LinearSegmentedColormap.from_list("warm_blue_to_red", color_list, N=256)
-
-
-def _blue_red_palette(n: int) -> List:
-    cmap = _blue_red_cmap()
-    if n <= 1:
-        return [cmap(0.6)]
-    return [cmap(v) for v in np.linspace(0.05, 0.95, n)]
 
 
 def _red_blue_palette(n: int) -> List:
@@ -194,16 +192,6 @@ def _normalize_frequency_by_iterations(freq_df: pd.DataFrame, run_df: pd.DataFra
     return out
 
 
-def _extract_run_order(run_tag: str) -> float:
-    if pd.isna(run_tag):
-        return np.nan
-    text = str(run_tag)
-    match = re.search(r"(\d+)", text)
-    if not match:
-        return np.nan
-    return float(match.group(1))
-
-
 def discover_city_excels(root_dir: Path) -> List[Path]:
     files = sorted(root_dir.glob("*/*_统计汇总.xlsx"))
     files = [p for p in files if not p.name.startswith("~$")]
@@ -284,10 +272,6 @@ def load_all_data(root_dir: Path) -> Dict[str, pd.DataFrame]:
         df["workflow_id"] = df["workflow_id"].astype(str)
         df["run_key"] = df["city"] + "|" + df["run_tag"] + "|" + df["workflow_id"]
 
-    run_all["run_order"] = run_all["run_tag"].apply(_extract_run_order)
-    obj_all["run_order"] = obj_all["run_tag"].apply(_extract_run_order)
-    fld_all["run_order"] = fld_all["run_tag"].apply(_extract_run_order)
-
     obj_all = _normalize_frequency_by_iterations(obj_all, run_all)
     fld_all = _normalize_frequency_by_iterations(fld_all, run_all)
 
@@ -319,7 +303,7 @@ def plot_top_bar(freq_df: pd.DataFrame, item_col: str, city: str, out_file: Path
 
     agg = (
         city_df.groupby(item_col, as_index=False)["frequency"]
-        .sum()
+        .mean()
         .sort_values("frequency", ascending=False)
         .head(top_n)
     )
@@ -337,9 +321,10 @@ def plot_top_bar(freq_df: pd.DataFrame, item_col: str, city: str, out_file: Path
         ax=ax,
         palette=bar_colors,
     )
-    ax.set_title(f"{city} | Top {top_n} {item_col} by Frequency")
-    ax.set_xlabel("Total Normalized Frequency (%)")
-    ax.set_ylabel(item_col)
+    display_label = _display_item_label(item_col)
+    ax.set_title(f"{city} | Top {top_n} {display_label} by Mean Frequency")
+    ax.set_xlabel("Mean Normalized Frequency (%)")
+    ax.set_ylabel(display_label)
     _save_figure(fig, out_file)
 
 
@@ -361,9 +346,10 @@ def plot_city_item_heatmap(freq_df: pd.DataFrame, item_col: str, out_file: Path,
     fig, ax = plt.subplots(figsize=(max(16, len(top_items) * 1.0), max(7, len(pivot.index) * 1.1)))
     heat_cmap = _blue_red_cmap()
     sns.heatmap(pivot, cmap=heat_cmap, ax=ax, cbar_kws={"label": "Normalized Frequency (%)"})
-    ax.set_title(f"City vs {item_col} Normalized Frequency Heatmap (%) (Top {top_n})")
+    display_label = _display_item_label(item_col)
+    ax.set_title(f"City vs {display_label} Normalized Frequency Heatmap (%) (Top {top_n})")
     ax.set_xlabel("City", fontsize=16)
-    ax.set_ylabel(item_col, fontsize=16)
+    ax.set_ylabel(display_label, fontsize=16)
     # Requested axis label orientation: y labels horizontal, x labels 45 degrees.
     wrapped_y = [_wrap_label(t.get_text(), width=18) for t in ax.get_yticklabels()]
     ax.set_yticklabels(wrapped_y, rotation=0, fontsize=12)
@@ -499,15 +485,16 @@ def plot_freq_saving_scatter(metrics: pd.DataFrame, item_col: str, out_file: Pat
         ax=ax,
         legend="brief",
     )
-    ax.set_title(f"{item_col} Frequency vs Efficiency (City-Balanced, IQR shown)")
+    display_label = _display_item_label(item_col)
+    ax.set_title(f"{display_label} Frequency vs Efficiency (City-Balanced, IQR shown)")
     ax.set_xlabel("City-Balanced Median Frequency (%)")
     ax.set_ylabel("City-Balanced Efficiency per Frequency")
 
     # Keep legend outside to reduce overlap in dense scatter plots.
     if item_col == "object_field":
-        _legend_bottom(ax, title=item_col, max_cols=2, fontsize=6, wrap_width=12, top_y=-0.1)
+        _legend_bottom(ax, title=display_label, max_cols=2, fontsize=6, wrap_width=12, top_y=-0.1)
     else:
-        _legend_bottom(ax, title=item_col, max_cols=4, fontsize=8, wrap_width=16, top_y=-0.1)
+        _legend_bottom(ax, title=display_label, max_cols=4, fontsize=8, wrap_width=16, top_y=-0.1)
 
     _save_figure(fig, out_file)
 
@@ -586,38 +573,16 @@ def plot_quadrant(metrics: pd.DataFrame, item_col: str, out_file: Path) -> None:
     )
     ax.axvline(x_mid, color="red", linestyle="--", linewidth=1)
     ax.axhline(y_mid, color="red", linestyle="--", linewidth=1)
-    ax.set_title(f"{item_col} Quadrant: City-Balanced Frequency vs Efficiency (IQR shown)")
+    display_label = _display_item_label(item_col)
+    ax.set_title(f"{display_label} Quadrant: City-Balanced Frequency vs Efficiency (IQR shown)")
     ax.set_xlabel("City-Balanced Median Frequency (%)")
     ax.set_ylabel("City-Balanced Efficiency per Frequency")
 
     if item_col == "object_field":
-        _legend_bottom(ax, title=item_col, max_cols=2, fontsize=6, wrap_width=12, top_y=-0.1)
+        _legend_bottom(ax, title=display_label, max_cols=2, fontsize=6, wrap_width=12, top_y=-0.1)
     else:
-        _legend_bottom(ax, title=item_col, max_cols=4, fontsize=8, wrap_width=16, top_y=-0.1)
+        _legend_bottom(ax, title=display_label, max_cols=4, fontsize=8, wrap_width=16, top_y=-0.1)
 
-    _save_figure(fig, out_file)
-
-
-def plot_cumulative_contribution(metrics: pd.DataFrame, item_col: str, out_file: Path) -> None:
-    df = metrics.copy()
-    if df.empty:
-        return
-
-    df = df.sort_values("weighted_contribution", ascending=False)
-    total = df["weighted_contribution"].sum()
-    if pd.isna(total) or total == 0:
-        return
-
-    df["cum_ratio"] = df["weighted_contribution"].cumsum() / total
-    df["rank_ratio"] = np.arange(1, len(df) + 1) / len(df)
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.plot(df["rank_ratio"], df["cum_ratio"], marker="o", linewidth=1.4)
-    ax.set_title(f"{item_col} Cumulative Weighted Contribution")
-    ax.set_xlabel("Top-K Item Ratio")
-    ax.set_ylabel("Cumulative Contribution Ratio")
-    ax.set_ylim(0, 1.02)
-    ax.grid(True, linestyle="--", alpha=0.45)
     _save_figure(fig, out_file)
 
 
@@ -650,54 +615,10 @@ def plot_consistency_cv(freq_df: pd.DataFrame, item_col: str, out_file: Path, to
         ax=ax,
         palette=bar_colors,
     )
-    ax.set_title(f"{item_col} Cross-City Variability (CV, higher=more city-specific)")
+    display_label = _display_item_label(item_col)
+    ax.set_title(f"{display_label} Cross-City Variability (CV, higher=more city-specific)")
     ax.set_xlabel("Coefficient of Variation (CV)")
-    ax.set_ylabel(item_col)
-    _save_figure(fig, out_file)
-
-
-def plot_city_trend(freq_df: pd.DataFrame, item_col: str, city: str, out_file: Path, top_k: int) -> None:
-    city_df = freq_df[freq_df["city"] == city].copy()
-    if city_df.empty:
-        return
-
-    city_df = city_df.dropna(subset=["run_order"])
-    if city_df.empty:
-        return
-
-    top_items = (
-        city_df.groupby(item_col)["frequency"]
-        .sum()
-        .sort_values(ascending=False)
-        .head(top_k)
-        .index
-        .tolist()
-    )
-    sub = city_df[city_df[item_col].isin(top_items)].copy()
-    if sub.empty:
-        return
-
-    trend = (
-        sub.groupby(["run_order", item_col], as_index=False)["frequency"]
-        .sum()
-        .pivot_table(index="run_order", columns=item_col, values="frequency", fill_value=0.0)
-        .sort_index()
-    )
-    if trend.empty:
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for col in trend.columns:
-        ax.plot(trend.index, trend[col], marker="o", label=str(col))
-
-    ax.set_title(f"{city} | {item_col} Frequency Trend by Run")
-    ax.set_xlabel("Run Order")
-    ax.set_ylabel("Normalized Frequency (%)")
-    if item_col == "object_field":
-        _legend_bottom(ax, title=item_col, max_cols=2, fontsize=6, wrap_width=12, top_y=-0.1)
-    else:
-        _legend_bottom(ax, title=item_col, max_cols=4, fontsize=8, wrap_width=16, top_y=-0.1)
-    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.set_ylabel(display_label)
     _save_figure(fig, out_file)
 
 
@@ -732,9 +653,6 @@ def generate_all_plots(data: Dict[str, pd.DataFrame], output_dir: Path, top_n: i
     plot_quadrant(obj_metrics, "object_type", overall_dir / "object_quadrant.png")
     plot_quadrant(fld_metrics, "object_field", overall_dir / "field_quadrant.png")
 
-    plot_cumulative_contribution(obj_metrics, "object_type", overall_dir / "object_cumulative_contribution.png")
-    plot_cumulative_contribution(fld_metrics, "object_field", overall_dir / "field_cumulative_contribution.png")
-
     plot_consistency_cv(obj_df, "object_type", overall_dir / "object_city_variability_cv.png", top_n=top_n)
     plot_consistency_cv(fld_df, "object_field", overall_dir / "field_city_variability_cv.png", top_n=top_n)
 
@@ -746,9 +664,6 @@ def generate_all_plots(data: Dict[str, pd.DataFrame], output_dir: Path, top_n: i
 
         plot_top_bar(obj_df, "object_type", city, city_dir / "object_top_bar.png", top_n=min(15, top_n))
         plot_top_bar(fld_df, "object_field", city, city_dir / "field_top_bar.png", top_n=min(20, top_n))
-
-        plot_city_trend(obj_df, "object_type", city, city_dir / "object_trend_top5.png", top_k=5)
-        plot_city_trend(fld_df, "object_field", city, city_dir / "field_trend_top8.png", top_k=8)
 
     print(f"[OK] All plots and metrics exported to: {output_dir}")
 
