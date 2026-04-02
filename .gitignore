@@ -1,5 +1,6 @@
 /api_key.txt
 /Energy+.idd
+/Energy+v8.9.idd
 /energyplus 遍历.py
 /energyplus.exe
 /in.idf
@@ -10,10 +11,11 @@
 /各城市迭代结果
 /频率分析可视化输出
 /画图
-/50%早停图v1
-/50%早停图v2
-/各城市迭代结果50早停GPT5.4
+/50%节能目标
 /knowledge_base_components/__pycache__
 /knowledge_base_components/__init__.py
 /api key
 /debug
+/in_v8.9.idf
+/in_v8.9_plus.idf
+/in_v8.9.dsb
