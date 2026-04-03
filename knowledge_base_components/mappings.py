@@ -45,11 +45,11 @@ def build_keyword_mapping() -> Dict[str, List[str]]:
         "infiltration": ["ZoneInfiltration:DesignFlowRate"],
 
         # 设备相关
-        "设备": ["ElectricEquipment", "GasEquipment"],
-        "电气设备": ["ElectricEquipment"],
-        "设备功率": ["ElectricEquipment", "GasEquipment"],
-        "设备密度": ["ElectricEquipment", "GasEquipment"],
-        "equipment": ["ElectricEquipment", "GasEquipment"],
+        "设备": ["OtherEquipment", "ElectricEquipment", "GasEquipment"],
+        "电气设备": ["OtherEquipment", "ElectricEquipment"],
+        "设备功率": ["OtherEquipment", "ElectricEquipment", "GasEquipment"],
+        "设备密度": ["OtherEquipment", "ElectricEquipment", "GasEquipment"],
+        "equipment": ["OtherEquipment", "ElectricEquipment", "GasEquipment"],
 
         # 人员相关
         "人员": ["People"],
@@ -62,6 +62,34 @@ def build_keyword_mapping() -> Dict[str, List[str]]:
         "供暖": ["Heating:DesignDay", "ZoneHVAC:IdealLoadsAirSystem"],
         "制冷": ["Cooling:DesignDay", "ZoneHVAC:IdealLoadsAirSystem"],
         "hvac": ["ZoneHVAC:IdealLoadsAirSystem", "AirLoopHVAC"],
+        "vrf": [
+            "AirConditioner:VariableRefrigerantFlow",
+            "AirConditioner:VariableRefrigerantFlow:FluidTemperatureControl",
+            "ZoneHVAC:TerminalUnit:VariableRefrigerantFlow",
+            "ZoneHVAC:IdealLoadsAirSystem",
+        ],
+        "多联机": [
+            "AirConditioner:VariableRefrigerantFlow",
+            "AirConditioner:VariableRefrigerantFlow:FluidTemperatureControl",
+            "ZoneHVAC:TerminalUnit:VariableRefrigerantFlow",
+            "ZoneHVAC:IdealLoadsAirSystem",
+        ],
+        "变冷媒": [
+            "AirConditioner:VariableRefrigerantFlow",
+            "AirConditioner:VariableRefrigerantFlow:FluidTemperatureControl",
+            "ZoneHVAC:TerminalUnit:VariableRefrigerantFlow",
+            "ZoneHVAC:IdealLoadsAirSystem",
+        ],
+        "理想空气": ["ZoneHVAC:IdealLoadsAirSystem"],
+
+        # 日光与空气分配
+        "采光": ["Daylighting:Controls"],
+        "日光": ["Daylighting:Controls"],
+        "daylighting": ["Daylighting:Controls"],
+        "照度控制": ["Daylighting:Controls"],
+        "空气分配": ["DesignSpecification:ZoneAirDistribution"],
+        "送风效率": ["DesignSpecification:ZoneAirDistribution"],
+        "通风效率": ["DesignSpecification:ZoneAirDistribution"],
 
         # 温控设定点相关
         "温控": ["ThermostatSetpoint:DualSetpoint"],
@@ -83,9 +111,16 @@ def build_keyword_mapping() -> Dict[str, List[str]]:
         # 热回收相关
         "热回收": ["ZoneHVAC:IdealLoadsAirSystem"],
         "能量回收": ["ZoneHVAC:IdealLoadsAirSystem"],
+        "全热回收": ["ZoneHVAC:IdealLoadsAirSystem"],
+        "热回收效率": ["ZoneHVAC:IdealLoadsAirSystem"],
         "显热回收": ["ZoneHVAC:IdealLoadsAirSystem"],
         "潜热回收": ["ZoneHVAC:IdealLoadsAirSystem"],
+        "显热效率": ["ZoneHVAC:IdealLoadsAirSystem"],
+        "潜热效率": ["ZoneHVAC:IdealLoadsAirSystem"],
         "热交换": ["ZoneHVAC:IdealLoadsAirSystem"],
+        "回收效率": ["ZoneHVAC:IdealLoadsAirSystem"],
+        "HRV": ["ZoneHVAC:IdealLoadsAirSystem"],
+        "ERV": ["ZoneHVAC:IdealLoadsAirSystem"],
         "heat recovery": ["ZoneHVAC:IdealLoadsAirSystem"],
 
         # 区域设计参数
@@ -119,11 +154,19 @@ def build_field_keyword_mapping() -> Dict[str, Dict[str, List[str]]]:
     """
     return {
         "Lights": {
-            "功率": ["Watts_per_Floor_Area", "Watts_per_Person", "Lighting_Level"],
-            "密度": ["Watts_per_Floor_Area", "Watts_per_Person"],
-            "瓦特": ["Watts_per_Floor_Area", "Watts_per_Person", "Lighting_Level"],
-            "watts": ["Watts_per_Floor_Area", "Watts_per_Person", "Lighting_Level"],
-            "power": ["Watts_per_Floor_Area", "Watts_per_Person", "Lighting_Level"],
+            "功率": ["Watts_per_Zone_Floor_Area", "Watts_per_Floor_Area", "Watts_per_Person", "Lighting_Level"],
+            "密度": ["Watts_per_Zone_Floor_Area", "Watts_per_Floor_Area", "Watts_per_Person"],
+            "瓦特": ["Watts_per_Zone_Floor_Area", "Watts_per_Floor_Area", "Watts_per_Person", "Lighting_Level"],
+            "watts": ["Watts_per_Zone_Floor_Area", "Watts_per_Floor_Area", "Watts_per_Person", "Lighting_Level"],
+            "power": ["Watts_per_Zone_Floor_Area", "Watts_per_Floor_Area", "Watts_per_Person", "Lighting_Level"],
+        },
+        "OtherEquipment": {
+            "功率": ["Power_per_Zone_Floor_Area", "Power_per_Person", "Design_Level"],
+            "密度": ["Power_per_Zone_Floor_Area", "Power_per_Person"],
+            "瓦特": ["Power_per_Zone_Floor_Area", "Power_per_Person", "Design_Level"],
+            "watts": ["Power_per_Zone_Floor_Area", "Power_per_Person", "Design_Level"],
+            "power": ["Power_per_Zone_Floor_Area", "Power_per_Person", "Design_Level"],
+            "equipment": ["Power_per_Zone_Floor_Area", "Power_per_Person", "Design_Level"],
         },
         "Material": {
             "导热": ["Conductivity"],
@@ -143,20 +186,21 @@ def build_field_keyword_mapping() -> Dict[str, Dict[str, List[str]]]:
             "U值": ["UFactor"],
             "传热系数": ["UFactor"],
             "ufactor": ["UFactor"],
+            "shgc": ["Solar_Heat_Gain_Coefficient"],
+            "遮阳系数": ["Solar_Heat_Gain_Coefficient"],
+            "太阳热得": ["Solar_Heat_Gain_Coefficient"],
+            "可见光": ["Visible_Transmittance"],
+            "透光": ["Visible_Transmittance"],
         },
         "WindowMaterial:Glazing": {
-            "光学": [
-                "Solar_Transmittance_at_Normal_Incidence",
-                "Front_Side_Solar_Reflectance_at_Normal_Incidence",
-                "Back_Side_Solar_Reflectance_at_Normal_Incidence",
-            ],
+            "光学": ["Solar_Transmittance_at_Normal_Incidence", "Front_Side_Solar_Reflectance_at_Normal_Incidence", "Back_Side_Solar_Reflectance_at_Normal_Incidence"],
             "厚度": ["Thickness"],
         },
         "ZoneInfiltration:DesignFlowRate": {
-            "渗透": ["Air_Changes_per_Hour", "Flow_Rate_per_Exterior_Surface_Area"],
-            "渗透率": ["Air_Changes_per_Hour", "Flow_Rate_per_Exterior_Surface_Area"],
+            "渗透": ["Air_Changes_per_Hour", "Flow_per_Exterior_Surface_Area", "Flow_Rate_per_Exterior_Surface_Area", "Flow_per_Zone_Floor_Area", "Flow_Rate_per_Floor_Area"],
+            "渗透率": ["Air_Changes_per_Hour", "Flow_per_Exterior_Surface_Area", "Flow_Rate_per_Exterior_Surface_Area", "Flow_per_Zone_Floor_Area", "Flow_Rate_per_Floor_Area"],
             "换气": ["Air_Changes_per_Hour"],
-            "infiltration": ["Air_Changes_per_Hour", "Flow_Rate_per_Exterior_Surface_Area"],
+            "infiltration": ["Air_Changes_per_Hour", "Flow_per_Exterior_Surface_Area", "Flow_Rate_per_Exterior_Surface_Area", "Flow_per_Zone_Floor_Area", "Flow_Rate_per_Floor_Area"],
         },
         "ElectricEquipment": {
             "功率": ["Watts_per_Floor_Area", "Watts_per_Person"],
@@ -164,9 +208,9 @@ def build_field_keyword_mapping() -> Dict[str, Dict[str, List[str]]]:
             "equipment": ["Watts_per_Floor_Area", "Watts_per_Person"],
         },
         "People": {
-            "人员密度": ["People_per_Floor_Area"],
-            "人均面积": ["Floor_Area_per_Person"],
-            "density": ["People_per_Floor_Area"],
+            "人员密度": ["People_per_Zone_Floor_Area", "People_per_Floor_Area"],
+            "人均面积": ["Zone_Floor_Area_per_Person", "Floor_Area_per_Person"],
+            "density": ["People_per_Zone_Floor_Area", "People_per_Floor_Area"],
         },
         "ThermostatSetpoint:DualSetpoint": {
             "供暖": ["Heating_Setpoint_Temperature_Schedule_Name"],
@@ -175,9 +219,20 @@ def build_field_keyword_mapping() -> Dict[str, Dict[str, List[str]]]:
             "cooling": ["Cooling_Setpoint_Temperature_Schedule_Name"],
         },
         "DesignSpecification:OutdoorAir": {
-            "新风": ["Outdoor_Air_Flow_per_Person", "Outdoor_Air_Flow_per_Zone_Floor_Area"],
+            "新风": ["Outdoor_Air_Flow_per_Person", "Outdoor_Air_Flow_per_Zone_Floor_Area", "Outdoor_Air_Flow_Air_Changes_per_Hour"],
             "人均新风": ["Outdoor_Air_Flow_per_Person"],
+            "换气次数": ["Outdoor_Air_Flow_Air_Changes_per_Hour"],
             "outdoor air": ["Outdoor_Air_Flow_per_Person"],
+        },
+        "DesignSpecification:ZoneAirDistribution": {
+            "送风效率": ["Zone_Air_Distribution_Effectiveness_in_Cooling_Mode", "Zone_Air_Distribution_Effectiveness_in_Heating_Mode"],
+            "空气分配": ["Zone_Air_Distribution_Effectiveness_in_Cooling_Mode", "Zone_Air_Distribution_Effectiveness_in_Heating_Mode"],
+            "通风效率": ["Zone_Air_Distribution_Effectiveness_in_Cooling_Mode", "Zone_Air_Distribution_Effectiveness_in_Heating_Mode"],
+        },
+        "Daylighting:Controls": {
+            "照度": ["Illuminance_Setpoint_at_Reference_Point_1", "Illuminance_Setpoint_at_Reference_Point_2"],
+            "日光": ["Minimum_Input_Power_Fraction_for_Continuous_or_ContinuousOff_Dimming_Control", "Minimum_Light_Output_Fraction_for_Continuous_or_ContinuousOff_Dimming_Control"],
+            "调光": ["Minimum_Input_Power_Fraction_for_Continuous_or_ContinuousOff_Dimming_Control", "Minimum_Light_Output_Fraction_for_Continuous_or_ContinuousOff_Dimming_Control"],
         },
         "ZoneHVAC:IdealLoadsAirSystem": {
             "阈值": ["Minimum_Cooling_Supply_Air_Temperature", "Maximum_Heating_Supply_Air_Temperature"],
@@ -185,11 +240,21 @@ def build_field_keyword_mapping() -> Dict[str, Dict[str, List[str]]]:
             "最小制冷供风温度": ["Minimum_Cooling_Supply_Air_Temperature"],
             "最大供暖供风温度": ["Maximum_Heating_Supply_Air_Temperature"],
             "热回收": ["Sensible_Heat_Recovery_Effectiveness", "Latent_Heat_Recovery_Effectiveness"],
+            "全热回收": ["Sensible_Heat_Recovery_Effectiveness", "Latent_Heat_Recovery_Effectiveness"],
+            "热回收效率": ["Sensible_Heat_Recovery_Effectiveness", "Latent_Heat_Recovery_Effectiveness"],
+            "显热效率": ["Sensible_Heat_Recovery_Effectiveness"],
+            "潜热效率": ["Latent_Heat_Recovery_Effectiveness"],
+            "供风含湿量": ["Minimum_Cooling_Supply_Air_Humidity_Ratio", "Maximum_Heating_Supply_Air_Humidity_Ratio"],
+            "湿度比": ["Minimum_Cooling_Supply_Air_Humidity_Ratio", "Maximum_Heating_Supply_Air_Humidity_Ratio"],
         },
         "Sizing:Zone": {
             "供风温度": ["Zone_Cooling_Design_Supply_Air_Temperature", "Zone_Heating_Design_Supply_Air_Temperature"],
             "制冷温度": ["Zone_Cooling_Design_Supply_Air_Temperature"],
             "供暖温度": ["Zone_Heating_Design_Supply_Air_Temperature"],
+            "供风含湿量": ["Zone_Cooling_Design_Supply_Air_Humidity_Ratio", "Zone_Heating_Design_Supply_Air_Humidity_Ratio"],
+            "湿度比": ["Zone_Cooling_Design_Supply_Air_Humidity_Ratio", "Zone_Heating_Design_Supply_Air_Humidity_Ratio"],
+            "裕量": ["Zone_Cooling_Sizing_Factor", "Zone_Heating_Sizing_Factor"],
+            "安全系数": ["Zone_Cooling_Sizing_Factor", "Zone_Heating_Sizing_Factor"],
         },
     }
 
@@ -242,8 +307,22 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "semantic": "值越低，保温性能越好，冬季热损失越少",
                 "related_concept": ["U值", "传热系数", "保温"],
             },
+            "Visible_Transmittance": {
+                "description": "可见光透射率：可见光进入室内的比例",
+                "unit": "无量纲 (0-1)",
+                "range": [0, 1],
+                "semantic": "值越高，自然采光越强，但可能增加眩光和部分太阳得热",
+                "related_concept": ["透光", "可见光", "采光"],
+            },
         },
         "Lights": {
+            "Watts_per_Zone_Floor_Area": {
+                "description": "单位楼板面积的照明功率密度",
+                "unit": "W/m²",
+                "range": [0, 50],
+                "semantic": "值越高，照明越亮，耗电越多",
+                "related_concept": ["照明密度", "功率密度"],
+            },
             "Watts_per_Floor_Area": {
                 "description": "单位楼板面积的照明功率密度",
                 "unit": "W/m²",
@@ -266,6 +345,29 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "related_concept": ["照度", "亮度"],
             },
         },
+        "OtherEquipment": {
+            "Power_per_Zone_Floor_Area": {
+                "description": "单位楼板面积的设备功率密度",
+                "unit": "W/m²",
+                "range": [0, 100],
+                "semantic": "值越高，设备散热和耗电越多",
+                "related_concept": ["设备功率密度", "设备负荷"],
+            },
+            "Power_per_Person": {
+                "description": "人均设备功率",
+                "unit": "W/person",
+                "range": [0, 200],
+                "semantic": "值越高，单个人相关的设备负荷越大",
+                "related_concept": ["人均功率", "设备负荷"],
+            },
+            "Design_Level": {
+                "description": "设备设计功率",
+                "unit": "W",
+                "range": [0, 100000],
+                "semantic": "值越高，设备基础负荷越大",
+                "related_concept": ["设备功率", "设计水平"],
+            },
+        },
         "ZoneInfiltration:DesignFlowRate": {
             "Air_Changes_per_Hour": {
                 "description": "换气次数：每小时房间空气被完全交换的次数",
@@ -274,6 +376,13 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "semantic": "值越高，渗透越严重，冬季热损失越大",
                 "related_concept": ["换气", "渗透率", "ACH"],
             },
+            "Flow_per_Exterior_Surface_Area": {
+                "description": "单位外表面积的渗透流量",
+                "unit": "m³/s-m²",
+                "range": [0, 0.01],
+                "semantic": "值越高，通过单位外墙面积的漏风越多",
+                "related_concept": ["渗透", "外墙面积渗透"],
+            },
             "Flow_Rate_per_Exterior_Surface_Area": {
                 "description": "单位外表面积的渗透流量",
                 "unit": "m³/s-m²",
@@ -281,14 +390,42 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "semantic": "值越高，通过单位外墙面积的漏风越多",
                 "related_concept": ["渗透", "外墙面积渗透"],
             },
+            "Flow_per_Zone_Floor_Area": {
+                "description": "单位楼板面积的渗透流量",
+                "unit": "m³/s-m²",
+                "range": [0, 0.01],
+                "semantic": "值越高，按楼板面积折算的漏风越多",
+                "related_concept": ["渗透", "面积渗透"],
+            },
+            "Flow_Rate_per_Floor_Area": {
+                "description": "单位楼板面积的渗透流量",
+                "unit": "m³/s-m²",
+                "range": [0, 0.01],
+                "semantic": "值越高，按楼板面积折算的漏风越多",
+                "related_concept": ["渗透", "面积渗透"],
+            },
         },
         "People": {
+            "People_per_Zone_Floor_Area": {
+                "description": "人员密度：单位楼板面积的人数",
+                "unit": "人/m²",
+                "range": [0, 0.2],
+                "semantic": "值越低，人员产热负荷越小，制冷能耗降低",
+                "related_concept": ["人员密度", "占用率", "灵活办公"],
+            },
             "People_per_Floor_Area": {
                 "description": "人员密度：单位楼板面积的人数",
                 "unit": "人/m²",
                 "range": [0, 0.2],
                 "semantic": "值越低，人员产热负荷越小，制冷能耗降低",
                 "related_concept": ["人员密度", "占用率", "灵活办公"],
+            },
+            "Zone_Floor_Area_per_Person": {
+                "description": "人均楼板面积",
+                "unit": "m²/人",
+                "range": [5, 50],
+                "semantic": "值越高，单位面积人数越少，人员负荷越低",
+                "related_concept": ["人均面积", "办公空间"],
             },
             "Floor_Area_per_Person": {
                 "description": "人均楼板面积",
@@ -332,6 +469,59 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "semantic": "值越小，新风负荷越低",
                 "related_concept": ["新风密度", "面积新风"],
             },
+            "Outdoor_Air_Flow_Air_Changes_per_Hour": {
+                "description": "按换气次数表示的新风量",
+                "unit": "次/小时",
+                "range": [0, 10],
+                "semantic": "值越小，新风负荷越低，但需结合健康和渗透控制综合判断",
+                "related_concept": ["换气次数", "ACH", "通风"],
+            },
+        },
+        "DesignSpecification:ZoneAirDistribution": {
+            "Zone_Air_Distribution_Effectiveness_in_Cooling_Mode": {
+                "description": "制冷工况空气分配效率",
+                "unit": "无量纲",
+                "range": [0.5, 1.5],
+                "semantic": "值越高，达到同等舒适所需的新风/送风量可降低，潜在减少空调负荷",
+                "related_concept": ["送风效率", "通风效率"],
+            },
+            "Zone_Air_Distribution_Effectiveness_in_Heating_Mode": {
+                "description": "供暖工况空气分配效率",
+                "unit": "无量纲",
+                "range": [0.5, 1.5],
+                "semantic": "值越高，供暖气流利用更充分，潜在降低供暖负荷",
+                "related_concept": ["送风效率", "通风效率"],
+            },
+        },
+        "Daylighting:Controls": {
+            "Minimum_Input_Power_Fraction_for_Continuous_or_ContinuousOff_Dimming_Control": {
+                "description": "连续调光时照明系统最小输入功率比例",
+                "unit": "无量纲 (0-1)",
+                "range": [0, 1],
+                "semantic": "值越低，日光充足时照明可降得更低，照明能耗下降潜力更大",
+                "related_concept": ["调光", "日光控制", "照明节能"],
+            },
+            "Minimum_Light_Output_Fraction_for_Continuous_or_ContinuousOff_Dimming_Control": {
+                "description": "连续调光时照明系统最小出光比例",
+                "unit": "无量纲 (0-1)",
+                "range": [0, 1],
+                "semantic": "值越低，允许更深度调光，日光利用率更高",
+                "related_concept": ["调光", "照明输出"],
+            },
+            "Illuminance_Setpoint_at_Reference_Point_1": {
+                "description": "参考点1照度设定值",
+                "unit": "lux",
+                "range": [100, 1000],
+                "semantic": "值越低，照明系统目标照度越低，照明能耗通常下降",
+                "related_concept": ["照度", "设定点", "日光控制"],
+            },
+            "Illuminance_Setpoint_at_Reference_Point_2": {
+                "description": "参考点2照度设定值",
+                "unit": "lux",
+                "range": [100, 1000],
+                "semantic": "值越低，照明系统目标照度越低，照明能耗通常下降",
+                "related_concept": ["照度", "设定点", "日光控制"],
+            },
         },
         "ZoneHVAC:IdealLoadsAirSystem": {
             "Minimum_Cooling_Supply_Air_Temperature": {
@@ -364,6 +554,20 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "semantic": "值越高，湿负荷回收越充分，可降低空调系统潜热负荷",
                 "related_concept": ["热回收", "潜热效率"],
             },
+            "Minimum_Cooling_Supply_Air_Humidity_Ratio": {
+                "description": "最小制冷供风含湿量下限",
+                "unit": "kgWater/kgDryAir",
+                "range": [0.005, 0.012],
+                "semantic": "值越低，除湿能力越强但潜热处理能耗可能上升",
+                "related_concept": ["含湿量", "湿度比", "除湿"],
+            },
+            "Maximum_Heating_Supply_Air_Humidity_Ratio": {
+                "description": "最大供暖供风含湿量上限",
+                "unit": "kgWater/kgDryAir",
+                "range": [0.005, 0.02],
+                "semantic": "值越高，供暖加湿潜力更大，但可能增加湿负荷处理成本",
+                "related_concept": ["含湿量", "湿度比", "加湿"],
+            },
         },
         "Sizing:Zone": {
             "Zone_Cooling_Design_Supply_Air_Temperature": {
@@ -381,6 +585,34 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "semantic": "温度越低，供暖效率越高（热泵COP提升），能耗越低",
                 "related_concept": ["供风温度", "供暖送风"],
                 "optimization_note": "可从50°C降至42-45°C（地暖30-35°C）",
+            },
+            "Zone_Cooling_Design_Supply_Air_Humidity_Ratio": {
+                "description": "制冷设计供风含湿量",
+                "unit": "kgWater/kgDryAir",
+                "range": [0.005, 0.012],
+                "semantic": "值越低，设计除湿要求越高，潜热处理能力增强但能耗可能增加",
+                "related_concept": ["含湿量", "湿度比", "除湿设计"],
+            },
+            "Zone_Heating_Design_Supply_Air_Humidity_Ratio": {
+                "description": "供暖设计供风含湿量",
+                "unit": "kgWater/kgDryAir",
+                "range": [0.005, 0.02],
+                "semantic": "影响供暖季空气湿度目标，过高可能增加处理能耗",
+                "related_concept": ["含湿量", "湿度比", "加湿设计"],
+            },
+            "Zone_Cooling_Sizing_Factor": {
+                "description": "制冷设计裕量系数",
+                "unit": "无量纲",
+                "range": [1.0, 1.5],
+                "semantic": "值越高，系统偏保守，设备容量和峰值能耗潜力更高",
+                "related_concept": ["裕量", "安全系数", "过度设计"],
+            },
+            "Zone_Heating_Sizing_Factor": {
+                "description": "供暖设计裕量系数",
+                "unit": "无量纲",
+                "range": [1.0, 1.5],
+                "semantic": "值越高，系统偏保守，供暖容量和峰值负荷潜力更高",
+                "related_concept": ["裕量", "安全系数", "过度设计"],
             },
         },
     }

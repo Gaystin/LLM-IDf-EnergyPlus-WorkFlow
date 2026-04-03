@@ -5,6 +5,8 @@
 /energyplus.exe
 /in.idf
 /weather.epw
+/weather_beijing_CSWD.epw
+/weather_beijing_IWEC.epw
 /__pycache__
 /.web_runtime
 /weather

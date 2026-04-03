@@ -10,6 +10,7 @@ import subprocess
 import logging
 import sys
 import shutil
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -35,7 +36,7 @@ class EnergyPlusOptimizer:
         idf_path,
         idd_path,
         api_key_path,
-        epw_path="weather.epw",
+        epw_path="weather_beijing_CSWD.epw",
         log_dir="optimization_logs_并行",
         optimization_dir="optimization_results_并行",
         plot_dir="optimization_plot_并行",
@@ -143,12 +144,14 @@ class EnergyPlusOptimizer:
                 'suggestion_field_frequency': {},
                 'suggestion_object_frequency_by_iteration': {},
                 'suggestion_field_frequency_by_iteration': {},
+                'zero_base_noop_fields': {},
                 'workflow_total_duration_sec': 0.0,
                 'llm_total_duration_sec': 0.0,
                 'sim_total_duration_sec': 0.0,
                 'llm_call_records': [],
                 'sim_call_records': [],
                 'llm_token_records': [],
+                'last_parameter_detail_lines': [],
                 'logger': self._setup_workflow_logger(workflow_id)  # 为每个workflow创建独立logger
             }
         
@@ -199,6 +202,10 @@ class EnergyPlusOptimizer:
                 "ZONE_HEATING_DESIGN_SUPPLY_AIR_TEMPERATURE": ["供暖", "制热", "供风温度", "送风温度", "设计供风温度", "设计温度", "供暖供冷温度"],
             }
         }
+
+        # 是否启用字段关键词硬过滤。
+        # 默认关闭：让LLM在可执行候选范围内更自主地探索字段组合，避免建议长期集中在少数字段。
+        self.enable_field_keyword_filter = False
 
     
     def _setup_logging(self):
@@ -381,21 +388,44 @@ class EnergyPlusOptimizer:
         try:
             # 运行目录按工作流隔离，避免并行时同名轮次目录冲突
             if workflow_id:
-                run_dir = os.path.join(self.optimization_dir, workflow_id, iteration_name)
+                base_run_dir = os.path.join(self.optimization_dir, workflow_id, iteration_name)
             else:
-                run_dir = os.path.join(self.optimization_dir, iteration_name)
+                base_run_dir = os.path.join(self.optimization_dir, iteration_name)
+
+            run_dir = base_run_dir
+
+            # 若目录下已存在SQL相关产物，重跑时容易触发SQLite独占锁冲突。
+            # 此时切换到唯一目录，避免覆盖旧数据库文件。
+            stale_sql_files = [
+                os.path.join(base_run_dir, "eplusout.sql"),
+                os.path.join(base_run_dir, "sqlite.err"),
+            ]
+            if any(os.path.exists(p) for p in stale_sql_files):
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                run_dir = f"{base_run_dir}_{ts}"
+                self.logger.warning(
+                    f"检测到已存在SQL输出文件，切换到新目录执行以避免SQLite锁冲突: {run_dir}"
+                )
+
             os.makedirs(run_dir, exist_ok=True)
-            
-            # 复制IDF到运行目录
+
+            # 使用ASCII临时目录运行，规避EnergyPlus 8.9在中文路径下SQLite打开失败问题。
+            temp_root = os.path.join(tempfile.gettempdir(), "ep89_runs")
+            os.makedirs(temp_root, exist_ok=True)
+            safe_workflow = (workflow_id or "wf").replace(":", "_").replace("/", "_").replace("\\", "_")
+            safe_iter = iteration_name.replace(":", "_").replace("/", "_").replace("\\", "_")
+            temp_run_dir = tempfile.mkdtemp(prefix=f"{safe_workflow}_{safe_iter}_", dir=temp_root)
+
+            # 复制IDF到临时运行目录
             idf_name = os.path.splitext(os.path.basename(idf_path))[0]
-            sim_idf = os.path.join(run_dir, f"{idf_name}.idf")
+            sim_idf = os.path.join(temp_run_dir, f"{idf_name}.idf")
             shutil.copy(idf_path, sim_idf)
             
             # 运行EnergyPlus
             cmd = [
                 self.eplus_exe,
                 "-w", self.epw_path,
-                "-d", run_dir,
+                "-d", temp_run_dir,
                 "-r",
                 sim_idf
             ]
@@ -405,6 +435,12 @@ class EnergyPlusOptimizer:
             result = subprocess.run(cmd, capture_output=True, text=False, timeout=600)
             
             if result.returncode == 0:
+                # 将临时目录结果回写到目标归档目录
+                for name in os.listdir(temp_run_dir):
+                    src = os.path.join(temp_run_dir, name)
+                    dst = os.path.join(run_dir, name)
+                    if os.path.isfile(src):
+                        shutil.copy2(src, dst)
                 self.logger.info(f"✓ 模拟完成: {iteration_name}")
                 return run_dir
             else:
@@ -416,8 +452,18 @@ class EnergyPlusOptimizer:
                 if stderr_text:
                     self.logger.error(f"错误: {stderr_text[:500]}")
 
+                # 失败时也尽量回写错误文件，便于在目标目录定位问题
+                for name in ("eplusout.err", "sqlite.err", "eplusout.end"):
+                    src = os.path.join(temp_run_dir, name)
+                    dst = os.path.join(run_dir, name)
+                    if os.path.exists(src):
+                        try:
+                            shutil.copy2(src, dst)
+                        except Exception:
+                            pass
+
                 # 追加读取 eplusout.err，提取 Severe/Fatal 关键行，便于快速定位失败原因
-                err_file = os.path.join(run_dir, "eplusout.err")
+                err_file = os.path.join(temp_run_dir, "eplusout.err")
                 if os.path.exists(err_file):
                     try:
                         with open(err_file, 'r', encoding='utf-8', errors='replace') as ef:
@@ -472,86 +518,69 @@ class EnergyPlusOptimizer:
             }
             
             try:
-                # 从TabularData表中查询能耗数据（单位：GJ）
-                # 数据结构：Total End Uses行包含所有能源类型的汇总
-                # 包括：Electricity, Natural Gas, Coal, District Cooling/Heating等
-                # 过滤条件：
-                # - 不包含"Source"前缀（因为Source是换算后的，会重复计算）
-                # - 不包含"Water"（这是用水量，不是能耗）
-                
-                # 1. 查询总建筑能耗 - Total End Uses行的所有非Source、非Water能源求和
+                # 兼容OutputControl:Table:Style的单位转换设置，且保持历史计算定义不变：
+                # - 优先使用旧口径 GJ / MJ/m2（与旧版逻辑一致）
+                # - 仅在旧口径不存在时回退到 kWh / kWh/m2
+                # - 重要：只从"End Uses"表查询，避免"End Uses By Subcategory"等其他表的重复数据
+                def _sum_end_use_kwh(row_name):
+                    cursor.execute("""
+                        SELECT su.Value, COALESCE(SUM(CAST(t.Value AS FLOAT)), 0) as Energy
+                        FROM TabularData t
+                        JOIN Strings sr ON t.RowNameIndex = sr.StringIndex
+                        JOIN Strings ste ON t.TableNameIndex = ste.StringIndex
+                        JOIN Strings sc ON t.ColumnNameIndex = sc.StringIndex
+                        JOIN Strings su ON t.UnitsIndex = su.StringIndex
+                        WHERE sr.Value = ?
+                        AND ste.Value = 'End Uses'
+                        AND su.Value IN ('GJ', 'kWh')
+                        AND sc.Value NOT LIKE 'Source%'
+                        AND sc.Value != 'Water'
+                        GROUP BY su.Value
+                    """, (row_name,))
+                    rows = cursor.fetchall()
+                    by_unit = {unit: float(value) for unit, value in rows}
+                    if 'GJ' in by_unit:
+                        return by_unit['GJ'] * 277.778
+                    if 'kWh' in by_unit:
+                        return by_unit['kWh']
+                    return 0.0
+
+                # 1) 总建筑能耗（kWh）
+                metrics['total_site_energy_kwh'] = round(_sum_end_use_kwh('Total End Uses'), 2)
+                self.logger.debug(f"总建筑能耗: {metrics['total_site_energy_kwh']} kWh")
+
+                # 2) 冷却能耗（kWh）
+                metrics['total_cooling_kwh'] = round(_sum_end_use_kwh('Cooling'), 2)
+                self.logger.debug(f"冷却能耗: {metrics['total_cooling_kwh']} kWh")
+
+                # 3) 供暖能耗（kWh）
+                metrics['total_heating_kwh'] = round(_sum_end_use_kwh('Heating'), 2)
+                self.logger.debug(f"供暖能耗: {metrics['total_heating_kwh']} kWh")
+
+                # 4) 单位面积总建筑能耗（优先总建筑面积口径；单位优先MJ/m2）
                 cursor.execute("""
-                    SELECT COALESCE(SUM(CAST(t.Value AS FLOAT)), 0) as TotalEnergy
-                    FROM TabularData t 
-                    JOIN Strings sr ON t.RowNameIndex = sr.StringIndex 
-                    JOIN Strings sc ON t.ColumnNameIndex = sc.StringIndex 
-                    JOIN Strings su ON t.UnitsIndex = su.StringIndex 
-                    WHERE sr.Value = 'Total End Uses'
-                    AND su.Value = 'GJ'
-                    AND sc.Value NOT LIKE 'Source%'
-                    AND sc.Value != 'Water'
-                """)
-                
-                total_result = cursor.fetchone()
-                if total_result:
-                    total_gj = float(total_result[0])
-                    metrics['total_site_energy_kwh'] = round(total_gj * 277.778, 2)
-                    self.logger.debug(f"总建筑能耗: {total_gj} GJ = {metrics['total_site_energy_kwh']} kWh")
-                
-                # 2. 查询冷却能耗 - Cooling行的所有非Source、非Water能源求和
-                cursor.execute("""
-                    SELECT COALESCE(SUM(CAST(t.Value AS FLOAT)), 0) as CoolingEnergy
-                    FROM TabularData t 
-                    JOIN Strings sr ON t.RowNameIndex = sr.StringIndex 
-                    JOIN Strings sc ON t.ColumnNameIndex = sc.StringIndex 
-                    JOIN Strings su ON t.UnitsIndex = su.StringIndex 
-                    WHERE sr.Value = 'Cooling'
-                    AND su.Value = 'GJ'
-                    AND sc.Value NOT LIKE 'Source%'
-                    AND sc.Value != 'Water'
-                """)
-                
-                cooling_result = cursor.fetchone()
-                if cooling_result:
-                    cooling_gj = float(cooling_result[0])
-                    metrics['total_cooling_kwh'] = round(cooling_gj * 277.778, 2)
-                    self.logger.debug(f"冷却能耗: {cooling_gj} GJ = {metrics['total_cooling_kwh']} kWh")
-                
-                # 3. 查询供暖能耗 - Heating行的所有非Source、非Water能源求和
-                cursor.execute("""
-                    SELECT COALESCE(SUM(CAST(t.Value AS FLOAT)), 0) as HeatingEnergy
-                    FROM TabularData t 
-                    JOIN Strings sr ON t.RowNameIndex = sr.StringIndex 
-                    JOIN Strings sc ON t.ColumnNameIndex = sc.StringIndex 
-                    JOIN Strings su ON t.UnitsIndex = su.StringIndex 
-                    WHERE sr.Value = 'Heating'
-                    AND su.Value = 'GJ'
-                    AND sc.Value NOT LIKE 'Source%'
-                    AND sc.Value != 'Water'
-                """)
-                
-                heating_result = cursor.fetchone()
-                if heating_result:
-                    heating_gj = float(heating_result[0])
-                    metrics['total_heating_kwh'] = round(heating_gj * 277.778, 2)
-                    self.logger.debug(f"供暖能耗: {heating_gj} GJ = {metrics['total_heating_kwh']} kWh")
-                
-                # 4. 查询单位面积总建筑能耗 (MJ/m²) 并转换为 kWh/m²
-                cursor.execute("""
-                    SELECT t.Value 
-                    FROM TabularData t 
-                    JOIN Strings sr ON t.RowNameIndex = sr.StringIndex 
-                    JOIN Strings su ON t.UnitsIndex = su.StringIndex 
+                    SELECT su.Value, t.Value
+                    FROM TabularData t
+                    JOIN Strings sr ON t.RowNameIndex = sr.StringIndex
+                    JOIN Strings sc ON t.ColumnNameIndex = sc.StringIndex
+                    JOIN Strings su ON t.UnitsIndex = su.StringIndex
                     WHERE sr.Value = 'Total Site Energy'
-                    AND su.Value = 'MJ/m2'
+                    AND sc.Value = 'Energy Per Total Building Area'
+                    AND su.Value IN ('MJ/m2', 'kWh/m2')
+                    ORDER BY CASE WHEN su.Value = 'MJ/m2' THEN 0 ELSE 1 END
+                    LIMIT 1
                 """)
-                
+
                 eui_result = cursor.fetchone()
                 if eui_result:
                     try:
-                        eui_mj_m2 = float(eui_result[0])
-                        metrics['eui_kwh_per_m2'] = round(eui_mj_m2 / 3.6, 2)
-                        self.logger.debug(f"单位面积总建筑能耗: {eui_mj_m2} MJ/m² = {metrics['eui_kwh_per_m2']} kWh/m²")
+                        eui_unit, eui_value = eui_result
+                        eui_value = float(eui_value)
+                        if eui_unit == 'MJ/m2':
+                            metrics['eui_kwh_per_m2'] = round(eui_value / 3.6, 2)
+                        else:
+                            metrics['eui_kwh_per_m2'] = round(eui_value, 2)
+                        self.logger.debug(f"单位面积总建筑能耗: {metrics['eui_kwh_per_m2']} kWh/m²")
                     except Exception as e:
                         self.logger.warning(f"无法从SQL查询单位面积总建筑能耗: {e}")
                 
@@ -862,10 +891,12 @@ class EnergyPlusOptimizer:
         # 迭代效率智能体：把历史表现转成下一轮策略提示，辅助LLM以更少轮次达标
         try:
             field_effectiveness = {}
+            zero_base_noop_fields = {}
             with self.workflows_lock:
                 current_wf = self.workflows.get(getattr(self, 'current_workflow_id', None), {})
                 if isinstance(current_wf, dict):
                     field_effectiveness = dict(current_wf.get('field_effectiveness', {}) or {})
+                    zero_base_noop_fields = dict(current_wf.get('zero_base_noop_fields', {}) or {})
 
             efficiency_directive = self.iteration_efficiency_agent.build_directive(
                 iteration_history=list(self.iteration_history or []),
@@ -874,10 +905,27 @@ class EnergyPlusOptimizer:
             )
             if efficiency_directive:
                 request += f"\n\n{efficiency_directive}"
+
+            if zero_base_noop_fields:
+                top_zero_noop_fields = sorted(zero_base_noop_fields.items(), key=lambda x: (-x[1], x[0]))[:10]
+                request += "\n\n【避免无效修改（关键）】下列字段历史上多次出现“基值为0且乘除表达式导致0->0无变化”：\n"
+                for fk, cnt in top_zero_noop_fields:
+                    request += f"  - {fk} (出现{cnt}次)\n"
+                request += (
+                    "对以上字段：若当前值为0，禁止使用纯乘法/除法表达式；"
+                    "请优先使用加法/减法/直接赋值（满足物理约束），"
+                    "若不适合修改则换其他更高收益字段，避免占用修改名额。"
+                )
         except Exception as e:
             self.logger.debug(f"生成迭代效率提示失败，跳过该增强: {e}")
         
-        request += f"\n请根据物理原理，推荐可执行的IDF参数修改方案（允许某些字段增大、另一些字段减小）。"
+        request += (
+            f"\n请根据物理原理，推荐可执行的IDF参数修改方案（允许某些字段增大、另一些字段减小）。"
+            f"\n【表达式要求】可使用加/减/乘/除任一形式（+ - * /），不要把所有字段都写成统一乘系数。"
+            f"\n【非负字段要求】对于新风、渗透、流量这类必须非负的字段，如果当前值接近0或已经为0，不要再写成“原值 - 常数”这类表达式；优先用加法、直接赋值或改选其他字段。"
+            f"\n【硬性要求】不要提出最终值与原值一致的字段；如果某个字段经过表达式/系数/约束后不会产生实际变化，请改选其他字段，不要占用修改名额。"
+            f"\n【硬性要求】每条修改都必须能在执行后产生真实数值变化，并尽量选择对总能耗影响更大的字段。"
+        )
         
         return request
     
@@ -959,6 +1007,34 @@ class EnergyPlusOptimizer:
 
         return directions_text
 
+    def _build_hvac_context(self):
+        """基于当前IDF对象实例给出HVAC系统类型上下文。"""
+        if not getattr(self, "base_idf", None):
+            return ""
+
+        def _count(obj_type):
+            return len(self.base_idf.idfobjects.get(obj_type, []))
+
+        ideal_loads = _count("ZoneHVAC:IdealLoadsAirSystem")
+        vrf_outdoor = _count("AirConditioner:VariableRefrigerantFlow") + _count("AirConditioner:VariableRefrigerantFlow:FluidTemperatureControl")
+        vrf_terminal = _count("ZoneHVAC:TerminalUnit:VariableRefrigerantFlow")
+
+        lines = ["【当前HVAC系统识别】"]
+        lines.append(f"- ZoneHVAC:IdealLoadsAirSystem 实例数: {ideal_loads}")
+        lines.append(f"- VRF室外机相关对象实例数: {vrf_outdoor}")
+        lines.append(f"- VRF室内末端对象实例数: {vrf_terminal}")
+
+        if ideal_loads > 0 and (vrf_outdoor + vrf_terminal) == 0:
+            lines.append("- 结论: 当前模型为 IdealLoads 路径，未检测到VRF对象实例。")
+        elif ideal_loads > 0 and (vrf_outdoor + vrf_terminal) > 0:
+            lines.append("- 结论: 当前模型存在 IdealLoads 与 VRF 相关对象，请仅针对存在实例的对象给出修改。")
+        elif ideal_loads == 0 and (vrf_outdoor + vrf_terminal) > 0:
+            lines.append("- 结论: 当前模型为 VRF 路径，未检测到 IdealLoads 对象实例。")
+        else:
+            lines.append("- 结论: 未检测到 IdealLoads/VRF 关键对象实例，请优先基于候选对象可修改字段给出建议。")
+
+        return "\n".join(lines)
+
     def generate_plan_with_knowledge_base(self, user_request):
         """使用知识库生成修改计划（与 main.py 逻辑保持一致）"""
         if not self.knowledge_base:
@@ -979,8 +1055,13 @@ class EnergyPlusOptimizer:
         for obj in enhanced_context['matched_objects']:
             obj_type = obj['object_type']
             candidate_fields = obj['candidate_fields']
+            object_count = len(self.base_idf.idfobjects.get(obj_type, []))
 
-            if obj_type in self.base_idf.idfobjects and len(self.base_idf.idfobjects[obj_type]) > 0:
+            if object_count <= 0:
+                self.logger.info(f"跳过当前IDF中不存在的对象类型: {obj_type}")
+                continue
+
+            if obj_type in self.base_idf.idfobjects and object_count > 0:
                 sample_obj = self.base_idf.idfobjects[obj_type][0]
                 candidate_field_names = [f['field_name'] for f in candidate_fields]
                 filtered_names = self._filter_fields_by_method(obj_type, sample_obj, candidate_field_names)
@@ -999,7 +1080,7 @@ class EnergyPlusOptimizer:
                 })
             
             current_values = {}
-            if obj_type in self.base_idf.idfobjects and len(self.base_idf.idfobjects[obj_type]) > 0:
+            if obj_type in self.base_idf.idfobjects and object_count > 0:
                 sample_obj = self.base_idf.idfobjects[obj_type][0]
                 for field_info in candidate_fields:
                     field = field_info['field_name']
@@ -1009,20 +1090,32 @@ class EnergyPlusOptimizer:
             kb_context['candidates'].append({
                 'object_type': obj_type,
                 'description': obj['description'],
-                'object_count': len(self.base_idf.idfobjects.get(obj_type, [])),
+                'object_count': object_count,
                 'field_semantics': field_semantics_list,
                 'current_sample_values': current_values
             })
         candidates_count = len(kb_context.get('candidates', [])) if isinstance(kb_context, dict) else 0
+        total_candidate_fields = 0
+        if isinstance(kb_context, dict):
+            for c in kb_context.get('candidates', []) or []:
+                total_candidate_fields += len(c.get('field_semantics', []) or [])
+
         min_categories = min(4, max(3, candidates_count)) if candidates_count > 0 else 4
-        max_modifications = min(6, max(4, candidates_count if candidates_count > 0 else 6))
-        min_modifications = max(4, min(5, max_modifications))
+        # 从固定 4~6 放宽为按候选规模动态范围，提升字段探索覆盖度
+        # 但仍保留上限，避免单轮过多修改导致不稳定。
+        if total_candidate_fields <= 0:
+            max_modifications = 8
+            min_modifications = 5
+        else:
+            max_modifications = min(18, max(8, int(total_candidate_fields * 0.35)))
+            min_modifications = min(max_modifications, max(5, int(max_modifications * 0.6)))
 
         # 不启用“低频补充/反重复”约束，仅保留覆盖度与可执行性要求
         enable_novelty_constraints = False
         base_novelty_directive = ""
         system_prompt = self.knowledge_base.build_system_prompt()
         field_usage_summary = self._get_field_usage_summary()
+        hvac_context = self._build_hvac_context()
         user_prompt = self.knowledge_base.build_user_prompt(
             user_request=user_request,
             kb_context=kb_context,
@@ -1032,6 +1125,7 @@ class EnergyPlusOptimizer:
             max_modifications=max_modifications,
             enable_novelty_constraints=enable_novelty_constraints,
             base_novelty_directive=base_novelty_directive,
+            hvac_context=hvac_context,
         )
         
         try:
@@ -1932,21 +2026,26 @@ class EnergyPlusOptimizer:
         """返回按对象类型定义的 Calculation Method → 有效字段映射。"""
         return {
             "Lights": ("Design_Level_Calculation_Method", {
-                "WATTS/AREA": "Watts_per_Floor_Area",
-                "WATTS/PERSON": "Watts_per_Person",
-                "LIGHTINGLEVEL": "Lighting_Level",
+                "WATTS/AREA": ("Watts_per_Zone_Floor_Area", "Watts_per_Floor_Area"),
+                "WATTS/PERSON": ("Watts_per_Person",),
+                "LIGHTINGLEVEL": ("Lighting_Level",),
+            }),
+            "OtherEquipment": ("Design_Level_Calculation_Method", {
+                "WATTS/AREA": ("Power_per_Zone_Floor_Area",),
+                "WATTS/PERSON": ("Power_per_Person",),
+                "EQUIPMENTLEVEL": ("Design_Level",),
             }),
             "ElectricEquipment": ("Design_Level_Calculation_Method", {
-                "WATTS/AREA": "Watts_per_Floor_Area",
-                "WATTS/PERSON": "Watts_per_Person",
-                "EQUIPMENTLEVEL": "Design_Level",
+                "WATTS/AREA": ("Watts_per_Floor_Area", "Watts_per_Zone_Floor_Area"),
+                "WATTS/PERSON": ("Watts_per_Person",),
+                "EQUIPMENTLEVEL": ("Design_Level",),
             }),
             "ZoneInfiltration:DesignFlowRate": ("Design_Flow_Rate_Calculation_Method", {
-                "FLOW/EXTERIORAREA": "Flow_Rate_per_Exterior_Surface_Area",
-                "FLOW/EXTERIORWALLAREA": "Flow_Rate_per_Exterior_Surface_Area",
-                "FLOW/AREA": "Flow_Rate_per_Floor_Area",
-                "FLOW/ZONE": "Design_Flow_Rate",
-                "AIRCHANGES/HOUR": "Air_Changes_per_Hour",
+                "FLOW/EXTERIORAREA": ("Flow_per_Exterior_Surface_Area", "Flow_Rate_per_Exterior_Surface_Area"),
+                "FLOW/EXTERIORWALLAREA": ("Flow_per_Exterior_Surface_Area", "Flow_Rate_per_Exterior_Surface_Area"),
+                "FLOW/AREA": ("Flow_per_Zone_Floor_Area", "Flow_Rate_per_Floor_Area"),
+                "FLOW/ZONE": ("Design_Flow_Rate",),
+                "AIRCHANGES/HOUR": ("Air_Changes_per_Hour",),
             }),
         }
 
@@ -1972,7 +2071,18 @@ class EnergyPlusOptimizer:
             return None
 
         key = str(method_val).upper().replace(" ", "")
-        return value_map.get(key)
+        candidate_fields = value_map.get(key)
+        if not candidate_fields:
+            return None
+        if isinstance(candidate_fields, str):
+            candidate_fields = (candidate_fields,)
+
+        sample_fieldnames = set(getattr(sample_obj, "fieldnames", []))
+        for field_name in candidate_fields:
+            if field_name in sample_fieldnames:
+                return field_name
+
+        return candidate_fields[0]
 
     def _get_valid_fields_for_method(self, object_type, sample_obj):
         """获取某个对象当前Calculation Method对应的所有有效字段集合。"""
@@ -1982,7 +2092,13 @@ class EnergyPlusOptimizer:
             return set()
 
         method_field, value_map = method_field_map[object_type]
-        return set(value_map.values())
+        valid_fields = set()
+        for field_candidates in value_map.values():
+            if isinstance(field_candidates, str):
+                valid_fields.add(field_candidates)
+            else:
+                valid_fields.update(field_candidates)
+        return valid_fields
 
     def _is_field_for_method(self, object_type, sample_obj, target_field):
         """检查target_field是否与该对象的当前Calculation Method相匹配。"""
@@ -2269,6 +2385,54 @@ class EnergyPlusOptimizer:
             _enforce_pair_sum('IR_T', 'IR_EF', 'enforce IR_T+Front_IR_Emissivity<=1')
             _enforce_pair_sum('IR_T', 'IR_EB', 'enforce IR_T+Back_IR_Emissivity<=1')
 
+        # DesignSpecification:OutdoorAir 等新风对象的流量参数必须非负
+        # 典型错误示例：Outdoor_Air_Flow_per_Person < 0 会触发 EnergyPlus Severe 并终止模拟。
+        for upd in list(target_updates):
+            obj_type_u = str(upd.get('type', '')).upper()
+            field_name_u = str(upd.get('field', '')).upper()
+
+            if 'MULTIPLIER' in field_name_u:
+                new_num = _to_float(upd.get('value'))
+                if new_num is not None and new_num < 1.0:
+                    _set_value(
+                        obj_type_u,
+                        str(upd.get('name', '')).upper(),
+                        str(upd.get('field', '')),
+                        1.0,
+                        'Multiplier_must_be_at_least_1'
+                    )
+                continue
+
+            if 'OUTDOORAIR' not in obj_type_u and 'DESIGNSPECIFICATION:OUTDOORAIR' not in obj_type_u:
+                continue
+
+            field_name = str(upd.get('field', ''))
+            field_u = field_name.upper()
+
+            # 仅对“流量相关数值字段”做非负约束，避免误伤 Method 等枚举字段
+            is_flow_field = (
+                ('FLOW' in field_u or 'AIR' in field_u)
+                and ('PER_PERSON' in field_u or 'PER_ZONE' in field_u or 'FLOW_RATE' in field_u or 'OUTDOOR_AIR' in field_u)
+            )
+            if not is_flow_field:
+                continue
+
+            new_num = _to_float(upd.get('value'))
+            if new_num is None:
+                continue
+            if new_num < 0.0:
+                old_num = _to_float(upd.get('old_value'))
+                adjusted_floor = 0.0
+                if old_num is not None and old_num > 0.0:
+                    adjusted_floor = max(old_num * 0.1, 1e-6)
+                _set_value(
+                    obj_type_u,
+                    str(upd.get('name', '')).upper(),
+                    field_name,
+                    adjusted_floor,
+                    'OutdoorAir_flow_must_be_non_negative'
+                )
+
         return target_updates
 
     def _normalize_field_label(self, text):
@@ -2316,6 +2480,9 @@ class EnergyPlusOptimizer:
         Returns:
             bool: True表示允许修改，False表示不允许
         """
+        if not bool(getattr(self, 'enable_field_keyword_filter', False)):
+            return True
+
         # 标准化对象类型和字段名（不区分大小写）
         obj_type_upper = object_type.upper()
         field_upper = field_name.upper()
@@ -2361,7 +2528,12 @@ class EnergyPlusOptimizer:
         return "\n".join([p for p in parts if p])
     
     def _apply_coefficient_to_expr(self, expr, coef):
-        """将外部系数应用到表达式"""
+        """将外部系数应用到表达式。
+
+        说明：
+        - 仅当表达式显式包含 `coefficient` 占位符时才替换。
+        - 不再把纯 `existing_value` 强制改写为乘法，避免把运算形式写死。
+        """
         if not isinstance(expr, str):
             return expr
 
@@ -2369,9 +2541,6 @@ class EnergyPlusOptimizer:
 
         if re.search(r"\bcoefficient\b", expr_stripped, flags=re.IGNORECASE):
             return re.sub(r"\bcoefficient\b", str(coef), expr_stripped, flags=re.IGNORECASE)
-
-        if re.fullmatch(r"\{?existing_value\}?", expr_stripped, flags=re.IGNORECASE):
-            return f"existing_value * {coef}"
 
         return expr_stripped
 
@@ -2443,6 +2612,54 @@ class EnergyPlusOptimizer:
         默认策略：同一对象类型下的同字段修改，应用到全部实例，避免漏改。
         """
         target_updates = []
+        skipped_noop_count = 0
+        skipped_noop_zero_base_count = 0
+        zero_base_noop_field_counter = {}
+
+        def _values_equivalent(a, b):
+            if a is None and b is None:
+                return True
+            if a is None or b is None:
+                return False
+            try:
+                a_num = float(a)
+                b_num = float(b)
+                return abs(a_num - b_num) <= max(1e-9, 1e-9 * max(abs(a_num), abs(b_num), 1.0))
+            except (ValueError, TypeError):
+                return str(a).strip() == str(b).strip()
+
+        def _is_zero_base_mul_div_noop(old_value, new_value, expr):
+            try:
+                old_num = float(old_value)
+                new_num = float(new_value)
+            except Exception:
+                return False
+
+            if abs(old_num) > 1e-12 or abs(new_num) > 1e-12:
+                return False
+            if not isinstance(expr, str):
+                return False
+
+            e = expr.lower().replace(" ", "")
+            if not any(tok in e for tok in ['existing_value', 'old_value', 'original_value', 'current_value']):
+                return False
+            if ('*' not in e) and ('/' not in e):
+                return False
+            if '+' in e:
+                return False
+            # 排除明显的减法（允许一元负号，不将其当作减法）
+            if re.search(r"[a-z0-9\)]-", e):
+                return False
+            return True
+
+        def _is_nonnegative_required_field(obj_type, field_name):
+            obj_u = str(obj_type or '').upper()
+            fld_u = str(field_name or '').upper()
+            if 'OUTDOORAIR' in obj_u or 'DESIGNSPECIFICATION:OUTDOORAIR' in obj_u:
+                return True
+            if 'INFILTRATION' in obj_u and ('FLOW' in fld_u or 'AIRCHANGES' in fld_u):
+                return True
+            return False
         
         for mod in plan["modifications"]:
             obj_type_input = mod.get("object_type")
@@ -2518,6 +2735,14 @@ class EnergyPlusOptimizer:
                             f"无法匹配字段 '{clean_field}'，可用字段数={len(valid_attrs)}"
                         )
                         continue
+
+                    # Multiplier 这类离散计数字段不适合做连续优化，必须保持整数且通常不应小于 1。
+                    target_attr_norm = target_attr.upper().replace("_", "").replace(" ", "")
+                    if "MULTIPLIER" in target_attr_norm:
+                        self.logger.info(
+                            f"  [跳过修改] {target_obj_type} ({obj_name}): {target_attr} 属于 multiplier 类字段，不参与连续优化"
+                        )
+                        continue
                     
                     old_value = getattr(obj, target_attr, 0)
                     
@@ -2533,6 +2758,43 @@ class EnergyPlusOptimizer:
                         continue
                     
                     final_value = self._evaluate_expression(value_expr, old_value)
+
+                    if _values_equivalent(old_value, final_value):
+                        skipped_noop_count += 1
+                        if _is_zero_base_mul_div_noop(old_value, final_value, value_expr):
+                            skipped_noop_zero_base_count += 1
+                            field_key = f"{target_obj_type}.{target_attr}".upper()
+                            zero_base_noop_field_counter[field_key] = zero_base_noop_field_counter.get(field_key, 0) + 1
+                        continue
+
+                    # 对必须非负的流量/渗透类字段，在进入修改计划前先做硬性下限保护。
+                    # 这样可以阻止“0 再减 0.001”之类的表达式把值写成负数，再交给后续约束兜底。
+                    if _is_nonnegative_required_field(target_obj_type, target_attr):
+                        try:
+                            final_num = float(final_value)
+                        except (ValueError, TypeError):
+                            final_num = None
+
+                        try:
+                            old_num_nonneg = float(old_value)
+                        except (ValueError, TypeError):
+                            old_num_nonneg = None
+
+                        if final_num is not None and final_num < 0.0:
+                            adjusted_floor = 0.0
+                            if old_num_nonneg is not None and old_num_nonneg > 0.0:
+                                # 原值本身为正时，避免一次减法把字段“减没了”到0
+                                adjusted_floor = max(old_num_nonneg * 0.1, 1e-6)
+                            self.logger.warning(
+                                f"  [非负约束前置拦截] {target_obj_type} ({obj_name}): {target_attr} 计划值 {final_num} < 0，"
+                                f"已提前钳制为 {adjusted_floor}，避免生成非法新风/渗透值"
+                            )
+                            final_value = adjusted_floor
+                            if _values_equivalent(old_value, final_value):
+                                skipped_noop_count += 1
+                                field_key = f"{target_obj_type}.{target_attr}".upper()
+                                zero_base_noop_field_counter[field_key] = zero_base_noop_field_counter.get(field_key, 0) + 1
+                                continue
                     
                     # 计算修改系数
                     try:
@@ -2574,10 +2836,49 @@ class EnergyPlusOptimizer:
 
         # ========== 物理约束修正：防止生成非法IDF（如玻璃参数组合越界） ==========
         target_updates = self._enforce_physical_constraints(target_updates)
+
+        # 约束修正后再次剔除“无实际变化”项，避免它们进入修改摘要与最终汇总
+        if target_updates:
+            filtered_updates = []
+            post_constraint_noop = 0
+            for upd in target_updates:
+                if _values_equivalent(upd.get('old_value'), upd.get('value')):
+                    post_constraint_noop += 1
+                    continue
+                filtered_updates.append(upd)
+            target_updates = filtered_updates
+            skipped_noop_count += post_constraint_noop
         
         if not target_updates:
-            self.logger.warning("所有修改因参数冲突被过滤，跳过保存")
+            if skipped_noop_count > 0:
+                self.logger.info(
+                    f"[无效修改过滤] 本轮共跳过{skipped_noop_count}项原值=目标值的无效修改"
+                    f"（其中基值为0导致无变化: {skipped_noop_zero_base_count}项）"
+                )
+            self.logger.warning("所有修改因参数冲突或无实际变化被过滤，跳过保存")
             return
+
+        if skipped_noop_count > 0:
+            self.logger.info(
+                f"[无效修改过滤] 本轮共跳过{skipped_noop_count}项原值=目标值的无效修改"
+                f"（其中基值为0导致无变化: {skipped_noop_zero_base_count}项）"
+            )
+
+        if zero_base_noop_field_counter:
+            top_items = sorted(zero_base_noop_field_counter.items(), key=lambda x: (-x[1], x[0]))[:8]
+            self.logger.info("[无效修改根因] 基值为0且采用乘除表达式导致0->0无变化的高频字段:")
+            for k, c in top_items:
+                self.logger.info(f"  - {k}: {c}次")
+
+        parameter_detail_lines = self._format_parameter_detail_lines(target_updates)
+        current_workflow_id = getattr(self, 'current_workflow_id', None)
+        if current_workflow_id and current_workflow_id in self.workflows:
+            self.workflows[current_workflow_id]['last_parameter_detail_lines'] = list(parameter_detail_lines)
+            if zero_base_noop_field_counter:
+                existing_counter = dict(self.workflows[current_workflow_id].get('zero_base_noop_fields', {}) or {})
+                for k, c in zero_base_noop_field_counter.items():
+                    existing_counter[k] = int(existing_counter.get(k, 0)) + int(c)
+                self.workflows[current_workflow_id]['zero_base_noop_fields'] = existing_counter
 
         # ========== 【修改摘要】先于【计划修改】输出 ==========
         self.logger.info("\n" + "="*100)
@@ -3078,13 +3379,15 @@ class EnergyPlusOptimizer:
                         self.workflows[workflow_id]['current_idf_path'] = candidate_modified_idf
 
                 with self.workflows_lock:
+                    cached_parameter_detail_lines = list(self.workflows[workflow_id].get('last_parameter_detail_lines', []) or [])
                     self.workflows[workflow_id]['iteration_history'].append({
                         'iteration': iteration,
                         'metrics': metrics,
                         'idf_path': sim_idf,
                         'plan_description': '基准模拟' if iteration == 0 else '优化方案',
                         'is_early_stop_trigger_iteration': False,
-                        'early_stop_reason': ''
+                        'early_stop_reason': '',
+                        'parameter_detail_lines': cached_parameter_detail_lines
                     })
                     self.iteration_history = self.workflows[workflow_id]['iteration_history']
                     self.best_metrics = self.workflows[workflow_id]['best_metrics']
@@ -3174,6 +3477,7 @@ class EnergyPlusOptimizer:
 
             # ---------- 随后为每个工作流打印完整的最优详情（也写入各自的工作流日志） ----------
             printed_workflow_optimal = set()
+            workflow_optimal_lines = {}
             global_best = None
             global_best_workflow = None
             global_best_energy = float('inf')
@@ -3354,7 +3658,10 @@ class EnergyPlusOptimizer:
                             best_iter = workflow_data.get('best_iteration', 0)
                             if best_iter is not None and iteration_history and 0 <= best_iter < len(iteration_history):
                                 best_idf = iteration_history[best_iter].get('idf_path')
-                                lines = self._format_optimal_parameters(self.idf_path, best_idf)
+                                lines = iteration_history[best_iter].get('parameter_detail_lines')
+                                if not lines:
+                                    lines = self._format_optimal_parameters(self.idf_path, best_idf)
+                                workflow_optimal_lines[workflow_id] = lines
                                 for l in lines:
                                     self.logger.info(l)
                                 if wlogger:
@@ -3371,7 +3678,10 @@ class EnergyPlusOptimizer:
                             best_iter = workflow_data.get('best_iteration', 0)
                             if best_iter is not None and iteration_history and 0 <= best_iter < len(iteration_history):
                                 best_idf = iteration_history[best_iter].get('idf_path')
-                                lines = self._format_optimal_parameters(self.idf_path, best_idf)
+                                lines = iteration_history[best_iter].get('parameter_detail_lines')
+                                if not lines:
+                                    lines = self._format_optimal_parameters(self.idf_path, best_idf)
+                                workflow_optimal_lines[workflow_id] = lines
                                 for l in lines:
                                     self.logger.info(l)
                                 if wlogger:
@@ -3529,7 +3839,12 @@ class EnergyPlusOptimizer:
                         gh_best_iter = all_workflows[global_best_workflow].get('best_iteration', 0)
                         if gh_best_iter is not None and gh_iteration_history and 0 <= gh_best_iter < len(gh_iteration_history):
                             gh_best_idf = gh_iteration_history[gh_best_iter].get('idf_path')
-                            gh_lines = self._format_optimal_parameters(self.idf_path, gh_best_idf)
+                            # 优先复用该轮在生成修改计划时缓存的详情，避免再次全量解析IDF
+                            gh_lines = gh_iteration_history[gh_best_iter].get('parameter_detail_lines')
+                            if not gh_lines:
+                                gh_lines = workflow_optimal_lines.get(global_best_workflow)
+                            if gh_lines is None:
+                                gh_lines = self._format_optimal_parameters(self.idf_path, gh_best_idf)
                             # 写到汇总日志（无需额外前缀，因为已在全局上下文）
                             for ln in gh_lines:
                                 self.logger.info(ln)
@@ -3803,16 +4118,98 @@ class EnergyPlusOptimizer:
             ]
         }
         return defaults
+
+    def _format_parameter_detail_lines(self, target_updates):
+        """把本轮修改计划格式化为可缓存的参数修改详情文本。"""
+        lines = []
+        if not target_updates:
+            return ["未检测到参数修改（可能原始文件和优化文件相同）"]
+
+        def _fmt_num(n):
+            try:
+                n = float(n)
+            except Exception:
+                return str(n)
+            an = abs(n)
+            if an == 0:
+                return "0"
+            if an < 1e-4:
+                return f"{n:.8f}"
+            if an < 1e-2:
+                return f"{n:.6f}"
+            if an < 1:
+                return f"{n:.4f}"
+            if an < 1000:
+                return f"{n:.2f}"
+            return f"{n:.2f}"
+
+        object_types = sorted({u.get('type') for u in target_updates if u.get('type')})
+        lines.append(f"【修改对象类型】({len(object_types)}种)")
+        lines.append(', '.join(object_types))
+        lines.append("")
+        lines.append("【统计口径说明】仅统计当前轮实际执行且产生净变化的字段；已跳过无效修改与未变化项")
+        lines.append(f"【参数修改详情】(共{len(target_updates)}项修改)")
+
+        current_obj_type = None
+        for mod in sorted(target_updates, key=lambda x: (str(x.get('type', '')), str(x.get('name', '')))):
+            obj_type = mod.get('type', '')
+            if obj_type != current_obj_type:
+                current_obj_type = obj_type
+                lines.append(f"\n━━ {current_obj_type} ━━")
+
+            obj_name = mod.get('name', '')
+            field = mod.get('field', '')
+            baseline = mod.get('old_value')
+            optimal = mod.get('value')
+
+            try:
+                baseline_num = float(baseline)
+                optimal_num = float(optimal)
+                baseline_str = _fmt_num(baseline_num)
+                optimal_str = _fmt_num(optimal_num)
+                change_str = f"{baseline_str} → {optimal_str}"
+                pct_str = ""
+                if baseline_num != 0:
+                    change_pct = ((optimal_num - baseline_num) / baseline_num) * 100
+                    if change_pct != 0:
+                        pct_str = f"({change_pct:+.2f}%)"
+                lines.append(f"  • {obj_name}")
+                lines.append(f"    └─ {field}: {change_str} {pct_str}")
+            except Exception:
+                change_str = f"{baseline} → {optimal}"
+                lines.append(f"  • {obj_name}")
+                lines.append(f"    └─ {field}: {change_str}")
+
+        return lines
     
     def _format_optimal_parameters(self, baseline_idf_path, optimal_idf_path):
         """比较基准IDF与最优IDF，生成逐项参数修改的文本行列表（不直接写日志）。
 
         返回: list[str]，每一行为一条待写入日志的文本
         """
+        # 结果缓存：避免同一对 baseline/optimal 在最终汇总中被重复全量解析与对比
+        if not hasattr(self, '_optimal_parameter_lines_cache'):
+            self._optimal_parameter_lines_cache = {}
+
         lines = []
         if not os.path.exists(optimal_idf_path):
             lines.append(f"最优IDF文件不存在: {optimal_idf_path}")
             return lines
+
+        try:
+            baseline_abs = os.path.abspath(baseline_idf_path)
+            optimal_abs = os.path.abspath(optimal_idf_path)
+            cache_key = (
+                baseline_abs,
+                optimal_abs,
+                os.path.getmtime(baseline_abs) if os.path.exists(baseline_abs) else None,
+                os.path.getmtime(optimal_abs) if os.path.exists(optimal_abs) else None,
+            )
+            cached = self._optimal_parameter_lines_cache.get(cache_key)
+            if cached is not None:
+                return list(cached)
+        except Exception:
+            cache_key = None
 
         try:
             baseline_idf = IDF(baseline_idf_path)
@@ -3874,6 +4271,7 @@ class EnergyPlusOptimizer:
                 lines.append(f"【修改对象类型】({len(modified_objects)}种)")
                 lines.append(', '.join(sorted(modified_objects)))
                 lines.append("")
+                lines.append("【统计口径说明】仅统计基准IDF与最优IDF之间的净变化；中途尝试、回退或被覆盖的修改不计入")
                 lines.append(f"【参数修改详情】(共{len(modifications)}项修改)")
 
                 current_obj_type = None
@@ -3921,6 +4319,12 @@ class EnergyPlusOptimizer:
             else:
                 lines.append("未检测到参数修改（可能原始文件和优化文件相同）")
 
+            if cache_key is not None:
+                self._optimal_parameter_lines_cache[cache_key] = list(lines)
+                # 防止缓存无限增长，保留最近10项足够覆盖单次优化汇总使用场景
+                if len(self._optimal_parameter_lines_cache) > 10:
+                    oldest_key = next(iter(self._optimal_parameter_lines_cache))
+                    self._optimal_parameter_lines_cache.pop(oldest_key, None)
             return lines
         except Exception as e:
             return [f"解析最优方案修改详情时出错: {e}"]
@@ -4592,8 +4996,8 @@ if __name__ == "__main__":
     WEATHER_DIR = "weather"
 
     # 运行7个目标城市
-    TARGET_CITIES = ["Chengdu"]
-    RUNS_PER_CITY = 10
+    TARGET_CITIES = ["Beijing"]
+    RUNS_PER_CITY = 1
 
     # 所有城市结果统一收敛到该目录下
     ROOT_OUTPUT_DIR = "各城市迭代结果"
