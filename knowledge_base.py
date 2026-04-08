@@ -412,9 +412,9 @@ class EnergyPlusKnowledgeBase:
         
         return formatted
 
-    def build_system_prompt(self) -> str:
+    def build_system_prompt(self, optimization_mode: str = "target") -> str:
         """构建LLM系统提示词。"""
-        return build_system_prompt()
+        return build_system_prompt(optimization_mode=optimization_mode)
 
     def build_user_prompt(
         self,
@@ -426,6 +426,7 @@ class EnergyPlusKnowledgeBase:
         max_modifications: int,
         enable_novelty_constraints: bool,
         base_novelty_directive: str,
+        optimization_mode: str = "target",
     ) -> str:
         """构建LLM用户提示词。"""
         return build_user_prompt(
@@ -437,6 +438,7 @@ class EnergyPlusKnowledgeBase:
             max_modifications=max_modifications,
             enable_novelty_constraints=enable_novelty_constraints,
             base_novelty_directive=base_novelty_directive,
+            optimization_mode=optimization_mode,
             is_numeric_value=is_numeric_value,
             is_special_value=is_special_value,
         )

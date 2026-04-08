@@ -40,7 +40,8 @@ class EnergyPlusOptimizer:
         optimization_dir="optimization_results_并行",
         plot_dir="optimization_plot_并行",
         num_workflows=1,
-        city_name=None
+        city_name=None,
+        optimization_mode="target"
     ):
         self.idf_path = idf_path
         self.idd_path = idd_path
@@ -114,16 +115,35 @@ class EnergyPlusOptimizer:
         self.workflows_lock = Lock()  # 保护共享资源的锁
         self.logger.info(f"初始化{num_workflows}条并行工作流")
 
-        # 早停配置：以“尽快达到目标节能率”为主
+        # 优化模式开关：
+        # - target: 达标优先（50%目标）
+        # - convergence: 收敛早停优先
+        self.optimization_mode = self._normalize_optimization_mode(optimization_mode)
+
+        # 早停配置（基础参数）
         self.early_stop_enabled = True
         self.early_stop_target_total_saving_pct = 50.0      # 达到目标节能率可提前停止
         self.early_stop_min_iterations = 2                  # 至少完成基准+1轮后再判定
-        self.early_stop_convergence_enabled = False         # 仅以达到目标节能率作为早停触发条件
         self.early_stop_convergence_patience = 2            # 连续N次增益极小判定收敛
         self.early_stop_min_delta_pct = 2                   # 节能率变化阈值（百分点）
         self.max_iterations_cap = 40                        # 自动模式下的最大安全上限
-        self.iteration_efficiency_agent = LLMIterationEfficiencyAgent(
-            target_saving_pct=self.early_stop_target_total_saving_pct
+
+        # 模式路由：不改动两种模式各自既有能力，仅决定启用组合
+        if self.optimization_mode == "convergence":
+            self.early_stop_target_enabled = False
+            self.early_stop_convergence_enabled = True
+            self.iteration_efficiency_agent = None  # 达标专属智能体在收敛模式关闭
+        else:
+            self.early_stop_target_enabled = True
+            self.early_stop_convergence_enabled = False
+            self.iteration_efficiency_agent = LLMIterationEfficiencyAgent(
+                target_saving_pct=self.early_stop_target_total_saving_pct
+            )
+
+        self.logger.info(
+            f"优化模式: {self.optimization_mode} "
+            f"(target_enabled={self.early_stop_target_enabled}, "
+            f"convergence_enabled={self.early_stop_convergence_enabled})"
         )
         self.climate_adaptation_agent = ClimateAdaptationAgent()
         
@@ -261,6 +281,16 @@ class EnergyPlusOptimizer:
         if match:
             return f"【工作流{match.group(1)}】"
         return f"【{wid}】"
+
+    def _normalize_optimization_mode(self, mode):
+        """标准化优化模式，仅允许 target 或 convergence。"""
+        m = str(mode or "target").strip().lower()
+        if m in ("target", "goal", "达标", "达标优先"):
+            return "target"
+        if m in ("convergence", "收敛", "收敛早停"):
+            return "convergence"
+        self.logger.warning(f"未知optimization_mode='{mode}'，已回退为target模式")
+        return "target"
     
     def _setup_workflow_logger(self, workflow_id):
         """为单个workflow初始化独立的日志系统
@@ -756,10 +786,17 @@ class EnergyPlusOptimizer:
             f"- 冷却能耗 {metrics['total_cooling_kwh']} kWh/m²\n"
             f"- 供暖能耗 {metrics['total_heating_kwh']} kWh/m²\n"
             f"\n【核心优化目标】必须同时降低总能耗、供暖能耗、制冷能耗三者，不允许其中任何一项上升。"
-            f"\n【本阶段达标目标】在修改幅度保持工程合理的前提下，优先用尽量少的迭代轮次，尽快达到总能耗节能率≥{self.early_stop_target_total_saving_pct:.1f}%。"
             f"\n【迭代效率要求】每轮优先选择预期节能贡献更高的对象/字段组合，减少低收益尝试。"
             f"\n【收敛行为要求】避免在目标阈值附近来回震荡；若上一轮出现反优化，本轮必须明确纠偏并提升总节能率。"
         )
+
+        if bool(getattr(self, 'early_stop_target_enabled', True)):
+            request += (
+                f"\n【本阶段达标目标】在修改幅度保持工程合理的前提下，优先用尽量少的迭代轮次，"
+                f"尽快达到总能耗节能率≥{self.early_stop_target_total_saving_pct:.1f}%。"
+            )
+        else:
+            request += "\n【本阶段优化目标】取消固定节能率硬目标，优先稳定降低总能耗并尽快收敛。"
 
         # 反馈上一轮效果，避免重复沿错误方向调整
         if len(self.iteration_history) >= 2:
@@ -832,9 +869,9 @@ class EnergyPlusOptimizer:
         
         request += f"\n{optimization_directions}"
 
-        # 达标冲刺意识：接近50%时减少低收益探索，优先跨越目标阈值
+        # 达标冲刺意识：仅达标模式启用
         try:
-            if self.iteration_history:
+            if bool(getattr(self, 'early_stop_target_enabled', True)) and self.iteration_history:
                 baseline_metrics = self.iteration_history[0].get('metrics', {})
                 baseline_total = float(baseline_metrics.get('total_site_energy_kwh', 0.0) or 0.0)
                 current_total = float(metrics.get('total_site_energy_kwh', 0.0) or 0.0)
@@ -862,22 +899,23 @@ class EnergyPlusOptimizer:
             self.logger.debug(f"生成气候适应上下文失败，跳过该增强: {e}")
 
         # 迭代效率智能体：把历史表现转成下一轮策略提示，辅助LLM以更少轮次达标
-        try:
-            field_effectiveness = {}
-            with self.workflows_lock:
-                current_wf = self.workflows.get(getattr(self, 'current_workflow_id', None), {})
-                if isinstance(current_wf, dict):
-                    field_effectiveness = dict(current_wf.get('field_effectiveness', {}) or {})
+        if self.iteration_efficiency_agent is not None and bool(getattr(self, 'early_stop_target_enabled', True)):
+            try:
+                field_effectiveness = {}
+                with self.workflows_lock:
+                    current_wf = self.workflows.get(getattr(self, 'current_workflow_id', None), {})
+                    if isinstance(current_wf, dict):
+                        field_effectiveness = dict(current_wf.get('field_effectiveness', {}) or {})
 
-            efficiency_directive = self.iteration_efficiency_agent.build_directive(
-                iteration_history=list(self.iteration_history or []),
-                field_modification_history=dict(self.field_modification_history or {}),
-                field_effectiveness=field_effectiveness,
-            )
-            if efficiency_directive:
-                request += f"\n\n{efficiency_directive}"
-        except Exception as e:
-            self.logger.debug(f"生成迭代效率提示失败，跳过该增强: {e}")
+                efficiency_directive = self.iteration_efficiency_agent.build_directive(
+                    iteration_history=list(self.iteration_history or []),
+                    field_modification_history=dict(self.field_modification_history or {}),
+                    field_effectiveness=field_effectiveness,
+                )
+                if efficiency_directive:
+                    request += f"\n\n{efficiency_directive}"
+            except Exception as e:
+                self.logger.debug(f"生成迭代效率提示失败，跳过该增强: {e}")
         
         request += f"\n请根据物理原理，推荐可执行的IDF参数修改方案（允许某些字段增大、另一些字段减小）。"
         
@@ -1023,7 +1061,9 @@ class EnergyPlusOptimizer:
         # 不启用“低频补充/反重复”约束，仅保留覆盖度与可执行性要求
         enable_novelty_constraints = False
         base_novelty_directive = ""
-        system_prompt = self.knowledge_base.build_system_prompt()
+        system_prompt = self.knowledge_base.build_system_prompt(
+            optimization_mode=self.optimization_mode
+        )
         field_usage_summary = self._get_field_usage_summary()
         user_prompt = self.knowledge_base.build_user_prompt(
             user_request=user_request,
@@ -1034,6 +1074,7 @@ class EnergyPlusOptimizer:
             max_modifications=max_modifications,
             enable_novelty_constraints=enable_novelty_constraints,
             base_novelty_directive=base_novelty_directive,
+            optimization_mode=self.optimization_mode,
         )
         
         try:
@@ -2960,8 +3001,9 @@ class EnergyPlusOptimizer:
             return False, ""
 
         latest_saving_pct = (baseline_total - latest_total) / baseline_total * 100.0
-        if latest_saving_pct >= float(self.early_stop_target_total_saving_pct):
-            return True, f"已达到目标节能率 {latest_saving_pct:.2f}% (阈值 {self.early_stop_target_total_saving_pct:.2f}%)"
+        if bool(getattr(self, 'early_stop_target_enabled', True)):
+            if latest_saving_pct >= float(self.early_stop_target_total_saving_pct):
+                return True, f"已达到目标节能率 {latest_saving_pct:.2f}% (阈值 {self.early_stop_target_total_saving_pct:.2f}%)"
 
         saving_series = []
         for item in iteration_history[1:]:
@@ -2999,16 +3041,26 @@ class EnergyPlusOptimizer:
         self.logger.info(f"\n{'█'*80}")
         self.logger.info(f"启动{max_iterations}轮迭代优化 (并行{self.num_workflows}条工作流)")
         self.logger.info("执行模型说明：工作流在线程池并行推进；日志会按完成先后交错显示，不代表串行执行")
-        if bool(getattr(self, 'early_stop_convergence_enabled', True)):
+        target_enabled = bool(getattr(self, 'early_stop_target_enabled', True))
+        convergence_enabled = bool(getattr(self, 'early_stop_convergence_enabled', True))
+
+        if convergence_enabled and target_enabled:
             self.logger.info(
                 f"早停策略：目标节能率≥{self.early_stop_target_total_saving_pct:.2f}% 或最近"
                 f"{self.early_stop_convergence_patience}轮节能率变化≤{self.early_stop_min_delta_pct:.2f}个百分点"
             )
-        else:
+        elif convergence_enabled:
+            self.logger.info(
+                f"早停策略：收敛优先。最近{self.early_stop_convergence_patience}轮"
+                f"节能率变化≤{self.early_stop_min_delta_pct:.2f}个百分点时停止"
+            )
+        elif target_enabled:
             self.logger.info(
                 f"早停策略：仅当目标节能率达到≥{self.early_stop_target_total_saving_pct:.2f}%时停止，"
                 f"用于评估达到目标所需最小迭代轮次"
             )
+        else:
+            self.logger.info("早停策略：已禁用（将运行到最大迭代轮次）")
         self.logger.info(f"{'█'*80}\n")
         
         parallel_start = perf_counter()
@@ -4850,6 +4902,7 @@ if __name__ == "__main__":
     IDD_PATH = "Energy+v24.2.idd"
     API_KEY_PATH = "api_key.txt"
     WEATHER_DIR = "weather"
+    OPTIMIZATION_MODE = "convergence"  # 可选: "target"(达标优先) / "convergence"(收敛早停)
 
     # 运行7个目标城市
     TARGET_CITIES = ["Beijing"]
@@ -4917,6 +4970,7 @@ if __name__ == "__main__":
                         api_key_path=API_KEY_PATH,
                         epw_path=epw_path,
                         city_name=city,
+                        optimization_mode=OPTIMIZATION_MODE,
                         log_dir=log_dir,
                         optimization_dir=optimization_dir,
                         plot_dir=plot_dir
