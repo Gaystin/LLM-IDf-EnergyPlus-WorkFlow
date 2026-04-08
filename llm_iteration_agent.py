@@ -1,13 +1,13 @@
 """LLM迭代效率智能体：基于历史迭代结果生成下一轮策略提示。"""
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 class LLMIterationEfficiencyAgent:
     """根据历史迭代表现，构建“尽快达标”的策略提示。"""
 
-    def __init__(self, target_saving_pct: Optional[float] = 50.0):
-        self.target_saving_pct = None if target_saving_pct is None else float(target_saving_pct)
+    def __init__(self, target_saving_pct: float = 50.0):
+        self.target_saving_pct = float(target_saving_pct)
 
     @staticmethod
     def _safe_saving_pct(baseline: float, current: float) -> float:
@@ -43,25 +43,19 @@ class LLMIterationEfficiencyAgent:
 
         best_saving = max(saving_series) if saving_series else 0.0
         latest_saving = saving_series[-1] if saving_series else 0.0
+        remaining = max(0.0, self.target_saving_pct - latest_saving)
 
         lines = [
             "【效率智能体建议】",
             f"- 当前最佳节能率: {best_saving:.2f}%",
             f"- 当前最新节能率: {latest_saving:.2f}%",
-            "- 优先给出高收益且可执行的字段修改组合，减少无效试探。",
-            "- 保持节能率稳步改善并避免在阈值附近来回震荡。",
+            f"- 与目标{self.target_saving_pct:.2f}%的差距: {remaining:.2f}%",
+            "- 目标是以更少迭代轮次达标，优先给出高收益且可执行的字段修改组合。",
+            "- 每轮都应推动总节能率向50%单调逼近，避免在阈值附近来回震荡。",
         ]
 
-        if self.target_saving_pct is not None:
-            remaining = max(0.0, self.target_saving_pct - latest_saving)
-            lines.insert(3, f"- 与目标{self.target_saving_pct:.2f}%的差距: {remaining:.2f}%")
-            lines.insert(4, "- 目标是以更少迭代轮次达标，优先给出高收益且可执行的字段修改组合。")
-            lines[5] = f"- 每轮都应推动总节能率向{self.target_saving_pct:.0f}%单调逼近，避免在阈值附近来回震荡。"
-
-            if 0.0 < remaining <= 5.0:
-                lines.append(
-                    f"- 当前已接近目标阈值：请进入冲刺模式，减少低收益探索，优先跨越{self.target_saving_pct:.0f}%目标。"
-                )
+        if 0.0 < remaining <= 5.0:
+            lines.append("- 当前已接近目标阈值：请进入冲刺模式，减少低收益探索，优先跨越50%目标。")
 
         if len(saving_series) >= 2:
             delta = saving_series[-1] - saving_series[-2]
@@ -111,8 +105,5 @@ class LLMIterationEfficiencyAgent:
                         f"  * {key}: 平均{avg_delta:+.2f} kWh/次，累计{total_delta:+.2f} kWh（{uses}次）"
                     )
 
-        if self.target_saving_pct is not None:
-            lines.append("- 为尽快达成目标，可适度提高有效方向的推进力度，但避免过于激进的步长。")
-        else:
-            lines.append("- 无固定达标阈值时，建议以稳定增益为先，达到收益平台后及时收敛。")
+        lines.append("- 为尽快达到50%目标，可适度提高有效方向的推进力度，但避免过于激进的步长。")
         return "\n".join(lines)

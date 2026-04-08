@@ -143,6 +143,8 @@ class EnergyPlusOptimizer:
                 'suggestion_field_frequency': {},
                 'suggestion_object_frequency_by_iteration': {},
                 'suggestion_field_frequency_by_iteration': {},
+                'last_parameter_detail_lines': [],
+                'last_parameter_updates': [],
                 'workflow_total_duration_sec': 0.0,
                 'llm_total_duration_sec': 0.0,
                 'sim_total_duration_sec': 0.0,
@@ -335,11 +337,6 @@ class EnergyPlusOptimizer:
         """定位EnergyPlus安装"""
         common_paths = [
             r"C:\EnergyPlusV24-2-0",
-            r"C:\EnergyPlusV24-1-0",
-            r"C:\EnergyPlusV23-2-0",
-            r"C:\EnergyPlusV23-1-0",
-            r"C:\EnergyPlusV22-2-0",
-            r"C:\EnergyPlus",
         ]
         
         for path in common_paths:
@@ -2448,6 +2445,25 @@ class EnergyPlusOptimizer:
         默认策略：同一对象类型下的同字段修改，应用到全部实例，避免漏改。
         """
         target_updates = []
+        skipped_noop_count = 0
+
+        current_workflow_id = getattr(self, 'current_workflow_id', None)
+        if current_workflow_id and current_workflow_id in self.workflows:
+            # 开始新一轮修改前清空缓存，避免沿用上一轮数据
+            self.workflows[current_workflow_id]['last_parameter_detail_lines'] = []
+            self.workflows[current_workflow_id]['last_parameter_updates'] = []
+
+        def _values_equivalent(a, b):
+            if a is None and b is None:
+                return True
+            if a is None or b is None:
+                return False
+            try:
+                a_num = float(a)
+                b_num = float(b)
+                return abs(a_num - b_num) <= max(1e-9, 1e-9 * max(abs(a_num), abs(b_num), 1.0))
+            except (ValueError, TypeError):
+                return str(a).strip() == str(b).strip()
         
         for mod in plan["modifications"]:
             obj_type_input = mod.get("object_type")
@@ -2579,10 +2595,43 @@ class EnergyPlusOptimizer:
 
         # ========== 物理约束修正：防止生成非法IDF（如玻璃参数组合越界） ==========
         target_updates = self._enforce_physical_constraints(target_updates)
+
+        # 约束修正后再次剔除“无实际变化”项，避免它们进入修改摘要与最终汇总
+        if target_updates:
+            filtered_updates = []
+            post_constraint_noop = 0
+            for upd in target_updates:
+                if _values_equivalent(upd.get('old_value'), upd.get('value')):
+                    post_constraint_noop += 1
+                    continue
+                filtered_updates.append(upd)
+            target_updates = filtered_updates
+            skipped_noop_count += post_constraint_noop
         
         if not target_updates:
-            self.logger.warning("所有修改因参数冲突被过滤，跳过保存")
+            if skipped_noop_count > 0:
+                self.logger.info(f"[无效修改过滤] 本轮共跳过{skipped_noop_count}项原值=目标值的无效修改")
+            self.logger.warning("所有修改因参数冲突或无实际变化被过滤，跳过保存")
             return
+
+        if skipped_noop_count > 0:
+            self.logger.info(f"[无效修改过滤] 本轮共跳过{skipped_noop_count}项原值=目标值的无效修改")
+
+        parameter_detail_lines = self._format_parameter_detail_lines(target_updates)
+        if current_workflow_id and current_workflow_id in self.workflows:
+            self.workflows[current_workflow_id]['last_parameter_detail_lines'] = list(parameter_detail_lines)
+            self.workflows[current_workflow_id]['last_parameter_updates'] = [
+                {
+                    'type': upd.get('type'),
+                    'name': upd.get('name'),
+                    'field': upd.get('field'),
+                    'old_value': upd.get('old_value'),
+                    'value': upd.get('value'),
+                    'coefficient': upd.get('coefficient'),
+                    'expression': upd.get('expression'),
+                }
+                for upd in target_updates
+            ]
 
         # ========== 【修改摘要】先于【计划修改】输出 ==========
         self.logger.info("\n" + "="*100)
@@ -3089,7 +3138,9 @@ class EnergyPlusOptimizer:
                         'idf_path': sim_idf,
                         'plan_description': '基准模拟' if iteration == 0 else '优化方案',
                         'is_early_stop_trigger_iteration': False,
-                        'early_stop_reason': ''
+                        'early_stop_reason': '',
+                        'parameter_detail_lines': list(self.workflows[workflow_id].get('last_parameter_detail_lines', []) or []),
+                        'parameter_updates': list(self.workflows[workflow_id].get('last_parameter_updates', []) or [])
                     })
                     self.iteration_history = self.workflows[workflow_id]['iteration_history']
                     self.best_metrics = self.workflows[workflow_id]['best_metrics']
@@ -3359,7 +3410,9 @@ class EnergyPlusOptimizer:
                             best_iter = workflow_data.get('best_iteration', 0)
                             if best_iter is not None and iteration_history and 0 <= best_iter < len(iteration_history):
                                 best_idf = iteration_history[best_iter].get('idf_path')
-                                lines = self._format_optimal_parameters(self.idf_path, best_idf)
+                                lines = self._format_cumulative_parameter_detail_lines(iteration_history)
+                                if not lines:
+                                    lines = self._format_optimal_parameters(self.idf_path, best_idf)
                                 for l in lines:
                                     self.logger.info(l)
                                 if wlogger:
@@ -3376,7 +3429,9 @@ class EnergyPlusOptimizer:
                             best_iter = workflow_data.get('best_iteration', 0)
                             if best_iter is not None and iteration_history and 0 <= best_iter < len(iteration_history):
                                 best_idf = iteration_history[best_iter].get('idf_path')
-                                lines = self._format_optimal_parameters(self.idf_path, best_idf)
+                                lines = self._format_cumulative_parameter_detail_lines(iteration_history)
+                                if not lines:
+                                    lines = self._format_optimal_parameters(self.idf_path, best_idf)
                                 for l in lines:
                                     self.logger.info(l)
                                 if wlogger:
@@ -3534,7 +3589,9 @@ class EnergyPlusOptimizer:
                         gh_best_iter = all_workflows[global_best_workflow].get('best_iteration', 0)
                         if gh_best_iter is not None and gh_iteration_history and 0 <= gh_best_iter < len(gh_iteration_history):
                             gh_best_idf = gh_iteration_history[gh_best_iter].get('idf_path')
-                            gh_lines = self._format_optimal_parameters(self.idf_path, gh_best_idf)
+                            gh_lines = self._format_cumulative_parameter_detail_lines(gh_iteration_history)
+                            if not gh_lines:
+                                gh_lines = self._format_optimal_parameters(self.idf_path, gh_best_idf)
                             # 写到汇总日志（无需额外前缀，因为已在全局上下文）
                             for ln in gh_lines:
                                 self.logger.info(ln)
@@ -3808,16 +3865,207 @@ class EnergyPlusOptimizer:
             ]
         }
         return defaults
+
+    def _format_parameter_detail_lines(self, target_updates):
+        """把本轮实际执行的修改计划格式化为可缓存的参数详情文本。"""
+        if not target_updates:
+            return ["未检测到参数修改（可能原始文件和优化文件相同）"]
+
+        def _fmt_num(n):
+            try:
+                n = float(n)
+            except Exception:
+                return str(n)
+            an = abs(n)
+            if an == 0:
+                return "0"
+            if an < 1e-4:
+                return f"{n:.8f}"
+            if an < 1e-2:
+                return f"{n:.6f}"
+            if an < 1:
+                return f"{n:.4f}"
+            if an < 1000:
+                return f"{n:.2f}"
+            return f"{n:.2f}"
+
+        lines = []
+        object_types = sorted({u.get('type') for u in target_updates if u.get('type')})
+        lines.append(f"【修改对象类型】({len(object_types)}种)")
+        lines.append(', '.join(object_types))
+        lines.append("")
+        lines.append("【统计口径说明】仅统计当前轮实际执行且产生净变化的字段；已跳过无效修改与未变化项")
+        lines.append(f"【参数修改详情】(共{len(target_updates)}项修改)")
+
+        current_obj_type = None
+        for mod in sorted(target_updates, key=lambda x: (str(x.get('type', '')), str(x.get('name', '')))):
+            obj_type = mod.get('type', '')
+            if obj_type != current_obj_type:
+                current_obj_type = obj_type
+                lines.append(f"\n━━ {current_obj_type} ━━")
+
+            obj_name = mod.get('name', '')
+            field = mod.get('field', '')
+            baseline = mod.get('old_value')
+            optimal = mod.get('value')
+
+            try:
+                baseline_num = float(baseline)
+                optimal_num = float(optimal)
+                baseline_str = _fmt_num(baseline_num)
+                optimal_str = _fmt_num(optimal_num)
+                change_str = f"{baseline_str} → {optimal_str}"
+                pct_str = ""
+                if baseline_num != 0:
+                    change_pct = ((optimal_num - baseline_num) / baseline_num) * 100
+                    if change_pct != 0:
+                        pct_str = f"({change_pct:+.2f}%)"
+                lines.append(f"  • {obj_name}")
+                lines.append(f"    └─ {field}: {change_str} {pct_str}")
+            except Exception:
+                change_str = f"{baseline} → {optimal}"
+                lines.append(f"  • {obj_name}")
+                lines.append(f"    └─ {field}: {change_str}")
+
+        return lines
+
+    def _format_cumulative_parameter_detail_lines(self, iteration_history):
+        """汇总截至当前所有轮次的修改（基于每轮缓存），用于最终报告。"""
+        if not iteration_history:
+            return ["未检测到参数修改（迭代历史为空）"]
+
+        aggregated = {}
+        total_events = 0
+
+        for item in iteration_history:
+            iteration = item.get('iteration')
+            updates = list(item.get('parameter_updates', []) or [])
+            if not updates:
+                continue
+
+            for upd in updates:
+                obj_type = str(upd.get('type', '') or '')
+                obj_name = str(upd.get('name', '') or '')
+                field = str(upd.get('field', '') or '')
+                key = (obj_type, obj_name, field)
+
+                if key not in aggregated:
+                    aggregated[key] = {
+                        'type': obj_type,
+                        'name': obj_name,
+                        'field': field,
+                        'first_old_value': upd.get('old_value'),
+                        'latest_value': upd.get('value'),
+                        'first_iteration': iteration,
+                        'last_iteration': iteration,
+                        'count': 1,
+                    }
+                else:
+                    aggregated[key]['latest_value'] = upd.get('value')
+                    aggregated[key]['last_iteration'] = iteration
+                    aggregated[key]['count'] = int(aggregated[key].get('count', 0)) + 1
+
+                total_events += 1
+
+        if not aggregated:
+            return ["未检测到参数修改（缓存为空或仅有基准轮）"]
+
+        def _fmt_num(n):
+            try:
+                n = float(n)
+            except Exception:
+                return str(n)
+            an = abs(n)
+            if an == 0:
+                return "0"
+            if an < 1e-4:
+                return f"{n:.8f}"
+            if an < 1e-2:
+                return f"{n:.6f}"
+            if an < 1:
+                return f"{n:.4f}"
+            if an < 1000:
+                return f"{n:.2f}"
+            return f"{n:.2f}"
+
+        lines = []
+        object_types = sorted({v.get('type') for v in aggregated.values() if v.get('type')})
+        lines.append(f"【修改对象类型】({len(object_types)}种)")
+        lines.append(', '.join(object_types))
+        lines.append("")
+        lines.append("【统计口径说明】统计截至当前轮次所有修改事件的汇总（跨轮次聚合，不仅限最优单轮）")
+        lines.append(f"【参数修改详情】(累计事件{total_events}项，累计唯一字段{len(aggregated)}项)")
+
+        current_obj_type = None
+        ordered = sorted(aggregated.values(), key=lambda x: (str(x.get('type', '')), str(x.get('name', '')), str(x.get('field', ''))))
+        for mod in ordered:
+            obj_type = mod.get('type', '')
+            if obj_type != current_obj_type:
+                current_obj_type = obj_type
+                lines.append(f"\n━━ {current_obj_type} ━━")
+
+            obj_name = mod.get('name', '')
+            field = mod.get('field', '')
+            baseline = mod.get('first_old_value')
+            optimal = mod.get('latest_value')
+            count = int(mod.get('count', 0) or 0)
+            first_iter = mod.get('first_iteration')
+            last_iter = mod.get('last_iteration')
+
+            try:
+                baseline_num = float(baseline)
+                optimal_num = float(optimal)
+                baseline_str = _fmt_num(baseline_num)
+                optimal_str = _fmt_num(optimal_num)
+                change_str = f"{baseline_str} → {optimal_str}"
+                pct_str = ""
+                if baseline_num != 0:
+                    change_pct = ((optimal_num - baseline_num) / baseline_num) * 100
+                    if change_pct != 0:
+                        pct_str = f"({change_pct:+.2f}%)"
+                lines.append(f"  • {obj_name}")
+                lines.append(
+                    f"    └─ {field}: {change_str} {pct_str} "
+                    f"[累计修改{count}次，首次第{first_iter}轮，最近第{last_iter}轮]"
+                )
+            except Exception:
+                change_str = f"{baseline} → {optimal}"
+                lines.append(f"  • {obj_name}")
+                lines.append(
+                    f"    └─ {field}: {change_str} "
+                    f"[累计修改{count}次，首次第{first_iter}轮，最近第{last_iter}轮]"
+                )
+
+        return lines
     
     def _format_optimal_parameters(self, baseline_idf_path, optimal_idf_path):
         """比较基准IDF与最优IDF，生成逐项参数修改的文本行列表（不直接写日志）。
 
         返回: list[str]，每一行为一条待写入日志的文本
         """
+        if not hasattr(self, '_optimal_parameter_lines_cache'):
+            self._optimal_parameter_lines_cache = {}
+
         lines = []
         if not os.path.exists(optimal_idf_path):
             lines.append(f"最优IDF文件不存在: {optimal_idf_path}")
             return lines
+
+        cache_key = None
+        try:
+            baseline_abs = os.path.abspath(baseline_idf_path)
+            optimal_abs = os.path.abspath(optimal_idf_path)
+            cache_key = (
+                baseline_abs,
+                optimal_abs,
+                os.path.getmtime(baseline_abs) if os.path.exists(baseline_abs) else None,
+                os.path.getmtime(optimal_abs) if os.path.exists(optimal_abs) else None,
+            )
+            cached = self._optimal_parameter_lines_cache.get(cache_key)
+            if cached is not None:
+                return list(cached)
+        except Exception:
+            cache_key = None
 
         try:
             baseline_idf = IDF(baseline_idf_path)
@@ -3879,6 +4127,7 @@ class EnergyPlusOptimizer:
                 lines.append(f"【修改对象类型】({len(modified_objects)}种)")
                 lines.append(', '.join(sorted(modified_objects)))
                 lines.append("")
+                lines.append("【统计口径说明】仅统计基准IDF与最优IDF之间的净变化；中途尝试、回退或被覆盖的修改不计入")
                 lines.append(f"【参数修改详情】(共{len(modifications)}项修改)")
 
                 current_obj_type = None
@@ -3925,6 +4174,12 @@ class EnergyPlusOptimizer:
                         lines.append(f"    └─ {field}: {change_str} {pct_str}")
             else:
                 lines.append("未检测到参数修改（可能原始文件和优化文件相同）")
+
+            if cache_key is not None:
+                self._optimal_parameter_lines_cache[cache_key] = list(lines)
+                if len(self._optimal_parameter_lines_cache) > 10:
+                    oldest_key = next(iter(self._optimal_parameter_lines_cache))
+                    self._optimal_parameter_lines_cache.pop(oldest_key, None)
 
             return lines
         except Exception as e:
@@ -4591,14 +4846,14 @@ def _export_city_xlsx(city_root, city, city_rows):
 
 if __name__ == "__main__":
     # 配置文件路径
-    IDF_PATH = "in.idf"
-    IDD_PATH = "Energy+.idd"
+    IDF_PATH = "in_v24.2.idf"
+    IDD_PATH = "Energy+v24.2.idd"
     API_KEY_PATH = "api_key.txt"
     WEATHER_DIR = "weather"
 
     # 运行7个目标城市
-    TARGET_CITIES = ["Chengdu"]
-    RUNS_PER_CITY = 10
+    TARGET_CITIES = ["Beijing"]
+    RUNS_PER_CITY = 1
 
     # 所有城市结果统一收敛到该目录下
     ROOT_OUTPUT_DIR = "各城市迭代结果"

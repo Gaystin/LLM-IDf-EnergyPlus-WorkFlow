@@ -177,10 +177,6 @@ class EnergyPlusKnowledgeBase:
                     # 逐个检查该对象类型的所有字段
                     for field_name in sample_obj.fieldnames:
                         try:
-                            field_norm = str(field_name).upper().replace("_", "").replace(" ", "")
-                            if "MULTIPLIER" in field_norm:
-                                continue
-
                             field_value = getattr(sample_obj, field_name, None)
                             
                             # 判断这个字段是否可修改：必须是数值类型
@@ -247,11 +243,11 @@ class EnergyPlusKnowledgeBase:
             if has_threshold_intent:
                 # 有阈值意图：IdealLoads 优先，Sizing:Zone 次之
                 priority_order = ["ZoneHVAC:IdealLoadsAirSystem", "Sizing:Zone"]
-                print("[KB] threshold intent detected, prioritize ZoneHVAC:IdealLoadsAirSystem")
+                print(f"  ✓ 检测到阈值关键词，优先推荐 ZoneHVAC:IdealLoadsAirSystem")
             else:
                 # 无阈值意图：Sizing:Zone 优先，IdealLoads 次之
                 priority_order = ["Sizing:Zone", "ZoneHVAC:IdealLoadsAirSystem"]
-                print("[KB] no threshold intent detected, prioritize Sizing:Zone")
+                print(f"  ✓ 未检测到阈值关键词，优先推荐 Sizing:Zone")
             
             # 按优先级排序（优先级高的对象排在前面）
             sorted_objects = []
@@ -299,23 +295,8 @@ class EnergyPlusKnowledgeBase:
         # 验证字段是否存在
         valid_fields_in_object = self.objects_metadata.get(object_type, {}).get('fields', [])
         matched_fields = [f for f in matched_fields if f in valid_fields_in_object]
-
-        # 关键改进：不要把候选字段缩得过窄。
-        # 在关键词命中的基础上，补充“可修改数值字段”，让LLM可自主探索更多有效字段组合。
-        modifiable = self._get_modifiable_fields(object_type)
-        if modifiable:
-            modifiable_fields = [f for f in valid_fields_in_object if f in modifiable]
-        else:
-            modifiable_fields = list(valid_fields_in_object)
-
-        if matched_fields:
-            matched_set = set(matched_fields)
-            extra_fields = [f for f in modifiable_fields if f not in matched_set]
-            # 控制上下文长度：保留关键词命中字段 + 额外最多24个可修改字段
-            return matched_fields + extra_fields[:24]
-
-        # 无关键词命中时，返回可修改字段，避免过度依赖关键词导致字段覆盖不足
-        return modifiable_fields
+        
+        return matched_fields if matched_fields else valid_fields_in_object
     
     def get_object_info(self, object_type: str) -> Dict:
         """
@@ -332,24 +313,6 @@ class EnergyPlusKnowledgeBase:
         }
         """
         matched_obj_types = self.match_objects_by_keywords(user_request)
-
-        # 关键改进：当关键词匹配对象过少时，自动补充可修改对象，提升LLM自主优化空间
-        if len(matched_obj_types) < 6:
-            modifiable_objects = []
-            for obj_type, mod_fields in self._modifiable_fields_cache.items():
-                if obj_type in self.objects_metadata and mod_fields:
-                    modifiable_objects.append((obj_type, len(mod_fields)))
-
-            # 按可修改字段数量优先，补充到最多10个对象类型
-            modifiable_objects.sort(key=lambda x: (-x[1], x[0]))
-            existing = set(matched_obj_types)
-            for obj_type, _ in modifiable_objects:
-                if obj_type in existing:
-                    continue
-                matched_obj_types.append(obj_type)
-                existing.add(obj_type)
-                if len(matched_obj_types) >= 10:
-                    break
         
         enhanced_context = {
             'matched_objects': [],
@@ -363,7 +326,6 @@ class EnergyPlusKnowledgeBase:
             # 为每个字段添加语义信息
             fields_with_semantics = []
             obj_semantics = self.field_semantics.get(obj_type, {})
-            user_request_lower = user_request.lower()
             
             for field in candidate_fields:
                 field_info = {
@@ -383,30 +345,6 @@ class EnergyPlusKnowledgeBase:
                     })
                 
                 fields_with_semantics.append(field_info)
-
-            def _field_score(info):
-                text = " ".join([
-                    str(info.get('field_name', '')),
-                    str(info.get('description', '')),
-                    str(info.get('semantic', '')),
-                    " ".join(info.get('related_concepts', []) or []),
-                ]).lower()
-                score = 0
-                priority_terms = [
-                    'heat recovery', '热回收', '显热', '潜热', 'efficiency', 'effectiveness',
-                    'humidity', '湿度', 'temperature', '温度', 'conduction', 'conductivity', '导热'
-                ]
-                for term in priority_terms:
-                    if term in text:
-                        score += 2
-                    if term in user_request_lower and term in text:
-                        score += 3
-                # 可修改数值字段优先
-                if info.get('unit'):
-                    score += 1
-                return score
-
-            fields_with_semantics.sort(key=lambda x: (-_field_score(x), str(x.get('field_name', ''))))
             
             enhanced_context['matched_objects'].append({
                 'object_type': obj_type,
@@ -488,7 +426,6 @@ class EnergyPlusKnowledgeBase:
         max_modifications: int,
         enable_novelty_constraints: bool,
         base_novelty_directive: str,
-        hvac_context: str = "",
     ) -> str:
         """构建LLM用户提示词。"""
         return build_user_prompt(
@@ -502,7 +439,6 @@ class EnergyPlusKnowledgeBase:
             base_novelty_directive=base_novelty_directive,
             is_numeric_value=is_numeric_value,
             is_special_value=is_special_value,
-            hvac_context=hvac_context,
         )
 
     def extract_plan_field_keys(self, plan: Dict) -> Set[str]:

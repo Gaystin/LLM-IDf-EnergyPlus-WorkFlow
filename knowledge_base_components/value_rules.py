@@ -54,9 +54,6 @@ def build_balanced_expression_for_field(object_type: str, field_name: str) -> st
     """为指定字段构造保守平衡的表达式（用于多样性补充）。"""
     field_upper = str(field_name).upper()
 
-    if "MULTIPLIER" in field_upper:
-        return "existing_value"
-
     increase_patterns = ["EFFECTIVENESS", "EFFICIENCY", "COP", "EER", "HEATRECOVERY"]
     for pattern in increase_patterns:
         if pattern in field_upper:

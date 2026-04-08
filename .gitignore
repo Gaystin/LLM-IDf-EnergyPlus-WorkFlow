@@ -1,21 +1,17 @@
 /api_key.txt
-/Energy+.idd
+/Energy+v24.2.idd
 /Energy+v8.9.idd
-/in.idf
-/weather.epw
-/weather_beijing_CSWD.epw
-/weather_beijing_IWEC.epw
+/in_v24.2.idf
+/in_v8.9_plus.idf
 /__pycache__
 /.web_runtime
 /weather
 /各城市迭代结果
 /频率分析可视化输出
 /画图
-/50%节能目标
 /knowledge_base_components/__pycache__
 /knowledge_base_components/__init__.py
 /api key
 /debug
-/in_v8.9_plus.idf
 /Task
 /最佳节能幅度.xlsx
