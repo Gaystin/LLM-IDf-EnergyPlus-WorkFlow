@@ -1,8 +1,6 @@
 /api_key.txt
 /Energy+.idd
 /Energy+v8.9.idd
-/energyplus 遍历.py
-/energyplus.exe
 /in.idf
 /weather.epw
 /weather_beijing_CSWD.epw
@@ -18,6 +16,6 @@
 /knowledge_base_components/__init__.py
 /api key
 /debug
-/in_v8.9.idf
 /in_v8.9_plus.idf
-/in_v8.9.dsb
+/Task
+/最佳节能幅度.xlsx

@@ -115,16 +115,21 @@ class EnergyPlusOptimizer:
         self.workflows_lock = Lock()  # 保护共享资源的锁
         self.logger.info(f"初始化{num_workflows}条并行工作流")
 
-        # 早停配置：以“尽快达到目标节能率”为主
+        # 早停配置：恢复为“收敛优先”，目标节能率可选
         self.early_stop_enabled = True
+        self.early_stop_target_enabled = False              # 关闭固定目标节能率（如50%）硬约束
         self.early_stop_target_total_saving_pct = 50.0      # 达到目标节能率可提前停止
         self.early_stop_min_iterations = 2                  # 至少完成基准+1轮后再判定
-        self.early_stop_convergence_enabled = False         # 仅以达到目标节能率作为早停触发条件
+        self.early_stop_convergence_enabled = True          # 启用收敛早停
         self.early_stop_convergence_patience = 2            # 连续N次增益极小判定收敛
         self.early_stop_min_delta_pct = 2                   # 节能率变化阈值（百分点）
         self.max_iterations_cap = 40                        # 自动模式下的最大安全上限
         self.iteration_efficiency_agent = LLMIterationEfficiencyAgent(
-            target_saving_pct=self.early_stop_target_total_saving_pct
+            target_saving_pct=(
+                self.early_stop_target_total_saving_pct
+                if bool(getattr(self, 'early_stop_target_enabled', True))
+                else None
+            )
         )
         self.climate_adaptation_agent = ClimateAdaptationAgent()
         
@@ -783,10 +788,17 @@ class EnergyPlusOptimizer:
             f"- 冷却能耗 {metrics['total_cooling_kwh']} kWh/m²\n"
             f"- 供暖能耗 {metrics['total_heating_kwh']} kWh/m²\n"
             f"\n【核心优化目标】必须同时降低总能耗、供暖能耗、制冷能耗三者，不允许其中任何一项上升。"
-            f"\n【本阶段达标目标】在修改幅度保持工程合理的前提下，优先用尽量少的迭代轮次，尽快达到总能耗节能率≥{self.early_stop_target_total_saving_pct:.1f}%。"
             f"\n【迭代效率要求】每轮优先选择预期节能贡献更高的对象/字段组合，减少低收益尝试。"
             f"\n【收敛行为要求】避免在目标阈值附近来回震荡；若上一轮出现反优化，本轮必须明确纠偏并提升总节能率。"
         )
+
+        if bool(getattr(self, 'early_stop_target_enabled', True)):
+            request += (
+                f"\n【本阶段达标目标】在修改幅度保持工程合理的前提下，优先用尽量少的迭代轮次，"
+                f"尽快达到总能耗节能率≥{self.early_stop_target_total_saving_pct:.1f}%。"
+            )
+        else:
+            request += "\n【本阶段优化目标】取消固定节能率硬目标，优先稳定降低总能耗并尽快收敛。"
 
         # 反馈上一轮效果，避免重复沿错误方向调整
         if len(self.iteration_history) >= 2:
@@ -859,9 +871,9 @@ class EnergyPlusOptimizer:
         
         request += f"\n{optimization_directions}"
 
-        # 达标冲刺意识：接近50%时减少低收益探索，优先跨越目标阈值
+        # 达标冲刺意识：接近目标阈值时减少低收益探索，优先跨越阈值
         try:
-            if self.iteration_history:
+            if bool(getattr(self, 'early_stop_target_enabled', True)) and self.iteration_history:
                 baseline_metrics = self.iteration_history[0].get('metrics', {})
                 baseline_total = float(baseline_metrics.get('total_site_energy_kwh', 0.0) or 0.0)
                 current_total = float(metrics.get('total_site_energy_kwh', 0.0) or 0.0)
@@ -2387,6 +2399,61 @@ class EnergyPlusOptimizer:
 
         # DesignSpecification:OutdoorAir 等新风对象的流量参数必须非负
         # 典型错误示例：Outdoor_Air_Flow_per_Person < 0 会触发 EnergyPlus Severe 并终止模拟。
+        # Material 关键热工参数约束：防止负值/极端值触发输入报错或 CTF 计算不收敛。
+        material_keys = set()
+        for upd in target_updates:
+            obj_type_u = str(upd.get('type', '')).upper()
+            if 'MATERIAL' in obj_type_u:
+                material_keys.add((obj_type_u, str(upd.get('name', '')).upper()))
+
+        material_limits = {
+            'THICKNESS': (0.003, 1.0),
+            'CONDUCTIVITY': (0.005, 5.0),
+            'DENSITY': (1.0, 5000.0),
+            'SPECIFIC_HEAT': (100.0, 5000.0),
+            'THERMAL_RESISTANCE': (0.001, 20.0),
+        }
+
+        for obj_type_u, obj_name_u in material_keys:
+            for field_name, (lo, hi) in material_limits.items():
+                val, _ = _get_value(obj_type_u, obj_name_u, field_name)
+                num = _to_float(val)
+                if num is None:
+                    continue
+                clamped = _clamp(num, lo, hi)
+                if clamped != num:
+                    _set_value(
+                        obj_type_u,
+                        obj_name_u,
+                        field_name,
+                        clamped,
+                        f'{field_name}_clamp_[{lo},{hi}]'
+                    )
+
+            # 对普通 MATERIAL（有 k/rho/cp）增加热扩散率约束，降低 CTF 不收敛风险。
+            if obj_type_u == 'MATERIAL':
+                k_val, _ = _get_value(obj_type_u, obj_name_u, 'CONDUCTIVITY')
+                rho_val, _ = _get_value(obj_type_u, obj_name_u, 'DENSITY')
+                cp_val, _ = _get_value(obj_type_u, obj_name_u, 'SPECIFIC_HEAT')
+                k_num = _to_float(k_val)
+                rho_num = _to_float(rho_val)
+                cp_num = _to_float(cp_val)
+
+                if k_num is not None and rho_num is not None and cp_num is not None and rho_num > 0 and cp_num > 0:
+                    alpha = k_num / (rho_num * cp_num)
+                    alpha_lo = 1e-8
+                    alpha_hi = 1e-4
+                    if alpha < alpha_lo or alpha > alpha_hi:
+                        target_alpha = _clamp(alpha, alpha_lo, alpha_hi)
+                        adjusted_k = _clamp(target_alpha * rho_num * cp_num, 0.005, 5.0)
+                        _set_value(
+                            obj_type_u,
+                            obj_name_u,
+                            'CONDUCTIVITY',
+                            round(adjusted_k, 6),
+                            'Thermal_diffusivity_stabilization_for_CTF'
+                        )
+
         for upd in list(target_updates):
             obj_type_u = str(upd.get('type', '')).upper()
             field_name_u = str(upd.get('field', '')).upper()
@@ -2660,6 +2727,26 @@ class EnergyPlusOptimizer:
             if 'INFILTRATION' in obj_u and ('FLOW' in fld_u or 'AIRCHANGES' in fld_u):
                 return True
             return False
+
+        def _get_strict_positive_floor(obj_type, field_name):
+            """返回必须为正值字段的下限；非必须字段返回None。"""
+            obj_u = str(obj_type or '').upper()
+            fld_u = str(field_name or '').upper()
+
+            if 'MATERIAL' not in obj_u:
+                return None
+
+            if 'THICKNESS' in fld_u:
+                return 0.003
+            if 'CONDUCTIVITY' in fld_u:
+                return 0.005
+            if 'DENSITY' in fld_u:
+                return 1.0
+            if 'SPECIFIC_HEAT' in fld_u:
+                return 100.0
+            if 'THERMAL_RESISTANCE' in fld_u:
+                return 0.001
+            return None
         
         for mod in plan["modifications"]:
             obj_type_input = mod.get("object_type")
@@ -2794,6 +2881,25 @@ class EnergyPlusOptimizer:
                                 skipped_noop_count += 1
                                 field_key = f"{target_obj_type}.{target_attr}".upper()
                                 zero_base_noop_field_counter[field_key] = zero_base_noop_field_counter.get(field_key, 0) + 1
+                                continue
+
+                    # 材料关键热工字段（k, thickness, rho, cp, R）必须严格 > 0。
+                    # 在计划阶段即提前拦截，可避免非法值进入后续IDF写入与模拟。
+                    strict_positive_floor = _get_strict_positive_floor(target_obj_type, target_attr)
+                    if strict_positive_floor is not None:
+                        try:
+                            final_num = float(final_value)
+                        except (ValueError, TypeError):
+                            final_num = None
+
+                        if final_num is not None and final_num <= 0.0:
+                            self.logger.warning(
+                                f"  [正值约束前置拦截] {target_obj_type} ({obj_name}): {target_attr} 计划值 {final_num} <= 0，"
+                                f"已提前钳制为 {strict_positive_floor}，避免生成非法材料热工参数"
+                            )
+                            final_value = strict_positive_floor
+                            if _values_equivalent(old_value, final_value):
+                                skipped_noop_count += 1
                                 continue
                     
                     # 计算修改系数
@@ -3207,8 +3313,9 @@ class EnergyPlusOptimizer:
             return False, ""
 
         latest_saving_pct = (baseline_total - latest_total) / baseline_total * 100.0
-        if latest_saving_pct >= float(self.early_stop_target_total_saving_pct):
-            return True, f"已达到目标节能率 {latest_saving_pct:.2f}% (阈值 {self.early_stop_target_total_saving_pct:.2f}%)"
+        if bool(getattr(self, 'early_stop_target_enabled', True)):
+            if latest_saving_pct >= float(self.early_stop_target_total_saving_pct):
+                return True, f"已达到目标节能率 {latest_saving_pct:.2f}% (阈值 {self.early_stop_target_total_saving_pct:.2f}%)"
 
         saving_series = []
         for item in iteration_history[1:]:
@@ -3246,16 +3353,26 @@ class EnergyPlusOptimizer:
         self.logger.info(f"\n{'█'*80}")
         self.logger.info(f"启动{max_iterations}轮迭代优化 (并行{self.num_workflows}条工作流)")
         self.logger.info("执行模型说明：工作流在线程池并行推进；日志会按完成先后交错显示，不代表串行执行")
-        if bool(getattr(self, 'early_stop_convergence_enabled', True)):
+        target_enabled = bool(getattr(self, 'early_stop_target_enabled', True))
+        convergence_enabled = bool(getattr(self, 'early_stop_convergence_enabled', True))
+
+        if convergence_enabled and target_enabled:
             self.logger.info(
                 f"早停策略：目标节能率≥{self.early_stop_target_total_saving_pct:.2f}% 或最近"
                 f"{self.early_stop_convergence_patience}轮节能率变化≤{self.early_stop_min_delta_pct:.2f}个百分点"
             )
-        else:
+        elif convergence_enabled:
+            self.logger.info(
+                f"早停策略：收敛优先。最近{self.early_stop_convergence_patience}轮"
+                f"节能率变化≤{self.early_stop_min_delta_pct:.2f}个百分点时停止"
+            )
+        elif target_enabled:
             self.logger.info(
                 f"早停策略：仅当目标节能率达到≥{self.early_stop_target_total_saving_pct:.2f}%时停止，"
                 f"用于评估达到目标所需最小迭代轮次"
             )
+        else:
+            self.logger.info("早停策略：已禁用（将运行到最大迭代轮次）")
         self.logger.info(f"{'█'*80}\n")
         
         parallel_start = perf_counter()
