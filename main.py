@@ -500,7 +500,9 @@ class EnergyPlusOptimizer:
                 'total_site_energy_kwh': 0,
                 'eui_kwh_per_m2': 0,
                 'total_cooling_kwh': 0,
-                'total_heating_kwh': 0
+                'total_heating_kwh': 0,
+                'total_cooling_kwh_per_m2': 0,
+                'total_heating_kwh_per_m2': 0
             }
             
             try:
@@ -602,10 +604,10 @@ class EnergyPlusOptimizer:
                         if building_area_m2 and building_area_m2 > 0:
                             old_cooling = metrics.get('total_cooling_kwh', 0)
                             old_heating = metrics.get('total_heating_kwh', 0)
-                            metrics['total_cooling_kwh'] = round(old_cooling / building_area_m2, 4)
-                            metrics['total_heating_kwh'] = round(old_heating / building_area_m2, 4)
-                            self.logger.debug(f"冷却能耗: {old_cooling} kWh -> {metrics['total_cooling_kwh']} kWh/m²")
-                            self.logger.debug(f"供暖能耗: {old_heating} kWh -> {metrics['total_heating_kwh']} kWh/m²")
+                            metrics['total_cooling_kwh_per_m2'] = round(old_cooling / building_area_m2, 4)
+                            metrics['total_heating_kwh_per_m2'] = round(old_heating / building_area_m2, 4)
+                            self.logger.debug(f"冷却能耗: {old_cooling} kWh -> {metrics['total_cooling_kwh_per_m2']} kWh/m²")
+                            self.logger.debug(f"供暖能耗: {old_heating} kWh -> {metrics['total_heating_kwh_per_m2']} kWh/m²")
                 except Exception as e:
                     self.logger.warning(f"计算建筑面积或转换冷/暖能耗为kWh/m²时出错: {e}")
 
@@ -614,9 +616,9 @@ class EnergyPlusOptimizer:
                     try:
                         old_cooling = metrics.get('total_cooling_kwh', 0)
                         old_heating = metrics.get('total_heating_kwh', 0)
-                        metrics['total_cooling_kwh'] = round(old_cooling / self.building_area_m2, 4)
-                        metrics['total_heating_kwh'] = round(old_heating / self.building_area_m2, 4)
-                        self.logger.debug(f"回退使用已知建筑面积 {self.building_area_m2:.2f} m² 进行冷/暖能耗转换: {old_cooling}->{metrics['total_cooling_kwh']} kWh/m²")
+                        metrics['total_cooling_kwh_per_m2'] = round(old_cooling / self.building_area_m2, 4)
+                        metrics['total_heating_kwh_per_m2'] = round(old_heating / self.building_area_m2, 4)
+                        self.logger.debug(f"回退使用已知建筑面积 {self.building_area_m2:.2f} m² 进行冷/暖能耗转换: {old_cooling}->{metrics['total_cooling_kwh_per_m2']} kWh/m²")
                         building_area_m2 = self.building_area_m2
                     except Exception as e:
                         self.logger.warning(f"使用历史建筑面积转换冷/暖能耗时出错: {e}")
@@ -630,8 +632,8 @@ class EnergyPlusOptimizer:
                     self.logger.info(f"  单位面积总建筑能耗: {metrics['eui_kwh_per_m2']} kWh/m²")
                     # 基于是否成功计算到建筑面积来标注单位
                     if building_area_m2:
-                        self.logger.info(f"  冷却能耗: {metrics['total_cooling_kwh']} kWh/m²")
-                        self.logger.info(f"  供暖能耗: {metrics['total_heating_kwh']} kWh/m²")
+                        self.logger.info(f"  冷却能耗: {metrics['total_cooling_kwh_per_m2']} kWh/m²")
+                        self.logger.info(f"  供暖能耗: {metrics['total_heating_kwh_per_m2']} kWh/m²")
                     else:
                         self.logger.info(f"  冷却能耗: {metrics['total_cooling_kwh']} kWh (未转换为 kWh/m²)")
                         self.logger.info(f"  供暖能耗: {metrics['total_heating_kwh']} kWh (未转换为 kWh/m²)")
@@ -783,8 +785,8 @@ class EnergyPlusOptimizer:
             f"{status_note}。当前能耗指标：\n"
             f"- 总建筑能耗 {metrics['total_site_energy_kwh']} kWh\n"
             f"- 单位面积总建筑能耗 {metrics['eui_kwh_per_m2']} kWh/m²\n"
-            f"- 冷却能耗 {metrics['total_cooling_kwh']} kWh/m²\n"
-            f"- 供暖能耗 {metrics['total_heating_kwh']} kWh/m²\n"
+            f"- 冷却能耗 {metrics['total_cooling_kwh_per_m2']} kWh/m²\n"
+            f"- 供暖能耗 {metrics['total_heating_kwh_per_m2']} kWh/m²\n"
             f"\n【核心优化目标】必须同时降低总能耗、供暖能耗、制冷能耗三者，不允许其中任何一项上升。"
             f"\n【迭代效率要求】每轮优先选择预期节能贡献更高的对象/字段组合，减少低收益尝试。"
             f"\n【收敛行为要求】避免在目标阈值附近来回震荡；若上一轮出现反优化，本轮必须明确纠偏并提升总节能率。"
@@ -802,8 +804,8 @@ class EnergyPlusOptimizer:
         if len(self.iteration_history) >= 2:
             prev_metrics = self.iteration_history[-2]['metrics']
             delta_total = metrics['total_site_energy_kwh'] - prev_metrics['total_site_energy_kwh']
-            delta_cooling = metrics['total_cooling_kwh'] - prev_metrics['total_cooling_kwh']
-            delta_heating = metrics['total_heating_kwh'] - prev_metrics['total_heating_kwh']
+            delta_cooling = metrics['total_cooling_kwh_per_m2'] - prev_metrics['total_cooling_kwh_per_m2']
+            delta_heating = metrics['total_heating_kwh_per_m2'] - prev_metrics['total_heating_kwh_per_m2']
 
             request += (
                 f"\n【上一轮效果反馈】\n"
@@ -857,8 +859,8 @@ class EnergyPlusOptimizer:
         # 传递供暖和制冷的变化信息，让优化方向对目标更有针对性
         if len(self.iteration_history) >= 2:
             prev_metrics = self.iteration_history[-2]['metrics']
-            delta_cooling_for_directions = metrics['total_cooling_kwh'] - prev_metrics['total_cooling_kwh']
-            delta_heating_for_directions = metrics['total_heating_kwh'] - prev_metrics['total_heating_kwh']
+            delta_cooling_for_directions = metrics['total_cooling_kwh_per_m2'] - prev_metrics['total_cooling_kwh_per_m2']
+            delta_heating_for_directions = metrics['total_heating_kwh_per_m2'] - prev_metrics['total_heating_kwh_per_m2']
             optimization_directions = self._get_dynamic_optimization_directions(
                 iteration, 
                 delta_cooling=delta_cooling_for_directions, 
@@ -2929,8 +2931,8 @@ class EnergyPlusOptimizer:
 
         total_saved_vs_baseline = baseline_metrics['total_site_energy_kwh'] - metrics['total_site_energy_kwh']
         eui_saved_vs_baseline = baseline_metrics['eui_kwh_per_m2'] - metrics['eui_kwh_per_m2']
-        cooling_saved_vs_baseline = baseline_metrics['total_cooling_kwh'] - metrics['total_cooling_kwh']
-        heating_saved_vs_baseline = baseline_metrics['total_heating_kwh'] - metrics['total_heating_kwh']
+        cooling_saved_vs_baseline = baseline_metrics['total_cooling_kwh_per_m2'] - metrics['total_cooling_kwh_per_m2']
+        heating_saved_vs_baseline = baseline_metrics['total_heating_kwh_per_m2'] - metrics['total_heating_kwh_per_m2']
 
         self.logger.info("\n【本轮节能明细（相对初始基准）】")
         self.logger.info(
@@ -2943,11 +2945,11 @@ class EnergyPlusOptimizer:
         )
         self.logger.info(
             f"- 制冷能耗: {cooling_saved_vs_baseline:+.2f} kWh/m² "
-            f"({_safe_pct(cooling_saved_vs_baseline, baseline_metrics['total_cooling_kwh']):+.2f}%)"
+            f"({_safe_pct(cooling_saved_vs_baseline, baseline_metrics['total_cooling_kwh_per_m2']):+.2f}%)"
         )
         self.logger.info(
             f"- 供暖能耗: {heating_saved_vs_baseline:+.2f} kWh/m² "
-            f"({_safe_pct(heating_saved_vs_baseline, baseline_metrics['total_heating_kwh']):+.2f}%)"
+            f"({_safe_pct(heating_saved_vs_baseline, baseline_metrics['total_heating_kwh_per_m2']):+.2f}%)"
         )
 
         if iteration > 0 and len(self.iteration_history) >= 2:
@@ -2955,8 +2957,8 @@ class EnergyPlusOptimizer:
 
             total_saved_vs_prev = prev_metrics['total_site_energy_kwh'] - metrics['total_site_energy_kwh']
             eui_saved_vs_prev = prev_metrics['eui_kwh_per_m2'] - metrics['eui_kwh_per_m2']
-            cooling_saved_vs_prev = prev_metrics['total_cooling_kwh'] - metrics['total_cooling_kwh']
-            heating_saved_vs_prev = prev_metrics['total_heating_kwh'] - metrics['total_heating_kwh']
+            cooling_saved_vs_prev = prev_metrics['total_cooling_kwh_per_m2'] - metrics['total_cooling_kwh_per_m2']
+            heating_saved_vs_prev = prev_metrics['total_heating_kwh_per_m2'] - metrics['total_heating_kwh_per_m2']
 
             self.logger.info("【本轮节能明细（相对上一轮）】")
             self.logger.info(
@@ -2969,11 +2971,11 @@ class EnergyPlusOptimizer:
             )
             self.logger.info(
                 f"- 制冷能耗: {cooling_saved_vs_prev:+.2f} kWh/m² "
-                f"({_safe_pct(cooling_saved_vs_prev, prev_metrics['total_cooling_kwh']):+.2f}%)"
+                f"({_safe_pct(cooling_saved_vs_prev, prev_metrics['total_cooling_kwh_per_m2']):+.2f}%)"
             )
             self.logger.info(
                 f"- 供暖能耗: {heating_saved_vs_prev:+.2f} kWh/m² "
-                f"({_safe_pct(heating_saved_vs_prev, prev_metrics['total_heating_kwh']):+.2f}%)"
+                f"({_safe_pct(heating_saved_vs_prev, prev_metrics['total_heating_kwh_per_m2']):+.2f}%)"
             )
     
     def _should_early_stop_workflow(self, workflow_id):
@@ -3301,8 +3303,8 @@ class EnergyPlusOptimizer:
                         self.logger.info(f"  最优轮次: 第{workflow_data.get('best_iteration', 0)}轮")
                         self.logger.info(f"  总建筑能耗: {best_metrics.get('total_site_energy_kwh')} kWh")
                         self.logger.info(f"  单位面积能耗: {best_metrics.get('eui_kwh_per_m2')} kWh/m²")
-                        self.logger.info(f"  制冷能耗: {best_metrics.get('total_cooling_kwh')} kWh/m²")
-                        self.logger.info(f"  供暖能耗: {best_metrics.get('total_heating_kwh')} kWh/m²")
+                        self.logger.info(f"  制冷能耗: {best_metrics.get('total_cooling_kwh_per_m2')} kWh/m²")
+                        self.logger.info(f"  供暖能耗: {best_metrics.get('total_heating_kwh_per_m2')} kWh/m²")
 
                         if iteration_history and len(iteration_history) > 0:
                             baseline_metrics = iteration_history[0].get('metrics', {})
@@ -3342,13 +3344,13 @@ class EnergyPlusOptimizer:
 
                                 total_val = m.get('total_site_energy_kwh', 0)
                                 eui_val = m.get('eui_kwh_per_m2', 0)
-                                cool_val = m.get('total_cooling_kwh', 0)
-                                heat_val = m.get('total_heating_kwh', 0)
+                                cool_val = m.get('total_cooling_kwh_per_m2', 0)
+                                heat_val = m.get('total_heating_kwh_per_m2', 0)
 
                                 total_pct = _pct_str(total_val, baseline_metrics.get('total_site_energy_kwh', 0))
                                 eui_pct = _pct_str(eui_val, baseline_metrics.get('eui_kwh_per_m2', 0))
-                                cool_pct = _pct_str(cool_val, baseline_metrics.get('total_cooling_kwh', 0))
-                                heat_pct = _pct_str(heat_val, baseline_metrics.get('total_heating_kwh', 0))
+                                cool_pct = _pct_str(cool_val, baseline_metrics.get('total_cooling_kwh_per_m2', 0))
+                                heat_pct = _pct_str(heat_val, baseline_metrics.get('total_heating_kwh_per_m2', 0))
 
                                 total_str = f"{total_val:<12.2f} {total_pct:<8}"
                                 eui_str = f"{eui_val:<12.2f} {eui_pct:<8}"
@@ -3384,10 +3386,10 @@ class EnergyPlusOptimizer:
                             total_energy_pct = (total_energy_saved / baseline_metrics.get('total_site_energy_kwh', 1) * 100) if baseline_metrics.get('total_site_energy_kwh', 0) > 0 else 0
                             eui_saved = baseline_metrics.get('eui_kwh_per_m2', 0) - best_metrics.get('eui_kwh_per_m2', 0)
                             eui_pct = (eui_saved / baseline_metrics.get('eui_kwh_per_m2', 1) * 100) if baseline_metrics.get('eui_kwh_per_m2', 0) > 0 else 0
-                            cooling_saved = baseline_metrics.get('total_cooling_kwh', 0) - best_metrics.get('total_cooling_kwh', 0)
-                            cooling_pct = (cooling_saved / baseline_metrics.get('total_cooling_kwh', 1) * 100) if baseline_metrics.get('total_cooling_kwh', 0) > 0 else 0
-                            heating_saved = baseline_metrics.get('total_heating_kwh', 0) - best_metrics.get('total_heating_kwh', 0)
-                            heating_pct = (heating_saved / baseline_metrics.get('total_heating_kwh', 1) * 100) if baseline_metrics.get('total_heating_kwh', 0) > 0 else 0
+                            cooling_saved = baseline_metrics.get('total_cooling_kwh_per_m2', 0) - best_metrics.get('total_cooling_kwh_per_m2', 0)
+                            cooling_pct = (cooling_saved / baseline_metrics.get('total_cooling_kwh_per_m2', 1) * 100) if baseline_metrics.get('total_cooling_kwh_per_m2', 0) > 0 else 0
+                            heating_saved = baseline_metrics.get('total_heating_kwh_per_m2', 0) - best_metrics.get('total_heating_kwh_per_m2', 0)
+                            heating_pct = (heating_saved / baseline_metrics.get('total_heating_kwh_per_m2', 1) * 100) if baseline_metrics.get('total_heating_kwh_per_m2', 0) > 0 else 0
 
                             summary_lines = [
                                 "  【优化效果】",
@@ -3516,8 +3518,8 @@ class EnergyPlusOptimizer:
                     if bm:
                         total = bm.get('total_site_energy_kwh', None)
                         eui = bm.get('eui_kwh_per_m2', None)
-                        cooling = bm.get('total_cooling_kwh', None)
-                        heating = bm.get('total_heating_kwh', None)
+                        cooling = bm.get('total_cooling_kwh_per_m2', None)
+                        heating = bm.get('total_heating_kwh_per_m2', None)
 
                         def _pct(curr, base):
                             try:
@@ -3529,8 +3531,8 @@ class EnergyPlusOptimizer:
 
                         total_pct = _pct(total, (baseline.get('total_site_energy_kwh') if baseline else None))
                         eui_pct = _pct(eui, (baseline.get('eui_kwh_per_m2') if baseline else None))
-                        cooling_pct = _pct(cooling, (baseline.get('total_cooling_kwh') if baseline else None))
-                        heating_pct = _pct(heating, (baseline.get('total_heating_kwh') if baseline else None))
+                        cooling_pct = _pct(cooling, (baseline.get('total_cooling_kwh_per_m2') if baseline else None))
+                        heating_pct = _pct(heating, (baseline.get('total_heating_kwh_per_m2') if baseline else None))
 
                         summary_rows.append({
                             'workflow': workflow_id,
@@ -3596,8 +3598,8 @@ class EnergyPlusOptimizer:
                 self.logger.info(f"{'─'*80}")
                 self.logger.info(f"总建筑能耗: {global_best['total_site_energy_kwh']} kWh")
                 self.logger.info(f"单位面积能耗: {global_best['eui_kwh_per_m2']} kWh/m²")
-                self.logger.info(f"制冷能耗: {global_best['total_cooling_kwh']} kWh/m²")
-                self.logger.info(f"供暖能耗: {global_best['total_heating_kwh']} kWh/m²")
+                self.logger.info(f"制冷能耗: {global_best['total_cooling_kwh_per_m2']} kWh/m²")
+                self.logger.info(f"供暖能耗: {global_best['total_heating_kwh_per_m2']} kWh/m²")
                 
                 # 计算全局最优的4个指标与基准的变化 - 检查 iteration_history 是否为空
                 if all_workflows[global_best_workflow]['iteration_history'] and len(all_workflows[global_best_workflow]['iteration_history']) > 0:
@@ -3610,11 +3612,11 @@ class EnergyPlusOptimizer:
                     eui_saved = baseline_metrics['eui_kwh_per_m2'] - global_best['eui_kwh_per_m2']
                     eui_pct = (eui_saved / baseline_metrics['eui_kwh_per_m2'] * 100) if baseline_metrics['eui_kwh_per_m2'] > 0 else 0
                     
-                    cooling_saved = baseline_metrics['total_cooling_kwh'] - global_best['total_cooling_kwh']
-                    cooling_pct = (cooling_saved / baseline_metrics['total_cooling_kwh'] * 100) if baseline_metrics['total_cooling_kwh'] > 0 else 0
+                    cooling_saved = baseline_metrics['total_cooling_kwh_per_m2'] - global_best['total_cooling_kwh_per_m2']
+                    cooling_pct = (cooling_saved / baseline_metrics['total_cooling_kwh_per_m2'] * 100) if baseline_metrics['total_cooling_kwh_per_m2'] > 0 else 0
                     
-                    heating_saved = baseline_metrics['total_heating_kwh'] - global_best['total_heating_kwh']
-                    heating_pct = (heating_saved / baseline_metrics['total_heating_kwh'] * 100) if baseline_metrics['total_heating_kwh'] > 0 else 0
+                    heating_saved = baseline_metrics['total_heating_kwh_per_m2'] - global_best['total_heating_kwh_per_m2']
+                    heating_pct = (heating_saved / baseline_metrics['total_heating_kwh_per_m2'] * 100) if baseline_metrics['total_heating_kwh_per_m2'] > 0 else 0
                     
                     # 输出4个指标的节能百分比
                     self.logger.info(f"【较基准节能汇总】")
@@ -3746,8 +3748,8 @@ class EnergyPlusOptimizer:
                     continue
 
                 x = [item.get('iteration', idx + 1) for idx, item in enumerate(history)]
-                cooling = [item['metrics']['total_cooling_kwh'] for item in history]
-                heating = [item['metrics']['total_heating_kwh'] for item in history]
+                cooling = [item['metrics']['total_cooling_kwh_per_m2'] for item in history]
+                heating = [item['metrics']['total_heating_kwh_per_m2'] for item in history]
                 total_site = [item['metrics']['total_site_energy_kwh'] for item in history]
 
                 fig, ax = plt.subplots(figsize=(10, 6))
@@ -4574,8 +4576,8 @@ def _collect_run_export_rows(city, run_tag, optimizer, run_status="success", err
                 'iteration': iteration,
                 'total_site_energy_kwh': float(metrics.get('total_site_energy_kwh', 0.0) or 0.0),
                 'eui_kwh_per_m2': float(metrics.get('eui_kwh_per_m2', 0.0) or 0.0),
-                'total_cooling_kwh': float(metrics.get('total_cooling_kwh', 0.0) or 0.0),
-                'total_heating_kwh': float(metrics.get('total_heating_kwh', 0.0) or 0.0),
+                'total_cooling_kwh_per_m2': float(metrics.get('total_cooling_kwh_per_m2', 0.0) or 0.0),
+                'total_heating_kwh_per_m2': float(metrics.get('total_heating_kwh_per_m2', 0.0) or 0.0),
                 'saving_pct_total_site_vs_baseline': round(saving_pct_total, 4),
                 'iteration_llm_duration_sec': round(iter_llm_sec, 4),
                 'iteration_sim_duration_sec': round(iter_sim_sec, 4),
@@ -4718,15 +4720,18 @@ def _write_rows_to_sheet(workbook, sheet_name, rows, headers):
 def _build_run_round_metric_rows(detail_rows):
     """从round_details提取按run/轮次的四指标数据（含第0轮基准）。"""
     rows = []
+    carbon_factor = 0.5306
     for row in detail_rows or []:
+        eui_value = float(row.get('eui_kwh_per_m2', 0.0) or 0.0)
         rows.append({
             'run_tag': row.get('run_tag', ''),
             'workflow_id': row.get('workflow_id', ''),
             'iteration': row.get('iteration', ''),
             'total_site_energy_kwh': row.get('total_site_energy_kwh', ''),
-            'eui_kwh_per_m2': row.get('eui_kwh_per_m2', ''),
-            'total_cooling_kwh': row.get('total_cooling_kwh', ''),
-            'total_heating_kwh': row.get('total_heating_kwh', ''),
+            'eui_kwh_per_m2': eui_value,
+            'eui_kgco2_per_m2': round(eui_value * carbon_factor, 4),
+            'total_cooling_kwh_per_m2': row.get('total_cooling_kwh_per_m2', ''),
+            'total_heating_kwh_per_m2': row.get('total_heating_kwh_per_m2', ''),
             'run_status': row.get('run_status', ''),
             'error_message': row.get('error_message', ''),
         })
@@ -4756,8 +4761,8 @@ def _export_all_cities_run_round_metrics_xlsx(root_output_dir, city_metric_rows_
 
     headers = [
         'run_tag', 'workflow_id', 'iteration',
-        'total_site_energy_kwh', 'eui_kwh_per_m2',
-        'total_cooling_kwh', 'total_heating_kwh',
+        'total_site_energy_kwh', 'eui_kwh_per_m2', 'eui_kgco2_per_m2',
+        'total_cooling_kwh_per_m2', 'total_heating_kwh_per_m2',
         'run_status', 'error_message'
     ]
 
@@ -4810,7 +4815,7 @@ def _export_city_xlsx(city_root, city, city_rows):
     ]
     detail_headers = [
         'city', 'run_tag', 'workflow_id', 'run_status', 'error_message', 'iteration',
-        'total_site_energy_kwh', 'eui_kwh_per_m2', 'total_cooling_kwh', 'total_heating_kwh',
+        'total_site_energy_kwh', 'eui_kwh_per_m2', 'total_cooling_kwh_per_m2', 'total_heating_kwh_per_m2',
         'saving_pct_total_site_vs_baseline',
         'iteration_llm_duration_sec', 'iteration_sim_duration_sec', 'iteration_total_duration_sec',
         'iteration_llm_call_count', 'iteration_input_tokens', 'iteration_output_tokens',
@@ -4831,8 +4836,8 @@ def _export_city_xlsx(city_root, city, city_rows):
     ]
     run_round_metric_headers = [
         'run_tag', 'workflow_id', 'iteration',
-        'total_site_energy_kwh', 'eui_kwh_per_m2',
-        'total_cooling_kwh', 'total_heating_kwh',
+        'total_site_energy_kwh', 'eui_kwh_per_m2', 'eui_kgco2_per_m2',
+        'total_cooling_kwh_per_m2', 'total_heating_kwh_per_m2',
         'run_status', 'error_message'
     ]
 
