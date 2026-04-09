@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-DEFAULT_EXCEL = "最佳节能幅度.xlsx"
+DEFAULT_EXCEL = "workflow.xlsx"
 DEFAULT_SHEET = "Sheet1"
 
 
@@ -83,10 +83,10 @@ def build_plot(
     ax_left.tick_params(axis="x", labelsize=13, colors="black")
     ax_left.tick_params(axis="y", labelsize=13, colors="black")
     ax_right.tick_params(axis="y", labelsize=13, colors="black")
-    ax_left.set_ylim(0.3, 0.8)
-    ax_left.set_yticks([0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
-    ax_right.set_ylim(1, 11)
-    ax_right.set_yticks([1, 3, 5, 7, 9, 11])
+    ax_left.set_ylim(0.7, 0.8)
+    ax_left.set_yticks([0.7, 0.72, 0.74, 0.76, 0.78, 0.8])
+    ax_right.set_ylim(5, 15)
+    ax_right.set_yticks([5, 7, 9, 11, 13, 15])
 
     ax_left.set_xticks(case_ids)
     ax_left.grid(axis="y", linestyle="--", linewidth=0.8, alpha=0.5)
@@ -96,7 +96,7 @@ def build_plot(
     legend = ax_left.legend(
         handles,
         labels,
-        loc="upper right",
+        loc="upper left",
         frameon=True,
         framealpha=0.95,
         edgecolor="black",
