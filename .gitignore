@@ -6,6 +6,8 @@
 /__pycache__
 /.web_runtime
 /weather
+/各城市迭代结果_50%节能率
+/各城市迭代结果_早停
 /各城市迭代结果
 /频率分析可视化输出
 /画图
@@ -15,3 +17,4 @@
 /debug
 /Task
 /figures
+/vis
