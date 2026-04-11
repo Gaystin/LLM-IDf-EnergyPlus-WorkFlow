@@ -10,7 +10,9 @@ import subprocess
 import logging
 import sys
 import shutil
+import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from datetime import datetime
@@ -410,6 +412,8 @@ class EnergyPlusOptimizer:
 
         resolved_workflow_id = workflow_id or getattr(self._log_context, 'workflow_id', None)
         sim_start = perf_counter()
+        run_dir = None
+        temp_run_dir = None
         try:
             # 运行目录按工作流隔离，避免并行时同名轮次目录冲突
             if workflow_id:
@@ -417,17 +421,22 @@ class EnergyPlusOptimizer:
             else:
                 run_dir = os.path.join(self.optimization_dir, iteration_name)
             os.makedirs(run_dir, exist_ok=True)
-            
-            # 复制IDF到运行目录
+
+            # 在唯一临时目录运行，避免ReadVarsESO与历史文件锁冲突
+            temp_parent = os.path.join(self.optimization_dir, "_temp_runs")
+            os.makedirs(temp_parent, exist_ok=True)
+            temp_run_dir = tempfile.mkdtemp(prefix=f"{workflow_id or 'wf0'}_{iteration_name}_", dir=temp_parent)
+
+            # 复制IDF到临时运行目录
             idf_name = os.path.splitext(os.path.basename(idf_path))[0]
-            sim_idf = os.path.join(run_dir, f"{idf_name}.idf")
-            shutil.copy(idf_path, sim_idf)
-            
+            sim_idf = os.path.join(temp_run_dir, f"{idf_name}.idf")
+            shutil.copy2(idf_path, sim_idf)
+
             # 运行EnergyPlus
             cmd = [
                 self.eplus_exe,
                 "-w", self.epw_path,
-                "-d", run_dir,
+                "-d", temp_run_dir,
                 "-r",
                 sim_idf
             ]
@@ -437,6 +446,28 @@ class EnergyPlusOptimizer:
             result = subprocess.run(cmd, capture_output=True, text=False, timeout=600)
             
             if result.returncode == 0:
+                # 回写产物到稳定目录，供后续提取与可视化读取
+                for name in os.listdir(temp_run_dir):
+                    src = os.path.join(temp_run_dir, name)
+                    dst = os.path.join(run_dir, name)
+                    if os.path.isdir(src):
+                        continue
+                    copied = False
+                    for attempt in range(8):
+                        try:
+                            if os.path.exists(dst):
+                                os.remove(dst)
+                            shutil.copy2(src, dst)
+                            copied = True
+                            break
+                        except PermissionError:
+                            # Windows偶发文件锁（防病毒/索引器）时做退避重试
+                            time.sleep(0.05 * (attempt + 1))
+                        except OSError:
+                            time.sleep(0.03 * (attempt + 1))
+                    if not copied:
+                        self.logger.warning(f"回写文件失败，已跳过: {name}")
+
                 self.logger.info(f"✓ 模拟完成: {iteration_name}")
                 return run_dir
             else:
@@ -449,7 +480,7 @@ class EnergyPlusOptimizer:
                     self.logger.error(f"错误: {stderr_text[:500]}")
 
                 # 追加读取 eplusout.err，提取 Severe/Fatal 关键行，便于快速定位失败原因
-                err_file = os.path.join(run_dir, "eplusout.err")
+                err_file = os.path.join(temp_run_dir or run_dir, "eplusout.err")
                 if os.path.exists(err_file):
                     try:
                         with open(err_file, 'r', encoding='utf-8', errors='replace') as ef:
@@ -470,6 +501,16 @@ class EnergyPlusOptimizer:
             self.logger.error(f"✗ 模拟异常: {str(e)}")
             return None
         finally:
+            # 清理临时目录，忽略锁定文件，避免影响后续运行
+            if temp_run_dir and os.path.exists(temp_run_dir):
+                for attempt in range(5):
+                    try:
+                        shutil.rmtree(temp_run_dir, ignore_errors=False)
+                        break
+                    except OSError:
+                        time.sleep(0.05 * (attempt + 1))
+                        continue
+
             sim_elapsed = perf_counter() - sim_start
             self._record_workflow_timing(
                 resolved_workflow_id,

@@ -14,6 +14,8 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
@@ -28,14 +30,19 @@ REASONING_HEADER_REGEX = re.compile(r"【LLM推理过程\s*-\s*(.*?)】")
 PERCENT_REGEX = re.compile(r"([+-]?\d+(?:\.\d+)?)%")
 LOG_LINE_START_REGEX = re.compile(r"(?<!\n)(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s-\s[A-Z]+\s-\s)")
 
-DEFAULT_IDD_PATH = "Energy+.idd"
+DEFAULT_IDD_PATH = "Energy+v24.2.idd"
 DEFAULT_EPW_PATH = os.path.join("weather", "Beijing.epw")
-DEFAULT_LOG_DIR = "optimization_logs_并行2_web"
+WEB_RUNS_DIR = os.path.join(CURRENT_DIR, "web")
+DEFAULT_LOG_DIR = os.path.join("web", "<timestamp>", "optimization_logs_web")
 DEFAULT_MAX_ITERATIONS = 5
-DEFAULT_EARLY_STOP_TARGET_SAVING_PCT = 60.0
+DEFAULT_EARLY_STOP_TARGET_SAVING_PCT = 50.0
 DEFAULT_NUM_WORKFLOWS = 2
-AUTO_REFRESH_SECONDS = 1.0
-UI_ACTION_COOLDOWN_SECONDS = 3.0
+DEFAULT_OPTIMIZATION_MODE = "target"
+MODE_TARGET = "target"
+MODE_CONVERGENCE = "convergence"
+DEFAULT_CONVERGENCE_MAX_ITERATIONS = 40
+AUTO_REFRESH_SECONDS = 0.5
+UI_ACTION_COOLDOWN_SECONDS = 0.5
 WEATHER_DIR = os.path.join(CURRENT_DIR, "weather")
 CITY_ZH_MAP = {
     "beijing": "北京",
@@ -89,11 +96,11 @@ def _list_weather_city_options() -> list[dict[str, str]]:
 
 
 def _real_to_display_iteration(real_iteration: int) -> int:
-    return max(int(real_iteration or 0) - 1, 0)
+    return max(int(real_iteration or 0), 0)
 
 
 def _real_to_display_max_iterations(real_max_iterations: int) -> int:
-    return max(int(real_max_iterations or 0) - 1, 0)
+    return max(int(real_max_iterations or 0), 0)
 
 
 def _build_default_capture_state() -> dict[str, Any]:
@@ -183,10 +190,13 @@ def _build_empty_snapshot(config: dict[str, Any] | None = None, status: str = "i
             "api_key_path": config.get("api_key_path", "api_key.txt"),
             "epw_path": config.get("epw_path", DEFAULT_EPW_PATH),
             "log_dir": config.get("log_dir", DEFAULT_LOG_DIR),
+            "optimization_dir": config.get("optimization_dir"),
+            "plot_dir": config.get("plot_dir"),
             "max_iterations": max_iterations,
             "optimization_rounds": optimization_rounds,
             "max_iterations_cap": max_iterations_cap,
             "early_stop_target_total_saving_pct": early_stop_target_total_saving_pct,
+            "optimization_mode": str(config.get("optimization_mode", DEFAULT_OPTIMIZATION_MODE) or DEFAULT_OPTIMIZATION_MODE),
             "num_workflows": num_workflows,
         },
         "global_summary_log": None,
@@ -235,11 +245,27 @@ def _write_snapshot(snapshot_path: str, snapshot: dict[str, Any]) -> None:
         raise
 
 
-def _read_snapshot(snapshot_path: str | None) -> dict[str, Any]:
+def _read_snapshot(snapshot_path: str | None, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
     if not snapshot_path or not os.path.exists(snapshot_path):
+        if isinstance(fallback, dict):
+            return json.loads(json.dumps(fallback, ensure_ascii=False))
         return _build_empty_snapshot()
-    with open(snapshot_path, "r", encoding="utf-8") as file_obj:
-        return json.load(file_obj)
+
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            with open(snapshot_path, "r", encoding="utf-8") as file_obj:
+                return json.load(file_obj)
+        except (PermissionError, OSError, json.JSONDecodeError) as exc:
+            last_error = exc
+            time.sleep(0.05 * (attempt + 1))
+
+    if isinstance(fallback, dict):
+        snapshot_copy = json.loads(json.dumps(fallback, ensure_ascii=False))
+        if last_error is not None:
+            snapshot_copy["_read_error"] = str(last_error)
+        return snapshot_copy
+    return _build_empty_snapshot()
 
 
 def _fallback_global_summary_log(snapshot: dict[str, Any]) -> dict[str, Any] | None:
@@ -747,7 +773,7 @@ class WebCaptureHandler(logging.Handler):
 
             if workflow_state.get("collecting_baseline_log"):
                 stop_match = ROUND_REGEX.search(message)
-                if stop_match and int(stop_match.group(1)) >= 2:
+                if stop_match and int(stop_match.group(1)) >= 1:
                     baseline_text = "\n".join(workflow_state.get("baseline_log_lines", [])).strip()
                     if baseline_text:
                         payload = {
@@ -952,7 +978,10 @@ def _run_optimizer_in_thread(snapshot_path: str, config: dict[str, Any], runtime
             api_key_path=config["api_key_path"],
             epw_path=config["epw_path"],
             log_dir=config["log_dir"],
+            optimization_dir=config["optimization_dir"],
+            plot_dir=config["plot_dir"],
             num_workflows=int(config["num_workflows"]),
+            optimization_mode=str(config.get("optimization_mode", DEFAULT_OPTIMIZATION_MODE) or DEFAULT_OPTIMIZATION_MODE),
         )
         _suppress_console_logs(optimizer.logger)
         capture_handler = _attach_capture_handler(optimizer, capture_state, capture_lock)
@@ -1269,6 +1298,117 @@ def _build_all_workflows_total_energy_curve(workflows: dict[str, dict[str, Any]]
             titleColor="#1A2E3A",
         )
     )
+
+
+def _sanitize_export_name(value: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(value or "")).strip("._")
+    return cleaned or "chart"
+
+
+def _prepare_matplotlib():
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return matplotlib, plt
+
+
+def _export_workflow_curve_images(plot_dir: str, workflow_id: str, dataframe: pd.DataFrame) -> None:
+    if dataframe.empty:
+        return
+    if not plot_dir:
+        return
+
+    os.makedirs(plot_dir, exist_ok=True)
+    _, plt = _prepare_matplotlib()
+
+    safe_workflow_id = _sanitize_export_name(workflow_id)
+    rounds = list(dataframe["轮次"].astype(int))
+    cooling = list(dataframe["制冷能耗(kWh/m²)"].astype(float))
+    heating = list(dataframe["供暖能耗(kWh/m²)"].astype(float))
+    total_energy = list(dataframe["总建筑能耗(kWh)"].astype(float))
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(rounds, cooling, color="#1F77B4", linestyle="-", marker="o", linewidth=2.4, label="Cooling")
+    ax.plot(rounds, heating, color="#E67E22", linestyle="--", marker="s", linewidth=2.4, label="Heating")
+    ax.set_title(f"{workflow_id} Cooling/Heating Curve")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Energy (kWh/m²)")
+    ax.grid(True, alpha=0.3)
+    if rounds:
+        ax.set_xticks(list(range(min(rounds), max(rounds) + 1)))
+    ax.legend()
+    fig.savefig(os.path.join(plot_dir, f"{safe_workflow_id}_cooling_heating_curve.png"), bbox_inches="tight", dpi=150)
+    fig.savefig(os.path.join(plot_dir, f"{safe_workflow_id}_cooling_heating_curve.svg"), bbox_inches="tight")
+    plt.close(fig)
+
+    fig_total, ax_total = plt.subplots(figsize=(10, 6))
+    ax_total.plot(rounds, total_energy, color="#2A9D8F", linestyle="-", marker="o", linewidth=2.4, label="Total Site Energy")
+    ax_total.set_title(f"{workflow_id} Total Site Energy Curve")
+    ax_total.set_xlabel("Iteration")
+    ax_total.set_ylabel("Energy (kWh)")
+    ax_total.grid(True, alpha=0.3)
+    if rounds:
+        ax_total.set_xticks(list(range(min(rounds), max(rounds) + 1)))
+    ax_total.legend()
+    fig_total.savefig(os.path.join(plot_dir, f"{safe_workflow_id}_total_site_energy_curve.png"), bbox_inches="tight", dpi=150)
+    fig_total.savefig(os.path.join(plot_dir, f"{safe_workflow_id}_total_site_energy_curve.svg"), bbox_inches="tight")
+    plt.close(fig_total)
+
+
+def _export_summary_curve_images(plot_dir: str, workflows: dict[str, dict[str, Any]]) -> None:
+    if not workflows:
+        return
+    if not plot_dir:
+        return
+
+    os.makedirs(plot_dir, exist_ok=True)
+    _, plt = _prepare_matplotlib()
+
+    valid_workflows = []
+    for workflow_id, workflow_snapshot in sorted(workflows.items()):
+        dataframe = _build_metrics_dataframe(workflow_snapshot.get("iteration_history", []) or [])
+        if dataframe.empty:
+            continue
+        valid_workflows.append((workflow_id, dataframe))
+
+    if not valid_workflows:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    color_map = plt.get_cmap("tab10")
+    for index, (workflow_id, dataframe) in enumerate(valid_workflows):
+        color = color_map(index % 10)
+        rounds = list(dataframe["轮次"].astype(int))
+        cooling = list(dataframe["制冷能耗(kWh/m²)"].astype(float))
+        heating = list(dataframe["供暖能耗(kWh/m²)"].astype(float))
+        ax.plot(rounds, cooling, color=color, linestyle="-", marker="o", linewidth=2.2, label=f"{workflow_id} Cooling")
+        ax.plot(rounds, heating, color=color, linestyle="--", marker="s", linewidth=2.2, label=f"{workflow_id} Heating")
+    ax.set_title("Parallel Workflow Cooling/Heating Curves")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Energy (kWh/m²)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, ncol=2)
+    fig.savefig(os.path.join(plot_dir, "summary_cooling_heating_curve.png"), bbox_inches="tight", dpi=150)
+    fig.savefig(os.path.join(plot_dir, "summary_cooling_heating_curve.svg"), bbox_inches="tight")
+    plt.close(fig)
+
+    fig_total, ax_total = plt.subplots(figsize=(12, 7))
+    for index, (workflow_id, dataframe) in enumerate(valid_workflows):
+        color = color_map(index % 10)
+        rounds = list(dataframe["轮次"].astype(int))
+        total_energy = list(dataframe["总建筑能耗(kWh)"].astype(float))
+        ax_total.plot(rounds, total_energy, color=color, linestyle="-", marker="o", linewidth=2.2, label=workflow_id)
+    ax_total.set_title("Parallel Workflow Total Site Energy Curves")
+    ax_total.set_xlabel("Iteration")
+    ax_total.set_ylabel("Energy (kWh)")
+    ax_total.grid(True, alpha=0.3)
+    ax_total.legend(fontsize=8, ncol=2)
+    fig_total.savefig(os.path.join(plot_dir, "summary_total_site_energy_curve.png"), bbox_inches="tight", dpi=150)
+    fig_total.savefig(os.path.join(plot_dir, "summary_total_site_energy_curve.svg"), bbox_inches="tight")
+    plt.close(fig_total)
 
 
 def _render_summary_curve_header(workflow_ids: list[str]) -> None:
@@ -1593,6 +1733,25 @@ def _render_style() -> None:
             background: rgba(255, 255, 255, 0.9) !important;
             border-radius: 12px;
         }
+        /* NumberInput panel: same yellow style as workflow buttons. */
+        div[data-testid="stNumberInput"] {
+            background: #F6F3EC !important;
+            border: 1px solid #C5B79A !important;
+            border-radius: 12px !important;
+            padding: 5px 7px !important;
+            display: flex !important;
+            align-items: center !important;
+            gap: 4px !important;
+            flex-wrap: nowrap !important;
+        }
+        div[data-testid="stNumberInput"] > div {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+        div[data-testid="stNumberInput"] * {
+            background-color: transparent !important;
+        }
         /* NumberInput: suppress sticky focus ring on +/- steppers after click. */
         div[data-testid="stNumberInput"] button,
         div[data-testid="stNumberInput"] button:focus,
@@ -1620,6 +1779,65 @@ def _render_style() -> None:
             outline: none !important;
             box-shadow: none !important;
             border-color: #C5B79A !important;
+        }
+        div[data-testid="stNumberInput"] [data-baseweb="input"] {
+            background: transparent !important;
+            border: none !important;
+            border-radius: 12px !important;
+            flex: 0 0 auto !important;
+            width: 148px !important;
+            min-width: 148px !important;
+            max-width: 148px !important;
+        }
+        div[data-testid="stNumberInput"] [data-baseweb="input"] > div {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+        div[data-testid="stNumberInput"] [data-baseweb="input"] [class*="control"],
+        div[data-testid="stNumberInput"] [data-baseweb="input"] [class*="Controls"],
+        div[data-testid="stNumberInput"] [data-baseweb="input"] [class*="Stepper"],
+        div[data-testid="stNumberInput"] [data-baseweb="input"] [class*="Adornment"] {
+            background: #F6F3EC !important;
+            border: none !important;
+            box-shadow: none !important;
+            gap: 0 !important;
+            margin-left: -4px !important;
+            padding-left: 0 !important;
+        }
+        div[data-testid="stNumberInput"] [data-baseweb="input"] input {
+            background: transparent !important;
+            color: #2C3A3F !important;
+            -webkit-text-fill-color: #2C3A3F !important;
+            font-weight: 800 !important;
+            font-size: 18px !important;
+            padding-right: 2px !important;
+        }
+        div[data-testid="stNumberInput"] [data-baseweb="input"] input:disabled,
+        div[data-testid="stNumberInput"] input:disabled,
+        div[data-testid="stNumberInput"] [disabled] {
+            background: transparent !important;
+            color: #2C3A3F !important;
+            -webkit-text-fill-color: #2C3A3F !important;
+            opacity: 1 !important;
+        }
+        div[data-testid="stNumberInput"] button,
+        div[data-testid="stNumberInput"] [role="button"] {
+            background: #F6F3EC !important;
+            color: #2C3A3F !important;
+            -webkit-text-fill-color: #2C3A3F !important;
+            border-color: #C5B79A !important;
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+            padding-left: 1px !important;
+            padding-right: 1px !important;
+            font-weight: 800 !important;
+            font-size: 18px !important;
+        }
+        div[data-testid="stNumberInput"] button:hover,
+        div[data-testid="stNumberInput"] [role="button"]:hover {
+            background: #EFE7D8 !important;
+            border-color: #B8A784 !important;
         }
         div[data-testid="stFileUploader"] button,
         div[data-testid="stFileUploader"] [role="button"] {
@@ -1660,6 +1878,7 @@ def _render_style() -> None:
         .stButton button:hover {
             border-color: #6A8D92;
             color: #1E3D47;
+            background: #EFE7D8;
         }
         .stButton button:disabled,
         .stButton button:disabled *,
@@ -2129,41 +2348,102 @@ def _render_style() -> None:
                 grid-template-columns: repeat(2, 1fr);
             }
         }
-        /* Popover trigger button: default black background + white text */
-        [data-testid="stPopover"] button,
-        [data-testid="stPopover"] button * {
-            background: #111111 !important;
-            border-color: #111111 !important;
-            color: #FFFFFF !important;
-            -webkit-text-fill-color: #FFFFFF !important;
+        /* Popover trigger + panel: single yellow box style like workflow buttons. */
+        [data-testid="stPopover"] {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
         }
-        [data-testid="stPopover"] button:hover,
-        [data-testid="stPopover"] button:hover * {
-            background: #1a1a1a !important;
-            border-color: #1a1a1a !important;
-            color: #FFFFFF !important;
-            -webkit-text-fill-color: #FFFFFF !important;
+        [data-testid="stPopover"] > div {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+        }
+        [data-testid="stPopover"] button {
+            background: #F6F3EC !important;
+            border: 1px solid #C5B79A !important;
+            color: #2C3A3F !important;
+            -webkit-text-fill-color: #2C3A3F !important;
+            border-radius: 12px !important;
+            font-size: 17px !important;
+            font-weight: 800 !important;
+            white-space: nowrap !important;
+            flex-wrap: nowrap !important;
+            min-width: max-content !important;
+        }
+        [data-testid="stPopover"] button * {
+            border: none !important;
+            box-shadow: none !important;
+            background: transparent !important;
+            white-space: nowrap !important;
+            font-weight: 800 !important;
+        }
+        [data-testid="stPopover"] button:hover {
+            background: #EFE7D8 !important;
+            border-color: #6A8D92 !important;
+            color: #1E3D47 !important;
+            -webkit-text-fill-color: #1E3D47 !important;
         }
         [data-testid="stPopover"] button:active,
         [data-testid="stPopover"] button:focus,
-        [data-testid="stPopover"] button:focus-visible,
-        [data-testid="stPopover"] button:active *,
-        [data-testid="stPopover"] button:focus *,
-        [data-testid="stPopover"] button:focus-visible * {
-            background: #0d0d0d !important;
-            border-color: #0d0d0d !important;
-            color: #FFFFFF !important;
-            -webkit-text-fill-color: #FFFFFF !important;
+        [data-testid="stPopover"] button:focus-visible {
+            background: #EFE7D8 !important;
+            border-color: #6A8D92 !important;
+            color: #1E3D47 !important;
+            -webkit-text-fill-color: #1E3D47 !important;
         }
-        /* Popover panel: make "选择城市" and radio texts white */
+        [data-baseweb="popover"] {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+        [data-baseweb="popover"] > div,
+        [data-testid="stPopoverContent"] {
+            background: #F6F3EC !important;
+            border: 1px solid #C5B79A !important;
+            border-radius: 12px !important;
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.08) !important;
+            padding: 8px 0 8px 10px !important;
+            overflow-y: auto !important;
+            overflow-x: hidden !important;
+            scrollbar-gutter: auto !important;
+        }
+        [data-baseweb="popover"] > div,
+        [data-baseweb="popover"] > div > div,
+        [data-testid="stPopoverContent"],
+        [data-testid="stPopoverContent"] > div {
+            padding-right: 0 !important;
+            margin-right: 0 !important;
+        }
+        [data-testid="stPopoverContent"] > div,
+        [data-testid="stPopoverContent"] [role="radiogroup"] {
+            margin-right: 0 !important;
+            padding-right: 0 !important;
+        }
+        [data-baseweb="popover"] > div::-webkit-scrollbar,
+        [data-testid="stPopoverContent"]::-webkit-scrollbar {
+            width: 12px !important;
+        }
+        [data-baseweb="popover"] > div::-webkit-scrollbar-thumb,
+        [data-testid="stPopoverContent"]::-webkit-scrollbar-thumb {
+            background: #8FA6B2 !important;
+            border-radius: 8px !important;
+            border: 0 !important;
+        }
+        [data-baseweb="popover"] > div::-webkit-scrollbar-track,
+        [data-testid="stPopoverContent"]::-webkit-scrollbar-track {
+            background: #F6F3EC !important;
+        }
+        /* Popover panel text stays dark in light theme. */
         [data-testid="stPopoverContent"] [data-testid="stWidgetLabel"],
         [data-testid="stPopoverContent"] [data-testid="stWidgetLabel"] *,
         [data-testid="stPopoverContent"] label,
         [data-testid="stPopoverContent"] label *,
         [data-testid="stPopoverContent"] [role="radiogroup"] *,
         [data-testid="stPopoverContent"] [role="radio"] * {
-            color: #FFFFFF !important;
-            -webkit-text-fill-color: #FFFFFF !important;
+            color: #2C3A3F !important;
+            -webkit-text-fill-color: #2C3A3F !important;
         }
         [data-baseweb="popover"] [data-testid="stWidgetLabel"],
         [data-baseweb="popover"] [data-testid="stWidgetLabel"] *,
@@ -2173,8 +2453,110 @@ def _render_style() -> None:
         [data-baseweb="popover"] fieldset legend *,
         [data-baseweb="popover"] label,
         [data-baseweb="popover"] label * {
-            color: #FFFFFF !important;
-            -webkit-text-fill-color: #FFFFFF !important;
+            color: #2C3A3F !important;
+            -webkit-text-fill-color: #2C3A3F !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] input[type="radio"] {
+            accent-color: #8FB3CC !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [data-baseweb="radio"],
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [data-baseweb="radio"] * {
+            color: #8FB3CC !important;
+            fill: #8FB3CC !important;
+            stroke: #8FB3CC !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [data-baseweb="radio"] svg,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [data-baseweb="radio"] circle,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [data-baseweb="radio"] path {
+            fill: none !important;
+            stroke: #8FB3CC !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [aria-checked="false"] svg,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [aria-checked="false"] circle,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [aria-checked="false"] path {
+            fill: none !important;
+            stroke: #8FB3CC !important;
+            color: #8FB3CC !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [aria-checked="false"] [fill="black"],
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [aria-checked="false"] [fill="#000"],
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [aria-checked="false"] [fill="#000000"],
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [aria-checked="true"] [fill="black"],
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [aria-checked="true"] [fill="#000"],
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [aria-checked="true"] [fill="#000000"] {
+            fill: none !important;
+            stroke: #8FB3CC !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"][aria-checked="false"],
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"][aria-checked="false"] * {
+            color: #8FB3CC !important;
+            -webkit-text-fill-color: #8FB3CC !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"][aria-checked="false"] {
+            border: 1.5px solid #8FB3CC !important;
+            background: transparent !important;
+            border-radius: 50% !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"][aria-checked="false"] svg,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"][aria-checked="false"] path,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"][aria-checked="false"] circle,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"][aria-checked="true"] svg,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"][aria-checked="true"] path,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"][aria-checked="true"] circle {
+            fill: none !important;
+            stroke: #8FB3CC !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"] svg *,
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"] [style*="fill: rgb(0, 0, 0)"],
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"] [style*="fill:#000"],
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"] [style*="fill: #000"] {
+            fill: none !important;
+            stroke: #8FB3CC !important;
+        }
+        [data-testid="stPopoverContent"] div[data-testid="stRadio"] [role="radio"] circle {
+            stroke-width: 2px !important;
+        }
+        div[data-testid="stNumberInput"] [data-testid="stWidgetLabel"] {
+            margin: 0 !important;
+            min-height: auto !important;
+            padding: 0 !important;
+            flex: 0 0 auto !important;
+        }
+        div[data-testid="stNumberInput"] [data-testid="stWidgetLabel"] p {
+            margin: 0 !important;
+            white-space: nowrap !important;
+            font-size: 18px !important;
+            font-weight: 800 !important;
+            color: #2C3A3F !important;
+            line-height: 1.2 !important;
+        }
+        .weather-caption-chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 12px;
+            border-radius: 12px;
+            background: #F6F3EC;
+            border: 1px solid #C5B79A;
+            color: #2C3A3F;
+            font-size: 16px;
+            font-weight: 700;
+            line-height: 1.3;
+            white-space: nowrap;
+            flex-wrap: nowrap;
+        }
+        .inline-setting-label {
+            display: inline-flex;
+            align-items: center;
+            min-height: 42px;
+            padding: 8px 12px;
+            border-radius: 12px;
+            background: #F6F3EC;
+            border: 1px solid #C5B79A;
+            color: #2C3A3F;
+            font-size: 16px;
+            font-weight: 700;
+            line-height: 1.2;
+            white-space: nowrap;
         }
         </style>
         """,
@@ -2187,49 +2569,7 @@ def _render_number_input_focus_fix() -> None:
         """
         <script>
         (function () {
-            const parentDoc = (window.parent && window.parent.document) ? window.parent.document : document;
-            if (!parentDoc || !parentDoc.body) {
-                return;
-            }
-
-            const guardAttr = "data-numinput-autoblur";
-            if (parentDoc.body.getAttribute(guardAttr) === "1") {
-                return;
-            }
-            parentDoc.body.setAttribute(guardAttr, "1");
-
-            const isNumberInputNode = (node) => {
-                return !!(node && node.closest && node.closest('[data-testid="stNumberInput"]'));
-            };
-
-            const blurIfNeeded = () => {
-                const active = parentDoc.activeElement;
-                if (isNumberInputNode(active) && typeof active.blur === "function") {
-                    active.blur();
-                }
-            };
-
-            const onPointerRelease = (event) => {
-                if (!isNumberInputNode(event.target)) {
-                    return;
-                }
-                window.setTimeout(blurIfNeeded, 0);
-            };
-
-            const onKeyConfirm = (event) => {
-                if (event.key !== "Enter" && event.key !== " ") {
-                    return;
-                }
-                if (!isNumberInputNode(event.target)) {
-                    return;
-                }
-                window.setTimeout(blurIfNeeded, 0);
-            };
-
-            parentDoc.addEventListener("pointerup", onPointerRelease, true);
-            parentDoc.addEventListener("mouseup", onPointerRelease, true);
-            parentDoc.addEventListener("touchend", onPointerRelease, true);
-            parentDoc.addEventListener("keydown", onKeyConfirm, true);
+            // Keep NumberInput focus behavior native so users can click value and type directly.
         })();
         </script>
         """,
@@ -2458,6 +2798,7 @@ def _render_summary_page(snapshot: dict[str, Any], running: bool = False) -> Non
     all_workflows = snapshot.get("workflows") or {}
     visible_ids = _visible_workflow_ids(snapshot)
     workflows = {workflow_id: all_workflows.get(workflow_id, {}) for workflow_id in visible_ids}
+    plot_dir = str(snapshot.get("config", {}).get("plot_dir") or "")
     if not workflows:
         _render_notice("暂无可汇总数据。")
         return
@@ -2528,6 +2869,8 @@ def _render_summary_page(snapshot: dict[str, Any], running: bool = False) -> Non
         st.altair_chart(summary_total_energy_curve, width='stretch')
     else:
         _render_notice("正在准备并行总建筑能耗曲线数据，生成后会自动显示完整图像。")
+
+    _export_summary_curve_images(plot_dir, workflows)
 
     summary_log_payload = _fallback_global_summary_log(snapshot)
     _render_text_panel(
@@ -2752,6 +3095,7 @@ def _init_page_state() -> None:
     if "web_ui_state" not in st.session_state:
         st.session_state["web_ui_state"] = {
             "snapshot_path": None,
+            "snapshot_cache": None,
             "runner_thread": None,
             "selected_workflow": "workflow_1",
             "selected_view": "workflow_1",
@@ -2777,6 +3121,10 @@ def _on_view_nav_click(view_name: str, default_workflow: str) -> None:
     page_state["last_ui_action_ts"] = time.time()
 
 
+def _on_mode_button_click(mode_name: str) -> None:
+    st.session_state["cfg_optimization_mode"] = mode_name
+
+
 def _install_summary_finish_watcher(snapshot_path: str | None, selected_view: str, running: bool) -> None:
     """When user stays on summary, refresh only when snapshot changes.
 
@@ -2789,11 +3137,13 @@ def _install_summary_finish_watcher(snapshot_path: str | None, selected_view: st
 
     # 不再使用 st.fragment(run_every=...)，避免全量 rerun 后旧 fragment 定时回调报错：
     # "The fragment with id ... does not exist anymore"。
-    latest_snapshot = _read_snapshot(snapshot_path)
-    latest_status = str(latest_snapshot.get("status", "idle") or "idle")
     state = st.session_state.get("web_ui_state")
     if not isinstance(state, dict):
         return
+
+    latest_snapshot = _read_snapshot(snapshot_path, fallback=state.get("snapshot_cache"))
+    state["snapshot_cache"] = latest_snapshot
+    latest_status = str(latest_snapshot.get("status", "idle") or "idle")
 
     if latest_status in {"running", "starting"}:
         live_marker = latest_snapshot.get("updated_at") or latest_status
@@ -2826,7 +3176,8 @@ def main() -> None:
     _render_number_input_focus_fix()
 
     page_state = st.session_state["web_ui_state"]
-    snapshot = _read_snapshot(page_state.get("snapshot_path"))
+    snapshot = _read_snapshot(page_state.get("snapshot_path"), fallback=page_state.get("snapshot_cache"))
+    page_state["snapshot_cache"] = snapshot
     status = snapshot.get("status", "idle")
     running = status in {"running", "starting"}
     _install_summary_finish_watcher(
@@ -2866,6 +3217,13 @@ def main() -> None:
         if st.session_state.get("cfg_epw_path") not in weather_label_map:
             st.session_state["cfg_epw_path"] = default_epw_path
 
+        if "cfg_optimization_mode" not in st.session_state:
+            st.session_state["cfg_optimization_mode"] = DEFAULT_OPTIMIZATION_MODE
+        if "cfg_max_iterations_cap" not in st.session_state:
+            st.session_state["cfg_max_iterations_cap"] = int(snapshot.get("config", {}).get("max_iterations_cap", DEFAULT_CONVERGENCE_MAX_ITERATIONS) or DEFAULT_CONVERGENCE_MAX_ITERATIONS)
+        if "cfg_early_stop_target_total_saving_pct" not in st.session_state:
+            st.session_state["cfg_early_stop_target_total_saving_pct"] = float(snapshot.get("config", {}).get("early_stop_target_total_saving_pct", DEFAULT_EARLY_STOP_TARGET_SAVING_PCT) or DEFAULT_EARLY_STOP_TARGET_SAVING_PCT)
+
         col_left, col_right = st.columns(2)
         with col_left:
             uploaded_idf = st.file_uploader("上传 IDF 模型文件", type=["idf"], key="idf_uploader", help="必填。上传后将自动复制到运行目录，不改动原始算法逻辑。")
@@ -2873,63 +3231,90 @@ def main() -> None:
             uploaded_api = st.file_uploader("上传 API Key 文本文件", type=["txt"], key="api_uploader", help="必填。内容应为可用密钥，等价于原来的 api_key.txt。")
 
         st.markdown("### 气象城市配置")
-        if hasattr(st, "popover"):
-            with st.popover("选择城市气象数据", use_container_width=False):
-                st.radio(
-                    "选择城市",
+        weather_btn_col, weather_caption_col, weather_spacer_col = st.columns([0.9, 1.6, 3.5], gap="small")
+        with weather_btn_col:
+            if hasattr(st, "popover"):
+                with st.popover("选择城市气象数据", use_container_width=False):
+                    st.radio(
+                        "选择城市",
+                        options=weather_paths,
+                        format_func=lambda path: weather_label_map.get(path, path),
+                        key="cfg_epw_path",
+                    )
+            else:
+                st.selectbox(
+                    "选择城市气象数据",
                     options=weather_paths,
                     format_func=lambda path: weather_label_map.get(path, path),
                     key="cfg_epw_path",
                 )
-        else:
-            st.selectbox(
-                "选择城市气象数据",
-                options=weather_paths,
-                format_func=lambda path: weather_label_map.get(path, path),
-                key="cfg_epw_path",
-            )
         selected_epw_path = str(st.session_state.get("cfg_epw_path", default_epw_path) or default_epw_path)
-        st.caption(f"当前城市气象：{weather_label_map.get(selected_epw_path, selected_epw_path)}")
+        with weather_caption_col:
+            st.markdown(
+                f"<div class='weather-caption-chip'>当前城市气象：{html.escape(weather_label_map.get(selected_epw_path, selected_epw_path))}</div>",
+                unsafe_allow_html=True,
+            )
+        with weather_spacer_col:
+            st.markdown("", unsafe_allow_html=True)
 
-        col_cfg_1, col_cfg_2, col_cfg_3 = st.columns(3)
+        st.markdown("### 优化模式")
+        mode_options = [MODE_CONVERGENCE, MODE_TARGET]
+        mode_labels = {
+            MODE_CONVERGENCE: "早停收敛模式（默认最大迭代 40，不限制节能目标）",
+            MODE_TARGET: "节能目标模式（默认目标节能 50%，尽快达标）",
+        }
+        mode_btn_cols = st.columns(2)
+        for idx, mode in enumerate(mode_options):
+            is_mode_active = st.session_state.get("cfg_optimization_mode", DEFAULT_OPTIMIZATION_MODE) == mode
+            mode_button_label = f"▶ {mode_labels.get(mode, mode)}" if is_mode_active else mode_labels.get(mode, mode)
+            with mode_btn_cols[idx]:
+                st.button(
+                    mode_button_label,
+                    key=f"cfg_mode_btn_{mode}",
+                    width="stretch",
+                    on_click=_on_mode_button_click,
+                    args=(mode,),
+                )
+        selected_optimization_mode = str(st.session_state.get("cfg_optimization_mode", DEFAULT_OPTIMIZATION_MODE) or DEFAULT_OPTIMIZATION_MODE)
+
+        if "cfg_last_mode_for_defaults" not in st.session_state:
+            st.session_state["cfg_last_mode_for_defaults"] = selected_optimization_mode
+        if st.session_state["cfg_last_mode_for_defaults"] != selected_optimization_mode:
+            if selected_optimization_mode == MODE_CONVERGENCE:
+                st.session_state["cfg_max_iterations_cap"] = DEFAULT_CONVERGENCE_MAX_ITERATIONS
+            else:
+                st.session_state["cfg_early_stop_target_total_saving_pct"] = DEFAULT_EARLY_STOP_TARGET_SAVING_PCT
+            st.session_state["cfg_last_mode_for_defaults"] = selected_optimization_mode
+
+        col_cfg_1, col_cfg_2, col_cfg_3 = st.columns(3, gap="small")
         with col_cfg_1:
             num_workflows = st.number_input(
-                "并行工作流数量",
+                "并行工作流数量：",
                 min_value=1,
                 value=int(snapshot.get("config", {}).get("num_workflows", DEFAULT_NUM_WORKFLOWS) or DEFAULT_NUM_WORKFLOWS),
                 step=1,
                 key="cfg_num_workflows",
+                width="stretch",
             )
         with col_cfg_2:
             max_iterations_cap = st.number_input(
-                "最大优化迭代轮次",
+                "最大优化迭代轮次：",
                 min_value=1,
-                value=int(snapshot.get("config", {}).get("max_iterations_cap", snapshot.get("config", {}).get("optimization_rounds", DEFAULT_MAX_ITERATIONS)) or DEFAULT_MAX_ITERATIONS),
                 step=1,
                 key="cfg_max_iterations_cap",
+                width="stretch",
             )
         with col_cfg_3:
             early_stop_target_total_saving_pct = st.number_input(
-                "最大节能幅度目标(%)",
+                "最大节能幅度目标(%)：",
                 min_value=0.1,
                 max_value=99.9,
-                value=float(snapshot.get("config", {}).get("early_stop_target_total_saving_pct", DEFAULT_EARLY_STOP_TARGET_SAVING_PCT) or DEFAULT_EARLY_STOP_TARGET_SAVING_PCT),
                 step=0.5,
                 format="%.1f",
                 key="cfg_early_stop_target_total_saving_pct",
+                disabled=(selected_optimization_mode == MODE_CONVERGENCE),
+                width="stretch",
             )
-
-        st.markdown(
-            f"""
-            <div class='glass config-card'>
-                <strong>固定配置</strong><br/>
-                IDD: {DEFAULT_IDD_PATH}<br/>
-                EPW: {html.escape(selected_epw_path)}<br/>
-                日志目录: {DEFAULT_LOG_DIR}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
         st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
@@ -2940,21 +3325,28 @@ def main() -> None:
                 return
 
             os.makedirs(RUNTIME_DIR, exist_ok=True)
-            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-            snapshot_path = os.path.join(RUNTIME_DIR, f"dashboard_snapshot_{run_id}.json")
-            upload_dir = os.path.join(RUNTIME_DIR, "uploads", run_id)
+            run_id = datetime.now().strftime("%Y%m%d%H%M")
+            run_root = os.path.join(WEB_RUNS_DIR, run_id)
+            snapshot_path = os.path.join(run_root, "dashboard_snapshot.json")
+            upload_dir = os.path.join(run_root, "uploads")
             idf_path = _save_uploaded_file(uploaded_idf, upload_dir)
             api_key_path = _save_uploaded_file(uploaded_api, upload_dir)
+            log_dir = os.path.join(run_root, "optimization_logs_web")
+            optimization_dir = os.path.join(run_root, "optimization_results_web")
+            plot_dir = os.path.join(run_root, "optimization_plot_web")
             config = {
                 "idf_path": idf_path,
                 "idd_path": DEFAULT_IDD_PATH,
                 "api_key_path": api_key_path,
                 "epw_path": selected_epw_path,
-                "log_dir": DEFAULT_LOG_DIR,
-                "max_iterations": int(max_iterations_cap) + 1,
+                "log_dir": log_dir,
+                "optimization_dir": optimization_dir,
+                "plot_dir": plot_dir,
+                "max_iterations": int(max_iterations_cap),
                 "optimization_rounds": int(max_iterations_cap),
                 "max_iterations_cap": int(max_iterations_cap),
                 "early_stop_target_total_saving_pct": float(early_stop_target_total_saving_pct),
+                "optimization_mode": selected_optimization_mode,
                 "num_workflows": int(num_workflows),
             }
             runtime_state = {"status": "starting", "started_at": None, "finished_at": None, "error": None}
@@ -3054,6 +3446,7 @@ def main() -> None:
         selected_workflow = workflow_keys[0]
         page_state["selected_view"] = selected_workflow
     workflow_snapshot = (snapshot.get("workflows") or {}).get(selected_workflow, {}) or {}
+    plot_dir = str(snapshot.get("config", {}).get("plot_dir") or "")
 
     st.subheader(f"当前查看：{selected_workflow}")
     round_text = f"第 {workflow_snapshot.get('current_iteration', 0)} 轮（最大 {workflow_snapshot.get('max_iterations', 0)} 轮）"
@@ -3169,6 +3562,8 @@ def main() -> None:
         _render_notice("正在准备总建筑能耗曲线数据，生成后会自动显示完整图像。")
     else:
         _render_notice("尚未开始运行，启动后将在此显示总建筑能耗曲线。")
+
+    _export_workflow_curve_images(plot_dir, selected_workflow, dataframe)
 
     st.markdown("### 各项能耗指标与节能变化")
     if dataframe.empty:

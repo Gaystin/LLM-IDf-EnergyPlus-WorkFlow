@@ -9,8 +9,6 @@
 /各城市迭代结果_50%节能率
 /各城市迭代结果_早停
 /各城市迭代结果
-/频率分析可视化输出
-/画图
 /knowledge_base_components/__pycache__
 /knowledge_base_components/__init__.py
 /api key
@@ -18,3 +16,4 @@
 /Task
 /figures
 /vis
+/web
