@@ -1063,12 +1063,32 @@ class EnergyPlusOptimizer:
             obj_type = obj['object_type']
             candidate_fields = obj['candidate_fields']
 
-            if obj_type in self.base_idf.idfobjects and len(self.base_idf.idfobjects[obj_type]) > 0:
-                sample_obj = self.base_idf.idfobjects[obj_type][0]
+            # 对有Method约束的对象，按该对象类型中“实际激活过的字段集合”过滤，
+            # 避免仅依据首个样本对象导致候选字段过窄。
+            if self._has_method_mapping(obj_type):
                 candidate_field_names = [f['field_name'] for f in candidate_fields]
-                filtered_names = self._filter_fields_by_method(obj_type, sample_obj, candidate_field_names)
-                if filtered_names:
-                    candidate_fields = [f for f in candidate_fields if f['field_name'] in filtered_names]
+                active_fields = self._get_active_method_fields_for_object_type(obj_type)
+                if active_fields:
+                    filtered_names = [f for f in candidate_field_names if f in active_fields]
+                    if filtered_names:
+                        candidate_fields = [f for f in candidate_fields if f['field_name'] in filtered_names]
+
+            current_values = {}
+            if obj_type in self.base_idf.idfobjects and len(self.base_idf.idfobjects[obj_type]) > 0:
+                for field_info in candidate_fields:
+                    field = field_info['field_name']
+                    current_values[field] = self._pick_representative_field_value(obj_type, field)
+
+            # 优先保留当前可修改（数值且非特殊关键字）的字段，降低无效字段噪声。
+            modifiable_candidate_fields = []
+            for field_info in candidate_fields:
+                field_name = field_info.get('field_name')
+                current_value = current_values.get(field_name, "未设置")
+                if self._is_numeric_value(current_value) and (not self._is_special_value(current_value)):
+                    modifiable_candidate_fields.append(field_info)
+
+            if modifiable_candidate_fields:
+                candidate_fields = modifiable_candidate_fields
 
             field_semantics_list = []
             for field_info in candidate_fields:
@@ -1080,14 +1100,9 @@ class EnergyPlusOptimizer:
                     'semantic': field_info.get('semantic', ''),
                     'related_concepts': field_info.get('related_concepts', [])
                 })
-            
-            current_values = {}
-            if obj_type in self.base_idf.idfobjects and len(self.base_idf.idfobjects[obj_type]) > 0:
-                sample_obj = self.base_idf.idfobjects[obj_type][0]
-                for field_info in candidate_fields:
-                    field = field_info['field_name']
-                    val = getattr(sample_obj, field, None)
-                    current_values[field] = str(val) if val is not None else "未设置"
+
+            # 与字段语义列表保持一致，避免展示被过滤掉的无效字段值。
+            current_values = {f['field_name']: current_values.get(f['field_name'], "未设置") for f in candidate_fields}
             
             kb_context['candidates'].append({
                 'object_type': obj_type,
@@ -2013,6 +2028,54 @@ class EnergyPlusOptimizer:
         if target_field in candidate_fields:
             return [target_field]
         return candidate_fields
+
+    def _get_active_method_fields_for_object_type(self, object_type, max_samples=200):
+        """返回对象类型内按Calculation Method实际激活过的字段集合。"""
+        active_fields = set()
+        if not self._has_method_mapping(object_type):
+            return active_fields
+
+        objs = list(self.base_idf.idfobjects.get(object_type, []) or [])
+        if not objs:
+            return active_fields
+
+        for obj in objs[:max_samples]:
+            try:
+                target_field = self._get_method_target_field(object_type, obj)
+            except Exception:
+                target_field = None
+            if target_field:
+                active_fields.add(target_field)
+
+        return active_fields
+
+    def _pick_representative_field_value(self, object_type, field_name, max_samples=200):
+        """为提示词选取更可靠字段样本值：优先数值，退化到首个非空值。"""
+        objs = list(self.base_idf.idfobjects.get(object_type, []) or [])
+        if not objs:
+            return "未设置"
+
+        fallback = None
+        for obj in objs[:max_samples]:
+            try:
+                val = getattr(obj, field_name, None)
+            except Exception:
+                continue
+
+            if val is None:
+                continue
+
+            text = str(val).strip()
+            if not text:
+                continue
+
+            if fallback is None:
+                fallback = text
+
+            if self._is_numeric_value(val):
+                return text
+
+        return fallback if fallback is not None else "未设置"
 
     def _get_method_field_map(self):
         """返回按对象类型定义的 Calculation Method → 有效字段映射。"""

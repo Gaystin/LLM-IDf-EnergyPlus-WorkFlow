@@ -172,26 +172,27 @@ class EnergyPlusKnowledgeBase:
                         self._modifiable_fields_cache[obj_type] = set()
                         continue
                     
-                    sample_obj = objs[0]
-                    
-                    # 逐个检查该对象类型的所有字段
-                    for field_name in sample_obj.fieldnames:
-                        try:
-                            field_value = getattr(sample_obj, field_name, None)
-                            
-                            # 判断这个字段是否可修改：必须是数值类型
-                            if field_value is None:
-                                continue
-                            
-                            # 检查是否是数值
+                    # 逐个检查该对象类型的所有字段。
+                    # 关键改进：不再只看第一个对象实例，避免因首个实例为 AutoSize/空值导致误判。
+                    # 只要同类型任一实例该字段为数值，即认为该字段具备可修改潜力。
+                    field_names = list(getattr(objs[0], 'fieldnames', []))
+                    for field_name in field_names:
+                        field_is_modifiable = False
+                        for obj in objs:
                             try:
+                                field_value = getattr(obj, field_name, None)
+                                if field_value is None:
+                                    continue
                                 float(str(field_value))
-                                modifiable_fields.add(field_name)
+                                field_is_modifiable = True
+                                break
                             except (ValueError, TypeError):
-                                # 非数值字段（字符串、引用等）不应被修改
-                                pass
-                        except Exception:
-                            pass
+                                continue
+                            except Exception:
+                                continue
+
+                        if field_is_modifiable:
+                            modifiable_fields.add(field_name)
                     
                     self._modifiable_fields_cache[obj_type] = modifiable_fields
         except Exception as e:
