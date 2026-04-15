@@ -56,7 +56,7 @@ RANGE_BY_TIER: Dict[str, Tuple[Optional[int], Optional[int]]] = {
 # 是否只跑指定文件名（不含后缀）；空列表表示不启用该过滤
 # 支持字符串或整数写法，都会自动转为字符串比较
 # 示例: ["10125", "10751"] 或 [10125, 10751]
-ONLY_IDF_STEMS: List[str] = [10479]
+ONLY_IDF_STEMS: List[str] = [10534]
 
 
 def _idf_sort_key(path_obj: Path):

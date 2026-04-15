@@ -37,6 +37,9 @@ def build_keyword_mapping() -> Dict[str, List[str]]:
         "SHGC": ["WindowMaterial:SimpleGlazingSystem"],
         "window": ["WindowMaterial:SimpleGlazingSystem", "WindowMaterial:Glazing"],
         "glazing": ["WindowMaterial:Glazing", "WindowMaterial:SimpleGlazingSystem"],
+        "玻璃导热": ["WindowMaterial:Glazing"],
+        "玻璃厚度": ["WindowMaterial:Glazing"],
+        "脏污": ["WindowMaterial:Glazing"],
 
         # 渗透/换气相关
         "渗透": ["ZoneInfiltration:DesignFlowRate"],
@@ -67,6 +70,10 @@ def build_keyword_mapping() -> Dict[str, List[str]]:
         "供暖": ["Heating:DesignDay", "ZoneHVAC:IdealLoadsAirSystem"],
         "制冷": ["Cooling:DesignDay", "ZoneHVAC:IdealLoadsAirSystem"],
         "hvac": ["ZoneHVAC:IdealLoadsAirSystem", "AirLoopHVAC"],
+        "湿度": ["Sizing:Zone", "ZoneHVAC:IdealLoadsAirSystem"],
+        "含湿比": ["Sizing:Zone", "ZoneHVAC:IdealLoadsAirSystem"],
+        "风量": ["Sizing:Zone", "ZoneHVAC:IdealLoadsAirSystem", "ZoneInfiltration:DesignFlowRate"],
+        "送风量": ["Sizing:Zone", "ZoneHVAC:IdealLoadsAirSystem"],
 
         # 温控设定点相关
         "温控": ["ThermostatSetpoint:DualSetpoint"],
@@ -78,6 +85,7 @@ def build_keyword_mapping() -> Dict[str, List[str]]:
         "制冷温度": ["ThermostatSetpoint:DualSetpoint", "Sizing:Zone"],
         "thermostat": ["ThermostatSetpoint:DualSetpoint"],
         "setpoint": ["ThermostatSetpoint:DualSetpoint"],
+        "温差": ["Sizing:Zone", "ZoneMixing", "ZoneControl:Thermostat"],
 
         # 新风量相关
         "新风": ["DesignSpecification:OutdoorAir"],
@@ -167,6 +175,10 @@ def build_field_keyword_mapping() -> Dict[str, Dict[str, List[str]]]:
                 "Back_Side_Visible_Reflectance_at_Normal_Incidence",
             ],
             "厚度": ["Thickness"],
+            "导热": ["Conductivity"],
+            "热导率": ["Conductivity"],
+            "红外": ["Infrared_Transmittance_at_Normal_Incidence", "Front_Side_Infrared_Hemispherical_Emissivity", "Back_Side_Infrared_Hemispherical_Emissivity"],
+            "脏污": ["Dirt_Correction_Factor_for_Solar_and_Visible_Transmittance"],
         },
         "ZoneInfiltration:DesignFlowRate": {
             "渗透": ["Design_Flow_Rate", "Air_Changes_per_Hour", "Flow_Rate_per_Exterior_Surface_Area", "Flow_Rate_per_Floor_Area"],
@@ -204,13 +216,19 @@ def build_field_keyword_mapping() -> Dict[str, Dict[str, List[str]]]:
             "最大供暖供风温度": ["Maximum_Heating_Supply_Air_Temperature"],
             "热回收": ["Sensible_Heat_Recovery_Effectiveness", "Latent_Heat_Recovery_Effectiveness"],
             "显热比": ["Cooling_Sensible_Heat_Ratio"],
+            "湿度": ["Maximum_Heating_Supply_Air_Humidity_Ratio", "Minimum_Cooling_Supply_Air_Humidity_Ratio"],
+            "含湿比": ["Maximum_Heating_Supply_Air_Humidity_Ratio", "Minimum_Cooling_Supply_Air_Humidity_Ratio"],
+            "送风湿度": ["Maximum_Heating_Supply_Air_Humidity_Ratio", "Minimum_Cooling_Supply_Air_Humidity_Ratio"],
         },
         "Sizing:Zone": {
             "供风温度": ["Zone_Cooling_Design_Supply_Air_Temperature", "Zone_Heating_Design_Supply_Air_Temperature"],
             "制冷温度": ["Zone_Cooling_Design_Supply_Air_Temperature"],
             "供暖温度": ["Zone_Heating_Design_Supply_Air_Temperature"],
-            "送风量": ["Cooling_Design_Air_Flow_Rate", "Heating_Design_Air_Flow_Rate", "Cooling_Minimum_Air_Flow_per_Zone_Floor_Area", "Heating_Maximum_Air_Flow_per_Zone_Floor_Area"],
-            "湿度": ["Zone_Cooling_Design_Supply_Air_Humidity_Ratio", "Zone_Heating_Design_Supply_Air_Humidity_Ratio"],
+            "温差": ["Zone_Cooling_Design_Supply_Air_Temperature_Difference", "Zone_Heating_Design_Supply_Air_Temperature_Difference"],
+            "送风量": ["Cooling_Design_Air_Flow_Rate", "Heating_Design_Air_Flow_Rate", "Cooling_Minimum_Air_Flow_per_Zone_Floor_Area", "Heating_Maximum_Air_Flow_per_Zone_Floor_Area", "Heating_Maximum_Air_Flow_Fraction", "Heating_Maximum_Air_Flow"],
+            "风量": ["Cooling_Design_Air_Flow_Rate", "Heating_Design_Air_Flow_Rate", "Cooling_Minimum_Air_Flow_per_Zone_Floor_Area", "Heating_Maximum_Air_Flow_per_Zone_Floor_Area", "Heating_Maximum_Air_Flow_Fraction", "Heating_Maximum_Air_Flow"],
+            "湿度": ["Zone_Cooling_Design_Supply_Air_Humidity_Ratio", "Zone_Heating_Design_Supply_Air_Humidity_Ratio", "Zone_Cooling_Design_Supply_Air_Humidity_Ratio_Difference", "Zone_Heating_Design_Supply_Air_Humidity_Ratio_Difference"],
+            "含湿比": ["Zone_Cooling_Design_Supply_Air_Humidity_Ratio", "Zone_Heating_Design_Supply_Air_Humidity_Ratio", "Zone_Cooling_Design_Supply_Air_Humidity_Ratio_Difference", "Zone_Heating_Design_Supply_Air_Humidity_Ratio_Difference"],
         },
         "ZoneMixing": {
             "混风": ["Design_Flow_Rate", "Flow_Rate_per_Floor_Area", "Flow_Rate_per_Person", "Air_Changes_per_Hour", "Delta_Temperature"],
@@ -290,6 +308,27 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "range": [0, 1],
                 "semantic": "影响室内外长波辐射交换",
                 "related_concept": ["红外发射率", "辐射换热"],
+            },
+            "Infrared_Transmittance_at_Normal_Incidence": {
+                "description": "红外透射率",
+                "unit": "无量纲 (0-1)",
+                "range": [0, 1],
+                "semantic": "值越高，长波辐射透射越强，影响辐射换热",
+                "related_concept": ["红外透射", "辐射换热"],
+            },
+            "Conductivity": {
+                "description": "玻璃导热系数",
+                "unit": "W/m-K",
+                "range": [0.01, 10],
+                "semantic": "值越低，玻璃传热越慢，保温性能越好",
+                "related_concept": ["导热系数", "保温"],
+            },
+            "Dirt_Correction_Factor_for_Solar_and_Visible_Transmittance": {
+                "description": "太阳与可见光透射脏污修正系数",
+                "unit": "无量纲 (0-1)",
+                "range": [0, 1],
+                "semantic": "值越高，透射损失越小；值越低表示脏污遮挡更强",
+                "related_concept": ["脏污修正", "透光修正"],
             },
         },
         "WindowMaterial:SimpleGlazingSystem": {
@@ -566,6 +605,20 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "related_concept": ["阈值", "运行限制", "最大供暖供风温度"],
                 "optimization_note": "建议在舒适度允许范围内小幅下调",
             },
+            "Maximum_Heating_Supply_Air_Humidity_Ratio": {
+                "description": "最大供暖送风含湿比",
+                "unit": "kgWater/kgDryAir",
+                "range": [0.001, 0.02],
+                "semantic": "值越低，冬季送风越干燥，加湿需求与潜在负荷越小",
+                "related_concept": ["含湿比", "加湿上限", "供暖湿度"],
+            },
+            "Minimum_Cooling_Supply_Air_Humidity_Ratio": {
+                "description": "最小制冷送风含湿比",
+                "unit": "kgWater/kgDryAir",
+                "range": [0.001, 0.02],
+                "semantic": "值越高，冷却送风对除湿约束越宽松，通常可减轻潜热负荷",
+                "related_concept": ["含湿比", "除湿下限", "制冷湿度"],
+            },
             "Sensible_Heat_Recovery_Effectiveness": {
                 "description": "显热回收效率",
                 "unit": "无量纲 (0-1)",
@@ -605,6 +658,20 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "related_concept": ["供风温度", "供暖送风"],
                 "optimization_note": "可从50°C降至42-45°C（地暖30-35°C）",
             },
+            "Zone_Cooling_Design_Supply_Air_Temperature_Difference": {
+                "description": "制冷设计供风温差",
+                "unit": "°C",
+                "range": [0, 20],
+                "semantic": "值越大，制冷侧允许的送风温差越大，可影响风量与送风策略",
+                "related_concept": ["供风温差", "制冷差值"],
+            },
+            "Zone_Heating_Design_Supply_Air_Temperature_Difference": {
+                "description": "供暖设计供风温差",
+                "unit": "°C",
+                "range": [0, 30],
+                "semantic": "值越大，供暖侧允许的送风温差越大，可影响风量与送风策略",
+                "related_concept": ["供风温差", "供暖差值"],
+            },
             "Cooling_Design_Air_Flow_Rate": {
                 "description": "制冷设计送风量",
                 "unit": "m³/s",
@@ -633,6 +700,20 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "semantic": "值越高，供暖风量上限越宽，可能增加输配能耗",
                 "related_concept": ["最大风量", "供暖送风"],
             },
+            "Heating_Maximum_Air_Flow_Fraction": {
+                "description": "供暖最大送风量分数",
+                "unit": "无量纲 (0-1)",
+                "range": [0, 1],
+                "semantic": "值越高，供暖侧允许的最大风量比例越大",
+                "related_concept": ["风量分数", "供暖风量上限"],
+            },
+            "Heating_Maximum_Air_Flow": {
+                "description": "供暖最大送风量",
+                "unit": "m³/s",
+                "range": [0, 20],
+                "semantic": "值越高，供暖阶段允许的最大送风量越大，可能抬高风机能耗",
+                "related_concept": ["最大风量", "供暖送风上限"],
+            },
             "Zone_Cooling_Design_Supply_Air_Humidity_Ratio": {
                 "description": "制冷设计送风含湿比",
                 "unit": "kgWater/kgDryAir",
@@ -646,6 +727,20 @@ def build_field_semantics() -> Dict[str, Dict[str, Dict]]:
                 "range": [0.002, 0.015],
                 "semantic": "影响冬季加湿需求与舒适性",
                 "related_concept": ["含湿比", "加湿"],
+            },
+            "Zone_Cooling_Design_Supply_Air_Humidity_Ratio_Difference": {
+                "description": "制冷设计送风含湿比差值",
+                "unit": "kgWater/kgDryAir",
+                "range": [0, 0.01],
+                "semantic": "值越大，制冷侧湿度差值越宽，影响除湿控制策略",
+                "related_concept": ["湿度差", "制冷除湿"],
+            },
+            "Zone_Heating_Design_Supply_Air_Humidity_Ratio_Difference": {
+                "description": "供暖设计送风含湿比差值",
+                "unit": "kgWater/kgDryAir",
+                "range": [0, 0.01],
+                "semantic": "值越大，供暖侧湿度差值越宽，影响加湿控制策略",
+                "related_concept": ["湿度差", "供暖加湿"],
             },
         },
         "ZoneMixing": {

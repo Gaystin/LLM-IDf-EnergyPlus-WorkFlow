@@ -1063,15 +1063,15 @@ class EnergyPlusOptimizer:
             obj_type = obj['object_type']
             candidate_fields = obj['candidate_fields']
 
-            # 对有Method约束的对象，按该对象类型中“实际激活过的字段集合”过滤，
-            # 避免仅依据首个样本对象导致候选字段过窄。
+            # 对有Method约束的对象，不再裁剪字段集合，避免在进入LLM前丢失潜在高价值字段。
+            # 仅做“当前激活字段优先展示”的弱排序提示。
             if self._has_method_mapping(obj_type):
-                candidate_field_names = [f['field_name'] for f in candidate_fields]
                 active_fields = self._get_active_method_fields_for_object_type(obj_type)
                 if active_fields:
-                    filtered_names = [f for f in candidate_field_names if f in active_fields]
-                    if filtered_names:
-                        candidate_fields = [f for f in candidate_fields if f['field_name'] in filtered_names]
+                    candidate_fields = sorted(
+                        candidate_fields,
+                        key=lambda f: (0 if f.get('field_name') in active_fields else 1, str(f.get('field_name', '')).upper())
+                    )
 
             current_values = {}
             if obj_type in self.base_idf.idfobjects and len(self.base_idf.idfobjects[obj_type]) > 0:
@@ -2650,25 +2650,36 @@ class EnergyPlusOptimizer:
                     target_attr = None
                     method_target = self._get_method_target_field(target_obj_type, obj)
 
-                    # 对有 Method 约束的对象，强制只改当前 Method 对应字段，避免 LLM 误改
+                    # 对有 Method 约束的对象：
+                    # - 不再强制覆盖为当前生效字段，允许探索同对象的其他数值字段；
+                    # - 若字段无法匹配，才退化到当前生效字段，保持执行稳定性。
                     if self._has_method_mapping(target_obj_type):
                         method_field_name = self._get_method_field_name(target_obj_type)
                         method_value = getattr(obj, method_field_name, None)
-                        if not method_target or method_target not in valid_attrs:
-                            self.logger.warning(
-                                f"  [跳过修改] {target_obj_type} ({obj_name}): "
-                                f"Method字段 '{method_field_name}' 当前值 '{method_value}' 无法解析为可修改字段，"
-                                f"跳过 LLM 建议字段 '{clean_field}'"
-                            )
-                            continue
 
-                        target_attr = method_target
                         norm_llm_field = clean_field.lower().replace("_", "").replace(" ", "")
-                        norm_target_attr = target_attr.lower().replace("_", "").replace(" ", "")
-                        if norm_llm_field != norm_target_attr:
+
+                        # 先尝试按LLM建议字段精确匹配
+                        if hasattr(obj, clean_field.replace(" ", "_")):
+                            target_attr = clean_field.replace(" ", "_")
+                        else:
+                            for attr in valid_attrs:
+                                if attr.lower().replace("_", "").replace(" ", "") == norm_llm_field:
+                                    target_attr = attr
+                                    break
+
+                        # 无法匹配LLM字段时，才回退到当前Method生效字段
+                        if not target_attr and method_target and method_target in valid_attrs:
+                            target_attr = method_target
                             self.logger.info(
-                                f"  [Method强制字段] {target_obj_type} ({obj_name}): "
-                                f"LLM建议字段 '{clean_field}' 已忽略，按 Method 使用 '{target_attr}'"
+                                f"  [Method回退字段] {target_obj_type} ({obj_name}): "
+                                f"LLM建议字段 '{clean_field}' 无法匹配，按当前Method('{method_value}')使用 '{target_attr}'"
+                            )
+                        elif target_attr and method_target and target_attr != method_target:
+                            self.logger.info(
+                                f"  [Method非生效字段] {target_obj_type} ({obj_name}): "
+                                f"当前Method='{method_value}' 生效字段为 '{method_target}'，"
+                                f"本次允许探索字段 '{target_attr}'"
                             )
                     else:
                         if hasattr(obj, clean_field.replace(" ", "_")):

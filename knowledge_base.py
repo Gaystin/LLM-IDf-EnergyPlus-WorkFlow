@@ -296,8 +296,28 @@ class EnergyPlusKnowledgeBase:
         # 验证字段是否存在
         valid_fields_in_object = self.objects_metadata.get(object_type, {}).get('fields', [])
         matched_fields = [f for f in matched_fields if f in valid_fields_in_object]
-        
-        return matched_fields if matched_fields else valid_fields_in_object
+
+        # 关键策略：关键词匹配字段仅作为“优先候选”，不再排他。
+        # 这样可避免例如 Material 命中“导热系数”后只剩 Conductivity，
+        # 仍保留 Thickness/Density 等可修改字段供LLM比较潜力。
+        if object_type in self._modifiable_fields_cache:
+            modifiable = self._modifiable_fields_cache.get(object_type, set())
+            supplemental_fields = [
+                f for f in valid_fields_in_object
+                if (f in modifiable) and (f not in matched_fields)
+            ]
+        else:
+            supplemental_fields = [f for f in valid_fields_in_object if f not in matched_fields]
+
+        if matched_fields:
+            return matched_fields + supplemental_fields
+
+        if object_type in self._modifiable_fields_cache:
+            modifiable = self._modifiable_fields_cache.get(object_type, set())
+            only_modifiable = [f for f in valid_fields_in_object if f in modifiable]
+            return only_modifiable if only_modifiable else valid_fields_in_object
+
+        return valid_fields_in_object
     
     def get_object_info(self, object_type: str) -> Dict:
         """
