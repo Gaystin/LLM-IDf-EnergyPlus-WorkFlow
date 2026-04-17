@@ -124,7 +124,7 @@ def analyze_idf(idf_file: str, log_dir: str = "log") -> Path:
     stats = parse_idf_objects(idf_path)
     report = build_report(idf_path, stats)
 
-    output_dir = Path(log_dir).resolve()
+    output_dir = (Path(log_dir) / "idf_data").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = output_dir / f"{idf_path.stem}.log"
