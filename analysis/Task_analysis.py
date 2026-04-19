@@ -23,13 +23,14 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 
 
-GROUP_ORDER = ["Task-Low", "Task-Medium", "Task-High"]
+GROUP_ORDER = ["Task-Low", "Task-Medium", "Task-High", "Task-Top"]
 GROUP_LABELS = {
     "Task-Low": "Low",
     "Task-Medium": "Medium",
     "Task-High": "High",
+    "Task-Top": "Top",
 }
-GROUP_SCORE = {"Task-Low": 1, "Task-Medium": 2, "Task-High": 3}
+GROUP_SCORE = {"Task-Low": 1, "Task-Medium": 2, "Task-High": 3, "Task-Top": 4}
 GROUP_RANK = {group: idx for idx, group in enumerate(GROUP_ORDER)}
 TOP_K = 12
 INPUT_ROOT = Path(__file__).parent.parent / "Task-result"
@@ -1096,8 +1097,8 @@ def build_summary_artifacts(task_df: pd.DataFrame, round_df: pd.DataFrame, early
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Analyze Task-result outputs across Task-Low / Task-Medium / Task-High.")
-    parser.add_argument("--input-root", type=Path, default=INPUT_ROOT, help="Root folder containing Task-result/Task-High|Task-Medium|Task-Low.")
+    parser = argparse.ArgumentParser(description="Analyze Task-result outputs across Task-Low / Task-Medium / Task-High / Task-Top.")
+    parser.add_argument("--input-root", type=Path, default=INPUT_ROOT, help="Root folder containing Task-result/Task-Top|Task-High|Task-Medium|Task-Low.")
     parser.add_argument("--output-root", type=Path, default=FIGURE_ROOT, help="Root folder for figures and summary tables.")
     parser.add_argument("--log-root", type=Path, default=LOG_ROOT, help="Root folder for analysis log files.")
     parser.add_argument("--run-stamp", type=str, default=None, help="Optional timestamp string for the output subdirectory.")

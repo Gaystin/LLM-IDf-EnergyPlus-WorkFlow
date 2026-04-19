@@ -20,11 +20,12 @@ import numpy as np
 import pandas as pd
 
 
-LEVEL_ORDER = ["Low", "Medium", "High"]
+LEVEL_ORDER = ["Low", "Medium", "High", "Top"]
 LEVEL_TO_DIR = {
     "Low": "Task-Low",
     "Medium": "Task-Medium",
     "High": "Task-High",
+    "Top": "Task-Top",
 }
 
 # For architecture-aware complexity grouping.
@@ -949,13 +950,13 @@ def build_output_dir(base_dir: Path | None = None) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze Task-Low/Medium/High IDF dataset complexity with logs, CSV summaries and plots."
+        description="Analyze Task-Low/Medium/High/Top IDF dataset complexity with logs, CSV summaries and plots."
     )
     parser.add_argument(
         "--task-root",
         type=Path,
-        default=Path(__file__).parent.parent / "Task_new",
-        help="Root directory containing Task-Low/Task-Medium/Task-High",
+        default=Path(__file__).parent.parent / "Task-new",
+        help="Root directory containing Task-Low/Task-Medium/Task-High/Task-Top",
     )
     parser.add_argument(
         "--out-dir",

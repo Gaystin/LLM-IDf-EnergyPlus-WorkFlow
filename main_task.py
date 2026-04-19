@@ -38,16 +38,17 @@ NUM_WORKFLOWS = 1
 MAX_ITERATIONS: Optional[int] = None
 
 # Task 根目录与输出根目录
-TASK_ROOT = "Task_new"
+TASK_ROOT = "Task-new"
 OUTPUT_ROOT = "Task-result"
 
 # 要遍历的复杂度文件夹（目录名需与 Task 下实际目录一致）
-TARGET_TIERS: List[str] = ["Task-High", "Task-Medium", "Task-Low"]
+TARGET_TIERS: List[str] = ["Task-Top", "Task-High", "Task-Medium", "Task-Low"]
 
 # 可配置遍历范围（1-based 且含两端）
 # 例如："Task-High": (3, 10) 表示仅跑该目录下第3到第10个IDF
 # 设为 (None, None) 表示全量
 RANGE_BY_TIER: Dict[str, Tuple[Optional[int], Optional[int]]] = {
+    "Task-Top": (None, None),
     "Task-High": (None, None),
     "Task-Medium": (None, None),
     "Task-Low": (None, None),
@@ -56,7 +57,7 @@ RANGE_BY_TIER: Dict[str, Tuple[Optional[int], Optional[int]]] = {
 # 是否只跑指定文件名（不含后缀）；空列表表示不启用该过滤
 # 支持字符串或整数写法，都会自动转为字符串比较
 # 示例: ["10125", "10751"] 或 [10125, 10751]
-ONLY_IDF_STEMS: List[str] = [10610, 10470, 10465, 10784, 10493, 10808, 10597, 10626]
+ONLY_IDF_STEMS: List[str] = [10864]
 
 
 def _idf_sort_key(path_obj: Path):
