@@ -21,9 +21,9 @@ from pathlib import Path
 from collections import defaultdict
 from eppy.modeleditor import IDF
 from openai import OpenAI
-from knowledge_base import EnergyPlusKnowledgeBase
-from llm_iteration_agent import LLMIterationEfficiencyAgent
-from climate_adaptation_agent import ClimateAdaptationAgent
+from knowledge_base_components.knowledge_base import EnergyPlusKnowledgeBase
+from agent.llm_iteration_agent import LLMIterationEfficiencyAgent
+from agent.climate_adaptation_agent import ClimateAdaptationAgent
 
 # 强制使用无界面绘图后端，避免Tkinter在多线程退出时触发Tcl_AsyncDelete崩溃
 os.environ.setdefault("MPLBACKEND", "Agg")

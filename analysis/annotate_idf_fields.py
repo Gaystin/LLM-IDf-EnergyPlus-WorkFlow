@@ -2,7 +2,7 @@
 """Annotate IDF fields with names from an EnergyPlus IDD file.
 
 Example:
-  python annotate_idf_fields.py --idd "Energy+v8.9.idd" --idf "base.idf" --out "base_annotated.idf"
+    python analysis/annotate_idf_fields.py --idd "Energy+v8.9.idd" --idf "base.idf" --out "base_annotated.idf"
 """
 
 from __future__ import annotations
