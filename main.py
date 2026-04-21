@@ -2169,6 +2169,61 @@ class EnergyPlusOptimizer:
         """
         return None
 
+    def _validate_parameter_value(self, object_type, field_name, value):
+        """前置验证：检查参数值是否符合基本有效范围，防止负值或非法值。
+        
+        这是在修改前的第一道防线，防止明显的物理违规参数进入约束处理。
+        """
+        try:
+            val_num = float(value)
+        except (ValueError, TypeError):
+            # 非数值，允许通过（后续检查会处理）
+            return True
+        
+        obj_type_u = str(object_type or "").upper()
+        field_u = str(field_name or "").upper()
+        
+        # Material 关键参数必须为正
+        if "MATERIAL" in obj_type_u:
+            positive_required_fields = [
+                'THICKNESS', 'CONDUCTIVITY', 'DENSITY', 'SPECIFIC_HEAT', 
+                'THERMAL_RESISTANCE', 'ROUGHNESS'
+            ]
+            for prf in positive_required_fields:
+                if prf in field_u:
+                    if val_num <= 0:
+                        self.logger.warning(
+                            f"  [参数验证] {object_type}.{field_name}: 值={val_num} <= 0，非法"
+                        )
+                        return False
+                    break
+        
+        # 光学属性必须在 [0, 1] 范围
+        if "GLAZING" in obj_type_u or "GLASS" in obj_type_u:
+            optical_fields = [
+                'SOLAR_TRANSMITTANCE', 'SOLAR_REFLECTANCE', 'VISIBLE_TRANSMITTANCE',
+                'VISIBLE_REFLECTANCE', 'INFRARED_TRANSMITTANCE', 'EMISSIVITY',
+                'TRANSMITTANCE', 'REFLECTANCE'
+            ]
+            for of in optical_fields:
+                if of in field_u:
+                    if val_num < 0 or val_num > 1:
+                        self.logger.warning(
+                            f"  [参数验证] {object_type}.{field_name}: 值={val_num}，应在 [0,1]"
+                        )
+                        return False
+                    break
+        
+        # 厚度必须为正且在合理范围内
+        if "THICKNESS" in field_u:
+            if val_num <= 0 or val_num > 2:  # 厚度不应超过 2 米
+                self.logger.warning(
+                    f"  [参数验证] {object_type}.{field_name}: 厚度={val_num}，应在 (0, 2]"
+                )
+                return False
+        
+        return True
+
     def _enforce_no_reverse_energy_updates(self, target_updates):
         """强制纠正会导致反优化方向的数值修改，确保关键负荷参数不被增大。
 
@@ -2417,6 +2472,236 @@ class EnergyPlusOptimizer:
             # Infrared 组合约束
             _enforce_pair_sum('IR_T', 'IR_EF', 'enforce IR_T+Front_IR_Emissivity<=1')
             _enforce_pair_sum('IR_T', 'IR_EB', 'enforce IR_T+Back_IR_Emissivity<=1')
+
+        # ========== 处理 MATERIAL 和 MATERIAL:NOMASS 热工参数约束（防止 CTF 收敛问题）==========
+        material_types = {'MATERIAL', 'MATERIAL:NOMASS'}
+        material_keys = set()
+        for upd in target_updates:
+            if str(upd.get('type', '')).upper() in material_types:
+                material_keys.add((str(upd.get('type', '')).upper(), str(upd.get('name', '')).upper()))
+
+        for obj_type_u, obj_name_u in material_keys:
+            # 关键参数定义与约束范围
+            material_constraints = {
+                'Thickness': (0.003, 1.0, '材料厚度必须在 [0.003, 1.0] m'),
+                'Conductivity': (0.005, 5.0, '导热系数必须在 [0.005, 5.0] W/mK'),
+                'Density': (1.0, 5000.0, '密度必须在 [1, 5000] kg/m³'),
+                'Specific_Heat': (100.0, 5000.0, '比热必须在 [100, 5000] J/kgK'),
+                'Thermal_Resistance': (0.001, 20.0, '热阻必须在 [0.001, 20] m²K/W'),
+            }
+
+            # 收集该对象的参数值
+            material_values = {}
+            for field_name, (lo, hi, reason) in material_constraints.items():
+                val, was_modified = _get_value(obj_type_u, obj_name_u, field_name)
+                material_values[field_name] = (_to_float(val), was_modified)
+
+            # 对每个参数应用范围约束
+            for field_name, (lo, hi, reason) in material_constraints.items():
+                val, was_modified = material_values[field_name]
+                if val is None:
+                    continue
+
+                clamped = _clamp(val, lo, hi)
+                if clamped != val:
+                    _set_value(obj_type_u, obj_name_u, field_name, clamped, reason)
+                    material_values[field_name] = (clamped, was_modified)
+
+            # 热扩散率约束 (alpha = k / (rho * cp)) 应在 [1e-8, 1e-4] 范围内
+            # 如果超出范围，优先调整导热系数，保持密度和比热不变
+            if (material_values['Conductivity'][0] is not None and
+                material_values['Density'][0] is not None and
+                material_values['Specific_Heat'][0] is not None):
+                
+                k = material_values['Conductivity'][0]
+                rho = material_values['Density'][0]
+                cp = material_values['Specific_Heat'][0]
+                
+                if rho > 0 and cp > 0:
+                    alpha = k / (rho * cp)
+                    
+                    # 如果热扩散率超出范围，调整导热系数
+                    if alpha < 1e-8 or alpha > 1e-4:
+                        if material_values['Conductivity'][1]:  # 导热系数在本次修改中被改动
+                            # 优先回调导热系数
+                            target_alpha = 5e-5  # 目标热扩散率
+                            new_k = target_alpha * rho * cp
+                            new_k = _clamp(new_k, 0.005, 5.0)
+                            _set_value(obj_type_u, obj_name_u, 'Conductivity', new_k, 
+                                      f'热扩散率约束(α={alpha:.2e} → {target_alpha:.2e})')
+                        else:
+                            # 若导热系数未被修改，检查是否需要调整其他参数
+                            self.logger.warning(
+                                f"  [热扩散率警告] {obj_type_u} ({obj_name_u}): "
+                                f"α={alpha:.2e}，超出目标范围 [1e-8, 1e-4]"
+                            )
+
+        # ========== 针对 ROOF 构造的组合稳定性约束（防止 CTF 不收敛）==========
+        # 仅做保守回调，不追求最优，仅确保 InitConductionTransferFunctions 稳定。
+        roof_construction_limits = {
+            'max_total_r': 6.0,          # m2.K/W，限制屋面总热阻
+            'max_layer_r': 2.5,          # m2.K/W，限制单层热阻
+            'max_air_gap_thickness': 0.05,
+            'min_air_gap_conductivity': 0.03,
+            'max_insulation_thickness': 0.15,
+            'min_insulation_conductivity': 0.015,
+            'max_generic_thickness': 0.30,
+            'max_nomass_r': 2.0,
+        }
+
+        def _get_material_type_by_name(material_name_u):
+            for mt in ('MATERIAL', 'MATERIAL:NOMASS'):
+                if (mt, material_name_u) in base_obj_lookup:
+                    return mt
+            return None
+
+        def _iter_construction_layers(construction_obj):
+            for fn in getattr(construction_obj, 'fieldnames', []):
+                if 'LAYER' not in _norm(fn):
+                    continue
+                layer_name = getattr(construction_obj, fn, None)
+                if layer_name is None:
+                    continue
+                layer_name_s = str(layer_name).strip()
+                if not layer_name_s:
+                    continue
+                yield layer_name_s
+
+        roof_constructions = []
+        for (obj_type_u, obj_name_u), obj in base_obj_lookup.items():
+            if obj_type_u != 'CONSTRUCTION':
+                continue
+            if 'ROOF' not in obj_name_u:
+                continue
+            roof_constructions.append((obj_name_u, obj))
+
+        for construction_name_u, construction_obj in roof_constructions:
+            layer_infos = []
+
+            for layer_name in _iter_construction_layers(construction_obj):
+                layer_name_u = layer_name.upper()
+                mat_type_u = _get_material_type_by_name(layer_name_u)
+                if mat_type_u is None:
+                    continue
+
+                if mat_type_u == 'MATERIAL':
+                    t_raw, t_mod = _get_value(mat_type_u, layer_name_u, 'Thickness')
+                    k_raw, k_mod = _get_value(mat_type_u, layer_name_u, 'Conductivity')
+                    t = _to_float(t_raw)
+                    k = _to_float(k_raw)
+
+                    # 层级先验约束：按材料语义限制极端值
+                    mat_name_norm = _norm(layer_name)
+                    if t is not None and k is not None and k > 0:
+                        if 'AIRGAP' in mat_name_norm:
+                            if t > roof_construction_limits['max_air_gap_thickness']:
+                                new_t = roof_construction_limits['max_air_gap_thickness']
+                                _set_value(mat_type_u, layer_name_u, 'Thickness', new_t,
+                                          f'ROOF_CTF_air_gap_thickness_limit({construction_name_u})')
+                                t = new_t
+                            if k < roof_construction_limits['min_air_gap_conductivity']:
+                                new_k = roof_construction_limits['min_air_gap_conductivity']
+                                _set_value(mat_type_u, layer_name_u, 'Conductivity', new_k,
+                                          f'ROOF_CTF_air_gap_conductivity_floor({construction_name_u})')
+                                k = new_k
+
+                        if 'INSULATION' in mat_name_norm:
+                            if t > roof_construction_limits['max_insulation_thickness']:
+                                new_t = roof_construction_limits['max_insulation_thickness']
+                                _set_value(mat_type_u, layer_name_u, 'Thickness', new_t,
+                                          f'ROOF_CTF_insulation_thickness_limit({construction_name_u})')
+                                t = new_t
+                            if k < roof_construction_limits['min_insulation_conductivity']:
+                                new_k = roof_construction_limits['min_insulation_conductivity']
+                                _set_value(mat_type_u, layer_name_u, 'Conductivity', new_k,
+                                          f'ROOF_CTF_insulation_conductivity_floor({construction_name_u})')
+                                k = new_k
+
+                        if t > roof_construction_limits['max_generic_thickness']:
+                            new_t = roof_construction_limits['max_generic_thickness']
+                            _set_value(mat_type_u, layer_name_u, 'Thickness', new_t,
+                                      f'ROOF_CTF_layer_thickness_limit({construction_name_u})')
+                            t = new_t
+
+                        # 单层热阻上限，优先提升导热系数回调
+                        layer_r = t / k if (k and k > 0) else None
+                        if layer_r is not None and layer_r > roof_construction_limits['max_layer_r']:
+                            target_r = roof_construction_limits['max_layer_r']
+                            new_k = _clamp(t / target_r, 0.005, 5.0)
+                            if new_k > k:
+                                _set_value(mat_type_u, layer_name_u, 'Conductivity', new_k,
+                                          f'ROOF_CTF_layer_R_limit({construction_name_u})')
+                                k = new_k
+                                layer_r = t / k
+
+                    if t is not None and k is not None and k > 0:
+                        layer_infos.append({
+                            'mat_type': mat_type_u,
+                            'mat_name_u': layer_name_u,
+                            'thickness': t,
+                            'conductivity': k,
+                            'layer_r': t / k,
+                        })
+
+                else:  # MATERIAL:NOMASS
+                    r_raw, _ = _get_value(mat_type_u, layer_name_u, 'Thermal_Resistance')
+                    r_val = _to_float(r_raw)
+                    if r_val is None:
+                        continue
+                    if r_val > roof_construction_limits['max_nomass_r']:
+                        new_r = roof_construction_limits['max_nomass_r']
+                        _set_value(mat_type_u, layer_name_u, 'Thermal_Resistance', new_r,
+                                  f'ROOF_CTF_nomass_R_limit({construction_name_u})')
+                        r_val = new_r
+                    layer_infos.append({
+                        'mat_type': mat_type_u,
+                        'mat_name_u': layer_name_u,
+                        'layer_r': r_val,
+                    })
+
+            total_r = sum(li['layer_r'] for li in layer_infos if li.get('layer_r') is not None)
+            if total_r <= roof_construction_limits['max_total_r']:
+                continue
+
+            # 总热阻兜底回调：优先提高屋面保温层导热系数
+            excess_r = total_r - roof_construction_limits['max_total_r']
+            candidates = [
+                li for li in layer_infos
+                if li.get('mat_type') == 'MATERIAL'
+                and li.get('thickness') is not None
+                and li.get('conductivity') is not None
+                and li.get('conductivity') > 0
+            ]
+
+            # 按可回调空间排序：先调热阻大的层
+            candidates.sort(key=lambda x: x['layer_r'], reverse=True)
+
+            for li in candidates:
+                if excess_r <= 1e-6:
+                    break
+
+                t = li['thickness']
+                k = li['conductivity']
+                current_r = t / k
+                min_possible_r = t / 5.0  # Conductivity 上限是 5.0
+                reducible = current_r - min_possible_r
+                if reducible <= 1e-9:
+                    continue
+
+                reduce_now = min(excess_r, reducible)
+                target_r = max(min_possible_r, current_r - reduce_now)
+                new_k = _clamp(t / target_r, 0.005, 5.0)
+
+                if new_k > k:
+                    _set_value(li['mat_type'], li['mat_name_u'], 'Conductivity', new_k,
+                              f'ROOF_CTF_total_R_limit({construction_name_u})')
+                    new_r = t / new_k
+                    excess_r -= (current_r - new_r)
+
+            if excess_r > 1e-3:
+                self.logger.warning(
+                    f"  [ROOF_CTF警告] {construction_name_u}: 总热阻仍超限，剩余超出={excess_r:.3f} m2.K/W"
+                )
 
         return target_updates
 
@@ -2712,6 +2997,14 @@ class EnergyPlusOptimizer:
                         continue
                     
                     final_value = self._evaluate_expression(value_expr, old_value)
+                    
+                    # 【前置检查】关键参数必须符合基本约束，防止负值等非法参数导致CTF收敛问题
+                    if not self._validate_parameter_value(target_obj_type, target_attr, final_value):
+                        self.logger.warning(
+                            f"  [参数验证失败] {target_obj_type} ({obj_name}): {target_attr}={final_value} "
+                            f"不符合有效范围，已跳过修改"
+                        )
+                        continue
                     
                     # 计算修改系数
                     try:
