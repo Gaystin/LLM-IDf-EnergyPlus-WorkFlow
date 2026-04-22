@@ -804,6 +804,53 @@ class DatasetComplexityAnalyzer:
 
         self._save_figure(fig, self.fig_dir / "05_metric_correlation_heatmap")
 
+    def plot_level_file_counts(self, file_df: pd.DataFrame) -> None:
+        self._set_plot_style()
+        
+        # Count files per level
+        level_counts = file_df["level"].value_counts().reindex(LEVEL_ORDER).fillna(0).astype(int)
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        color_map = self._level_color_map()
+        colors = [color_map[lv] for lv in LEVEL_ORDER]
+        
+        bars = ax.bar(
+            LEVEL_ORDER,
+            level_counts.values,
+            width=0.6,
+            color=colors,
+            alpha=0.45,
+            edgecolor=[color_map[lv] for lv in LEVEL_ORDER],
+            linewidth=1.5,
+        )
+        
+        # Add value labels on top of bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                height,
+                f"{int(height)}",
+                ha="center",
+                va="bottom",
+                fontsize=14,
+                fontweight="bold",
+            )
+        
+        ax.set_xlabel("Task Level", fontsize=16)
+        ax.set_ylabel("Number of IDF Files", fontsize=16)
+        ax.tick_params(axis="x", labelsize=13)
+        ax.tick_params(axis="y", labelsize=13)
+        ax.grid(axis="y", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.grid(axis="x", visible=False)
+        
+        fig.tight_layout()
+        output_png = self.fig_dir / "00_level_file_counts_bar"
+        output_png.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_png.with_suffix(".png"), dpi=300, bbox_inches="tight")
+        fig.savefig(output_png.with_suffix(".svg"), bbox_inches="tight")
+        plt.close(fig)
+
     def write_report(
         self,
         file_df: pd.DataFrame,
@@ -933,6 +980,7 @@ class DatasetComplexityAnalyzer:
         self.plot_level_metric_heatmap(file_df)
         self.plot_family_composition(family_df)
         self.plot_correlation_heatmap(file_df)
+        self.plot_level_file_counts(file_df)
 
         self.logger.info("Saved figures to %s", self.fig_dir)
 
