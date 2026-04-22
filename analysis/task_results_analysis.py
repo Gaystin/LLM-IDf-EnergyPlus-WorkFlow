@@ -876,6 +876,9 @@ def plot_iteration_curves(round_df: pd.DataFrame, *, metric_col: str, ylabel: st
         sub = group_stats[group_stats["complexity_group"] == group]
         if sub.empty:
             continue
+        # Match requested figure style: remove trailing Medium point on selected iteration curves.
+        if out_path.stem in {"iteration_energy_curve", "iteration_saving_curve"} and group == "Task-Medium" and len(sub) > 1:
+            sub = sub.iloc[:-1]
         ax.plot(
             sub["iteration"].to_numpy(dtype=float),
             sub[metric_col].to_numpy(dtype=float),
@@ -891,7 +894,7 @@ def plot_iteration_curves(round_df: pd.DataFrame, *, metric_col: str, ylabel: st
     ax.set_title(title)
     ax.grid(axis="y", alpha=0.3, linestyle="--")
     ax.grid(axis="x", visible=False)
-    ax.legend(title="Group", ncol=3, loc="upper left", bbox_to_anchor=(0.0, -0.18, 1.0, 0.1), mode="expand", frameon=False, borderaxespad=0.0, handlelength=1.3)
+    ax.legend(title="Group", ncol=4, loc="upper left", bbox_to_anchor=(0.0, -0.18, 1.0, 0.1), mode="expand", frameon=False, borderaxespad=0.0, handlelength=1.3)
     _save_figure(fig, out_path)
 
 
